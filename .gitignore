@@ -1,0 +1,23 @@
+# --- local runtime data (Docker mode) ---
+data/
+
+# --- exported WSL rootfs archives (built by CI, not committed) ---
+*.tar.gz
+*.tar.zst
+*.tar.zst.part-*
+*.zst
+rootfs-*.tar.*
+
+# --- secrets ---
+.env
+
+# --- windows build/scratch ---
+windows/*.exe
+
+# --- editor / OS ---
+.DS_Store
+*.swp
+
+# --- agent / session metadata (not project content) ---
+.omo/
+PROGRESS.md

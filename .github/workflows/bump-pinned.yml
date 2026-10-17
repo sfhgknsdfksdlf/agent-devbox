@@ -1,0 +1,64 @@
+# =============================================================================
+# bump-pinned — every 6 months, move the manually-pinned build ARGs
+# (PLAYWRIGHT_VERSION, GO_VERSION) to the latest upstream, then rebuild.
+#
+# The floating packages (OpenCode, omo, wrangler, ...) refresh on the regular
+# every-3-day build; these two are pinned on purpose so they only move on this
+# slower cadence. A run with no upstream change does nothing.
+#
+# NOTE: a `git push` made with the workflow GITHUB_TOKEN does NOT trigger other
+# workflows, so we explicitly dispatch build.yml (workflow_dispatch is the
+# documented exception and IS allowed with GITHUB_TOKEN).
+# =============================================================================
+name: bump-pinned
+on:
+  schedule:
+    - cron: "0 5 1 */6 *"   # 05:00 UTC on the 1st of Jan / Jul
+  workflow_dispatch:
+permissions:
+  contents: write
+  actions: write
+concurrency:
+  group: bump-pinned
+  cancel-in-progress: false
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+
+      - name: Bump the pinned ARGs if upstream moved
+        id: bump
+        run: |
+          set -euo pipefail
+          pw="$(curl -fsSL https://registry.npmjs.org/playwright/latest | jq -r '.version')"
+          go="$(curl -fsSL 'https://go.dev/dl/?mode=json' | jq -r '.[0].version')"
+          go="${go#go}"
+          cur_pw="$(sed -n 's/^ARG PLAYWRIGHT_VERSION=//p' Dockerfile | head -1)"
+          cur_go="$(sed -n 's/^ARG GO_VERSION=//p' Dockerfile | head -1)"
+          echo "playwright: $cur_pw -> $pw"
+          echo "go:         $cur_go -> $go"
+          if [ "$pw" = "$cur_pw" ] && [ "$go" = "$cur_go" ]; then
+            echo "already up to date"
+            exit 0
+          fi
+          if [ "$pw" != "$cur_pw" ]; then
+            sed -i "s|^ARG PLAYWRIGHT_VERSION=.*|ARG PLAYWRIGHT_VERSION=$pw|" Dockerfile
+          fi
+          if [ "$go" != "$cur_go" ]; then
+            sed -i "s|^ARG GO_VERSION=.*|ARG GO_VERSION=$go|" Dockerfile
+          fi
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Dockerfile
+          git commit -m "chore: bump pinned Playwright/Go"
+          git push origin main
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Trigger a rebuild with the bumped versions
+        if: steps.bump.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh workflow run build.yml --ref main

@@ -1,0 +1,21 @@
+# Keeps scheduled workflows enabled. GitHub disables `on.schedule` workflows in
+# a public repo after 60 days without repository activity, so we make an empty
+# commit well within that window.
+name: keepalive
+on:
+  schedule:
+    - cron: "17 4 */20 * *"
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Empty commit to reset the 60-day inactivity timer
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git commit --allow-empty -m "chore: keepalive (avoid 60-day schedule auto-disable)"
+          git push

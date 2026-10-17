@@ -1,0 +1,27 @@
+name: Agent Devbox
+tags:
+  - 工具
+title: Agent Devbox
+description: AI 开发 / 测试环境（paseo + OpenCode V1 + omo）
+additionalProperties:
+  key: agent-devbox
+  name: Agent Devbox
+  tags:
+    - Tool
+  shortDescZh: 一个装好就能用的 AI 开发 / 测试环境
+  shortDescEn: A ready-to-use AI dev / test environment
+  description:
+    en: A ready-to-use AI dev / test environment (paseo + OpenCode V1 + omo)
+    zh: 一个装好就能用的 AI 开发 / 测试环境（paseo + OpenCode V1 + omo）
+    zh-Hant: 一個裝好就能用的 AI 開發 / 測試環境
+  type: tool
+  crossVersionUpdate: true
+  limit: 0
+  github: https://github.com/sfhgknsdfksdlf/agent-devbox
+  document: https://github.com/sfhgknsdfksdlf/agent-devbox#readme
+  website: https://github.com/sfhgknsdfksdlf/agent-devbox
+  architectures:
+    - amd64
+    - arm64
+  memoryRequired: 2048
+  gpuSupport: false
