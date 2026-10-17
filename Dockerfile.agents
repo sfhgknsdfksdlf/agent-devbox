@@ -1,0 +1,51 @@
+# syntax=docker/dockerfile:1.7
+# =============================================================================
+# agent-devbox — the DEFAULT (multi-agent) image.
+#   = agent-devbox-core  +  the extra AI coding-agent CLIs (Claude Code, Codex,
+#     Gemini, Pi, DeepSeek Harness, Grok Build, zcode) + Aider, Crush,
+#     Qwen Code and GitHub Copilot CLI.
+#
+# It is derived from the already-built core image so the two images stay in
+# lock-step (same base digest, same UID/GID, same paths and startup protocol).
+#
+# CI passes CORE_IMAGE=<core image at the same datetime tag>.
+# =============================================================================
+ARG CORE_IMAGE=ghcr.io/sfhgknsdfksdlf/agent-devbox-core:latest
+FROM ${CORE_IMAGE}
+
+USER root
+
+# -----------------------------------------------------------------------------
+# Extra AI coding-agent CLIs (Node-based). Installed strictly: if an upstream
+# package is unavailable the build fails loudly (adjust this list deliberately).
+# -----------------------------------------------------------------------------
+RUN set -eux; \
+    npm install -g \
+      @anthropic-ai/claude-code \
+      @openai/codex \
+      @google/gemini-cli \
+      @qwen-code/qwen-code \
+      @charmland/crush \
+      @github/copilot \
+      @earendil-works/pi-coding-agent \
+      @deepseek-ai/dsh \
+      @xai-official/grok \
+      zcode-app-cli; \
+    npm cache clean --force; \
+    for c in claude codex gemini qwen crush copilot pi dsh grok zcode; do \
+      printf '  %-8s -> ' "$c"; command -v "$c" >/dev/null 2>&1 && ("$c" --version 2>&1 | head -1) || echo "(no --version)"; \
+    done
+
+# -----------------------------------------------------------------------------
+# Aider (Python) via `uv tool` on a uv-managed CPython 3.12. aider-chat requires
+# Python <3.13 and pins numpy==1.26.4, which has no wheel for the image's
+# Python 3.13 (a source build of the fallback pin fails), so 3.12 is required.
+# UV_TOOL_BIN_DIR puts the `aider` shim in /usr/local/bin for root and paseo.
+# -----------------------------------------------------------------------------
+RUN set -eux; \
+    UV_TOOL_BIN_DIR=/usr/local/bin UV_TOOL_DIR=/opt/uv-tools \
+      uv tool install --python 3.12 aider-chat; \
+    aider --version 2>&1 | head -1
+
+WORKDIR /workspace
+ENTRYPOINT ["/usr/bin/tini","--","/usr/local/bin/docker-entrypoint.sh"]

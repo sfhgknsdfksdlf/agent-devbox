@@ -1,0 +1,13 @@
+# Keep the build context tiny. NOTE: windows/ IS copied into the image
+# (bundled Windows helper), so it is intentionally NOT ignored.
+.git
+.github
+docs
+tests
+1panel
+data
+*.tar.gz
+*.tar.zst
+*.zst
+.env
+**/*.md

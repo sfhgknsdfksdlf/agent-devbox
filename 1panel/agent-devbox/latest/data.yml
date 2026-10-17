@@ -1,0 +1,32 @@
+additionalProperties:
+  formFields:
+    - default: 6767
+      envKey: PANEL_APP_PORT_HTTP
+      labelEn: Web port
+      labelZh: 网页端口
+      label:
+        en: Web port
+        zh: 网页端口
+      required: true
+      rule: paramPort
+      type: number
+      edit: true
+    - default: change-me-please
+      envKey: PASEO_PASSWORD
+      labelEn: Access password (required)
+      labelZh: 访问密码（必填）
+      label:
+        en: Access password (required)
+        zh: 访问密码（必填）
+      required: true
+      rule: paramComplexity
+      type: password
+    - default: Asia/Shanghai
+      envKey: TZ
+      labelEn: Timezone
+      labelZh: 时区
+      label:
+        en: Timezone
+        zh: 时区
+      required: false
+      type: text
