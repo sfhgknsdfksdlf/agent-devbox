@@ -1,0 +1,339 @@
+name: build
+# Builds BOTH images in CI (never locally) and publishes them to ghcr.io:
+#   ghcr.io/<owner>/agent-devbox-core   (lean base)
+#   ghcr.io/<owner>/agent-devbox        (multi-agent, DEFAULT)
+# Tags: <YYYYMMDD.HHMM> (candidate) then `latest` promoted only after a smoke test.
+# amd64 is built on ubuntu-latest and arm64 NATIVELY on ubuntu-24.04-arm (free
+# for public repos) - no QEMU emulation. The per-arch images are merged into one
+# multi-arch manifest. WSL rootfs is packaged with zstd (Windows has no zstd, so
+# the installer downloads the small zstd.exe attached to the Release).
+on:
+  schedule:
+    # ~every 3 days, in a quiet UTC window and off the top of the hour
+    # (scheduled workflows queue behind everything else; top-of-hour is worst).
+    - cron: "23 3 */3 * *"
+  push:
+    branches: [main]
+    # Only files that can change the images (an empty keepalive commit matches
+    # nothing here, so it no longer triggers a full build + Release).
+    paths:
+      - "Dockerfile"
+      - "Dockerfile.agents"
+      - ".dockerignore"
+      - "scripts/**"
+      - "config/**"
+      - "windows/**"
+      - "versions.json"
+      - ".github/workflows/build.yml"
+      - ".github/workflows/keepalive.yml"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Rebuild even if upstream versions are unchanged"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write   # GitHub Release (rootfs assets)
+  packages: write   # ghcr.io push
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CORE_IMAGE: ghcr.io/${{ github.repository_owner }}/agent-devbox-core
+  AGENTS_IMAGE: ghcr.io/${{ github.repository_owner }}/agent-devbox
+  ZSTD_VER: "1.5.7"
+  ZSTD_LEVEL: "12"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Skip the whole build on a scheduled run when no upstream version changed.
+  # ---------------------------------------------------------------------------
+  versions:
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.diff.outputs.changed }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: diff
+        run: |
+          set -euo pipefail
+          changed=false
+          pkgs="
+          opencode-ai
+          oh-my-openagent
+          @getpaseo/cli
+          wrangler
+          create-cloudflare
+          @anthropic-ai/claude-code
+          @openai/codex
+          @google/gemini-cli
+          @qwen-code/qwen-code
+          @charmland/crush
+          @github/copilot
+          @earendil-works/pi-coding-agent
+          @deepseek-ai/dsh
+          @xai-official/grok
+          zcode-app-cli
+          "
+          for pkg in $pkgs; do
+            latest="$(npm view "$pkg" version 2>/dev/null || echo ERR)"
+            have="$(jq -r --arg k "$pkg" '.[$k] // "MISSING"' versions.json)"
+            echo "$pkg  have=$have  latest=$latest"
+            if [ "$latest" != "ERR" ] && [ "$latest" != "$have" ]; then changed=true; fi
+          done
+          aider_latest="$(curl -fsSL https://pypi.org/pypi/aider-chat/json 2>/dev/null | jq -r '.info.version' 2>/dev/null || echo ERR)"
+          aider_have="$(jq -r '."aider-chat" // "MISSING"' versions.json)"
+          echo "aider-chat  have=$aider_have  latest=$aider_latest"
+          if [ "$aider_latest" != "ERR" ] && [ "$aider_latest" != "$aider_have" ]; then changed=true; fi
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.force }}" = "true" ]; then changed=true; fi
+          echo "changed=$changed" >> "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------------------
+  # Static verification (no image build needed).
+  # ---------------------------------------------------------------------------
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck bats && shellcheck scripts/*.sh tests/run.sh
+      - name: bash syntax
+        run: for f in scripts/*.sh; do bash -n "$f"; done
+      - name: YAML parse
+        run: |
+          pip install --quiet pyyaml
+          python3 - <<'PY'
+          import glob, yaml, sys
+          files = glob.glob(".github/**/*.yml", recursive=True) + ["docker-compose.yml"]
+          for f in files:
+              yaml.safe_load(open(f))
+              print("ok:", f)
+          PY
+      - name: compose config
+        run: PASEO_PASSWORD=x docker compose -f docker-compose.yml config -q
+      - name: actionlint
+        run: docker run --rm -v "$PWD:/r" -w /r rhysd/actionlint:latest -color
+      - name: hadolint
+        run: docker run --rm -i hadolint/hadolint < Dockerfile || true
+      - name: bats
+        run: tests/run.sh
+
+  # ---------------------------------------------------------------------------
+  # PowerShell parse check on a real Windows runner.
+  # ---------------------------------------------------------------------------
+  ps-lint:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Parse PowerShell AST
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Get-ChildItem windows -Filter *.ps1 | ForEach-Object {
+            $errs = $null
+            [System.Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$null, [ref]$errs) | Out-Null
+            if ($errs) { $errs | ForEach-Object { Write-Error $_.Message }; exit 1 }
+            Write-Host "ok: $($_.Name)"
+          }
+
+  # ---------------------------------------------------------------------------
+  # Decide the version tag and which architectures to build (push = amd64 only).
+  # ---------------------------------------------------------------------------
+  plan:
+    needs: [versions, lint, ps-lint]
+    if: needs.versions.outputs.changed == 'true' || github.event_name == 'push'
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.set.outputs.tag }}
+      matrix: ${{ steps.set.outputs.matrix }}
+    steps:
+      - id: set
+        run: |
+          set -euo pipefail
+          echo "tag=$(date -u +'%Y%m%d.%H%M')" >> "$GITHUB_OUTPUT"
+          if [ "${{ github.event_name }}" = "push" ]; then
+            echo 'matrix={"include":[{"arch":"amd64","runner":"ubuntu-latest"}]}' >> "$GITHUB_OUTPUT"
+          else
+            echo 'matrix={"include":[{"arch":"amd64","runner":"ubuntu-latest"},{"arch":"arm64","runner":"ubuntu-24.04-arm"}]}' >> "$GITHUB_OUTPUT"
+          fi
+
+  # ---------------------------------------------------------------------------
+  # Build core, then the multi-agent image, per architecture, on NATIVE runners.
+  # ---------------------------------------------------------------------------
+  build:
+    needs: [plan]
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.plan.outputs.matrix) }}
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build & push core (${{ matrix.arch }})
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/${{ matrix.arch }}
+          push: true
+          tags: ${{ env.CORE_IMAGE }}:${{ needs.plan.outputs.tag }}-${{ matrix.arch }}
+          provenance: false
+          sbom: false
+          cache-from: type=gha,scope=core-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=core-${{ matrix.arch }}
+
+      - name: Build & push multi-agent (${{ matrix.arch }})
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.agents
+          platforms: linux/${{ matrix.arch }}
+          push: true
+          build-args: |
+            CORE_IMAGE=${{ env.CORE_IMAGE }}:${{ needs.plan.outputs.tag }}-${{ matrix.arch }}
+          tags: ${{ env.AGENTS_IMAGE }}:${{ needs.plan.outputs.tag }}-${{ matrix.arch }}
+          provenance: false
+          sbom: false
+          cache-from: type=gha,scope=agents-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=agents-${{ matrix.arch }}
+
+  # ---------------------------------------------------------------------------
+  # Merge the per-arch images into one multi-arch manifest per image.
+  # ---------------------------------------------------------------------------
+  merge:
+    needs: [plan, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Create multi-arch manifests
+        run: |
+          set -euo pipefail
+          TAG="${{ needs.plan.outputs.tag }}"
+          for img in "${{ env.CORE_IMAGE }}" "${{ env.AGENTS_IMAGE }}"; do
+            srcs=("$img:$TAG-amd64")
+            if docker buildx imagetools inspect "$img:$TAG-arm64" >/dev/null 2>&1; then
+              srcs+=("$img:$TAG-arm64")
+            fi
+            echo "manifest $img:$TAG <= ${srcs[*]}"
+            docker buildx imagetools create -t "$img:$TAG" "${srcs[@]}"
+          done
+
+  # ---------------------------------------------------------------------------
+  # Smoke test the candidate BEFORE promoting `latest`.
+  # ---------------------------------------------------------------------------
+  smoke:
+    needs: [plan, merge]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Password is required (must fail without PASEO_PASSWORD)
+        run: |
+          set -euo pipefail
+          set +e
+          out=$(docker run --rm --platform linux/amd64 -e IS_DOCKER=true \
+                  ${{ env.AGENTS_IMAGE }}:${{ needs.plan.outputs.tag }} true 2>&1)
+          rc=$?
+          set -e
+          if [ "$rc" -eq 0 ]; then
+            echo "ERROR: refused-to-listen-without-password guard did not trigger"; exit 1
+          fi
+          echo "$out" | grep -q "PASEO_PASSWORD is not set" || {
+            echo "ERROR: refusal did not report the password reason"; echo "$out"; exit 1; }
+          echo "ok: refuses without password"
+      - name: Boot and health-check
+        run: |
+          set -euo pipefail
+          docker run -d --name smoke --platform linux/amd64 \
+            -e IS_DOCKER=true -e PASEO_PASSWORD=smoke-test-pw \
+            -p 16767:6767 \
+            ${{ env.AGENTS_IMAGE }}:${{ needs.plan.outputs.tag }}
+          code=000
+          for i in $(seq 1 40); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:16767/api/health || true)
+            [ "$code" = "200" ] && break; sleep 3
+          done
+          echo "health=$code (after up to $i attempts)"; docker logs smoke | tail -40
+          [ "$code" = "200" ]
+      - name: Daemon runs as non-root paseo
+        run: docker exec smoke sh -lc "ps -o user= -C node | sort -u | grep -q '^paseo$'"
+      - name: PTY works (node-pty path)
+        run: docker exec smoke bash -lc 'script -qec "echo pty-ok" /dev/null | grep -q pty-ok'
+      - name: Tear down
+        if: always()
+        run: docker rm -f smoke || true
+
+  # ---------------------------------------------------------------------------
+  # Promote `latest`, export the WSL rootfs (zstd, split <2GiB), create Release.
+  # ---------------------------------------------------------------------------
+  publish:
+    needs: [plan, merge, smoke]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Promote latest (both images)
+        run: |
+          set -euo pipefail
+          TAG="${{ needs.plan.outputs.tag }}"
+          for img in "${{ env.CORE_IMAGE }}" "${{ env.AGENTS_IMAGE }}"; do
+            docker buildx imagetools create -t "${img}:latest" "${img}:$TAG"
+          done
+      - name: Install zstd
+        run: sudo apt-get update && sudo apt-get install -y zstd
+      - name: Export WSL rootfs (core + agents) with zstd, split into <2GiB parts
+        run: |
+          set -euo pipefail
+          TAG="${{ needs.plan.outputs.tag }}"
+          for pair in "core:${CORE_IMAGE}" "agents:${AGENTS_IMAGE}"; do
+            v="${pair%%:*}"; img="${pair#*:}"
+            echo "== exporting $v from $img:$TAG =="
+            docker pull --platform linux/amd64 "$img:$TAG"
+            cid=$(docker create --platform linux/amd64 "$img:$TAG")
+            docker export "$cid" -o "rootfs-$v-amd64.tar"
+            docker rm -f "$cid"
+            zstd -T0 -${{ env.ZSTD_LEVEL }} -f "rootfs-$v-amd64.tar"
+            rm -f "rootfs-$v-amd64.tar"
+            split -b 1900M -d -a 2 "rootfs-$v-amd64.tar.zst" "rootfs-$v-amd64.tar.zst.part-"
+            rm -f "rootfs-$v-amd64.tar.zst"
+          done
+          ls -lh rootfs-*-amd64.tar.zst.part-*
+      - name: Fetch zstd.exe (for the Windows installer)
+        run: |
+          set -euo pipefail
+          curl -fsSL -o zstd.zip "https://github.com/facebook/zstd/releases/download/v${{ env.ZSTD_VER }}/zstd-v${{ env.ZSTD_VER }}-win64.zip"
+          unzip -j -o zstd.zip "zstd-v${{ env.ZSTD_VER }}-win64/zstd.exe"
+          ls -l zstd.exe
+      - name: Create Release with rootfs parts
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ needs.plan.outputs.tag }}
+          name: build-${{ needs.plan.outputs.tag }}
+          files: |
+            rootfs-*-amd64.tar.zst.part-*
+            zstd.exe
+          generate_release_notes: true
+          make_latest: true
