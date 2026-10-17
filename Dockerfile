@@ -23,7 +23,7 @@
 # V1 via `opencode-ai@^1`, omo = `oh-my-openagent@latest`) so a rebuild picks up
 # the newest, while `versions.json` + a CI diff-gate records what was resolved.
 # =============================================================================
-FROM node:22-trixie-slim
+FROM node:25-trixie-slim
 
 ARG PLAYWRIGHT_VERSION=1.64.1
 ARG GO_VERSION=1.27.2
