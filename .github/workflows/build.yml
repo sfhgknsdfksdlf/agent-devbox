@@ -328,7 +328,7 @@ jobs:
           unzip -j -o zstd.zip "zstd-v${{ env.ZSTD_VER }}-win64/zstd.exe"
           ls -l zstd.exe
       - name: Create Release with rootfs parts
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: build-${{ needs.plan.outputs.tag }}
           name: build-${{ needs.plan.outputs.tag }}
