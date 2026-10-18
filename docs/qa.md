@@ -98,3 +98,25 @@ maintain, would still have to shell out for VHDX creation (`New-VHD` /
 `diskpart`), and would still need admin. Prior art:
 [yuk7/wsldl](https://github.com/yuk7/wsldl) is Go, but it is a thin in-distro
 launcher without the VHDX, Scheduled Task, or ACL work this installer does.
+
+## 为什么不再推荐 PowerShell 一行安装 / 为什么改用 `install.cmd`?
+
+旧的推荐方式是把远端脚本"下载后直接执行"（网络取回脚本再交给 PowerShell 执行）。这种
+"取回即执行"的形态会被静态杀软启发式直接判为下载器：火绒（Huorong）就把这条入口报成
+`HEUR:TrojanDownloader/PS.NetLoader.av`。于是入口换成 `install.cmd`，行为不变，去掉的是
+高信号的静态特征：
+
+- **入口**：`cmd.exe` 引导器 `install.cmd`（或原始网页入口 `install.ps1`）；两者都从
+  **项目源码 `main`** 取安装脚本；
+- **暂存目录**：从 `%TEMP%`（正是杀软会清理的上下文）挪到 `%LOCALAPPDATA%\agent-devbox\`，
+  每次运行用独立的随机子目录，成功和失败后都会清理；
+- **共享辅助**：`wsl-ensure.ps1` 里不再有内联 C#（`Add-Type -TypeDefinition`）、P/Invoke
+  （`DllImport`）或裸 `HttpWebRequest`/`GetResponseStream`——磁盘空间改用托管的
+  `System.IO.DriveInfo`，远端 zstd 帧头改用 `HttpClient` 的 Range 请求；
+- **执行策略**：旧的原始网页入口 `install.ps1` 在提权时不再用 `-ExecutionPolicy Bypass`，
+  而是 `RemoteSigned`（提权后的副本由父进程刚写出，不带 Mark-of-the-Web，`RemoteSigned`
+  已经足够，也更不像恶意样本）。
+
+安装行为本身没有变：仍然先检查磁盘空间再下载、仍然三级回退导入、仍然注册数据盘开机挂载；
+`install.cmd`/`install.ps1` 从 `main` 取脚本；rootfs 分片用系统自带 `curl.exe`（`-C -` 续传、
+校验 Content-Length，短读即重试）下载，Release 只用于 rootfs 镜像。

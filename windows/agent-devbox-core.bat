@@ -19,7 +19,7 @@ if errorlevel 1 (
   echo [ERROR] agent-devbox install failed. See the messages above.
 ) else (
   echo.
-  echo [OK] agent-devbox install finished. Enter the environment with: wsl -d agent-devbox
+  echo [OK] agent-devbox install finished. Enter the environment with: wsl -d agent-devbox-core
 )
 echo.
 pause

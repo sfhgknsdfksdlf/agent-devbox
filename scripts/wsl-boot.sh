@@ -2,31 +2,47 @@
 # =============================================================================
 # wsl-boot.sh — WSL2 boot script, run as root from /etc/wsl.conf [boot] command.
 #
-# Responsibilities (idempotent):
-#   1. Ensure the VHDX data disk is attached and mounted at /mnt/wsl/<name>.
-#   2. VERIFY the disk identity (mountpoint + optional UUID) — fail closed.
-#   3. First-run: seed /home, /root, /workspace onto the data disk.
-#   4. Bind /home, /root and /workspace onto the data disk.
-#   5. Start the paseo daemon as `paseo` (single owner, backgrounded).
+# Design (PURE-LINUX mount; NO Windows interop):
+#   Attaching the VHDX is the Windows side's job: a logon Scheduled Task runs a
+#   hidden PowerShell that attaches the VHDX as a BARE block device (`wsl
+#   --mount --vhd <path> --bare`) on the host. By the time this script runs, the
+#   guest already sees the raw disk. This script then does everything in Linux:
+#     1. Find the already-attached block device by UUID (blkid -U).
+#     2. `mount -t ext4 <dev> /mnt/<mntname>` (mntname from DATA_MNTNAME,
+#        default `devbox-data`, read out of /etc/agent-devbox.conf).
+#     3. VERIFY the mount identity (mountpoint + UUID) — fail closed.
+#     4. First-run: seed /home, /root, /workspace onto the data disk.
+#     5. Bind /home, /root and /workspace onto the data disk.
+#     6. Start the paseo daemon as `paseo` (single owner, backgrounded).
 #
-# It NEVER formats a disk. Formatting happens only in datadisk-init.sh, which is
-# invoked by the Windows installer for a freshly created VHDX. It also NEVER
-# re-launches the Windows installer: if the data disk cannot be mounted it enters
-# MAINTENANCE MODE and tells the user to run agent-devbox.bat themselves.
+# WHY NO INTEROP HERE (root cause of a confirmed boot loop):
+#   This file runs from `[boot]` on EVERY distro start — a point where WSL interop
+#   is not yet ready. Shelling out to Windows tooling (a bare attach, or triggering
+#   the host task) from inside `[boot]` is re-entrant and unsupported: the Windows
+#   binary is not on PATH yet, and a bare mount also needs an elevated token. Doing
+#   it here made the distro restart after the task trigger, then loop, then shut the
+#   VM down. So this script calls NO Windows binary (no wsl / no schtasks): the host
+#   attaches, the guest mounts, purely in Linux.
+#
+# NEVER FORMATS: formatting happens only in datadisk-init.sh, invoked by the Windows
+# installer for a freshly created VHDX. It also NEVER re-launches the Windows
+# installer: if the data disk cannot be mounted it enters MAINTENANCE MODE and tells
+# the user to run the installer themselves.
+#
+# MOUNT PATH: the data disk lives at /mnt/<name>, NOT under /mnt/ (the auto-mount
+# tmpfs shared across distros). A shared, distro-independent location would let two
+# distros using the same mount name collide on an identical path. Hence /mnt/<name>.
 #
 # SHELL OPTIONS — deliberately `set -uo pipefail` with NO `-e`:
-#   The mount chain has several best-effort steps that are EXPECTED to fail (the
-#   elevated Scheduled Task may not exist, `wsl.exe --mount --type ext4` can fail
-#   on some WSL builds, `--bare` needs a follow-up manual mount). Under `set -e`
-#   any one of those failures would abort the script BEFORE we could log it or
-#   write the MAINTENANCE MOTD. So we intentionally omit `-e` and check every
-#   step's exit status explicitly. Errors are still loud: they are logged and
-#   either advanced past or turned into a fail-closed exit 0 (MAINTENANCE MODE).
+#   The device wait is best-effort (the host Scheduled Task may not have attached
+#   the disk yet), and every step must be able to log before we bail out. Under
+#   `set -e` a single failed command would abort before we could write the
+#   MAINTENANCE MOTD. So we check every exit status explicitly instead. Errors stay
+#   loud: they are logged and turned into a fail-closed exit 0 (MAINTENANCE MODE).
 #
 # Layout: credentials/identity come from /etc/agent-devbox.conf (written by the
-# Windows installer): DATA_VHDX, DATA_UUID, PASEO_PASSWORD, DATA_MNTNAME,
-# DATA_TASK. The installer also registers an elevated Scheduled Task (named by
-# DATA_TASK) that runs `wsl.exe --mount --vhd <path> --type ext4 --name ...`.
+# Windows installer): DATA_VHDX, DATA_UUID, PASEO_PASSWORD, DATA_MNTNAME (and
+# DATA_TASK, consumed by the Windows side).
 #
 # This file is safe to SOURCE — every side effect lives in a function, and the
 # entry point is guarded by the BASH_SOURCE check at the bottom.
@@ -35,10 +51,12 @@ set -uo pipefail
 
 # --- env-overridable constants (overridable so tests can point them at tmp) ---
 CONF="${AGENT_DEVBOX_CONF:-/etc/agent-devbox.conf}"
-DATADIR="${AGENT_DEVBOX_DATADIR:-/mnt/wsl/agent-devbox-data}"
-MNTNAME="${AGENT_DEVBOX_MNTNAME:-agent-devbox-data}"
-TASKNAME="${AGENT_DEVBOX_TASK:-agent-devbox-mount-datadisk}"
 LOG_FILE="${AGENT_DEVBOX_LOG:-/var/log/agent-devbox-boot.log}"
+MOTD_FILE="${AGENT_DEVBOX_MOTD:-/etc/motd}"
+# DATADIR is derived in load_conf() from DATA_MNTNAME / AGENT_DEVBOX_DATADIR.
+# Left empty at source time (unless explicitly overridden) so sourcing has no
+# side effects and no hardcoded path leaks in.
+DATADIR="${AGENT_DEVBOX_DATADIR:-}"
 
 # Installer-populated values (reloaded by load_conf). Pre-declared empty so the
 # functions stay safe under `set -u` even when called directly, or when the file
@@ -59,8 +77,8 @@ log() {
 }
 
 # load_conf(): reset the installer-written values, source the config if present,
-# then let DATA_MNTNAME / DATA_TASK override the mount name / task name, and
-# export PASEO_PASSWORD for the daemon child.
+# then resolve the mount name and the concrete DATADIR, and export
+# PASEO_PASSWORD for the daemon child.
 load_conf() {
   DATA_VHDX=""
   DATA_UUID=""
@@ -69,31 +87,13 @@ load_conf() {
   if [ -f "$CONF" ]; then
     . "$CONF"
   fi
-  if [ -n "${DATA_MNTNAME:-}" ]; then
-    MNTNAME="$DATA_MNTNAME"
-  fi
-  if [ -n "${DATA_TASK:-}" ]; then
-    TASKNAME="$DATA_TASK"
+  MNTNAME="${DATA_MNTNAME:-devbox-data}"
+  if [ -n "${AGENT_DEVBOX_DATADIR:-}" ]; then
+    DATADIR="$AGENT_DEVBOX_DATADIR"
+  else
+    DATADIR="/mnt/$MNTNAME"
   fi
   export PASEO_PASSWORD
-}
-
-# wsl_exe(): locate wsl.exe on PATH, else the fixed System32 path.
-wsl_exe() {
-  if command -v wsl.exe >/dev/null 2>&1; then
-    command -v wsl.exe
-  elif [ -x /mnt/c/Windows/System32/wsl.exe ]; then
-    echo /mnt/c/Windows/System32/wsl.exe
-  fi
-}
-
-# schtasks_exe(): locate schtasks.exe on PATH, else the fixed System32 path.
-schtasks_exe() {
-  if command -v schtasks.exe >/dev/null 2>&1; then
-    command -v schtasks.exe
-  elif [ -x /mnt/c/Windows/System32/schtasks.exe ]; then
-    echo /mnt/c/Windows/System32/schtasks.exe
-  fi
 }
 
 # is_mounted(): true when $DATADIR is a live mountpoint.
@@ -109,8 +109,8 @@ is_mounted() {
 bind_and_verify() {
   mountpoint -q "$2" || mount --bind "$1" "$2"
   local src dst
-  src="$(stat -c '%d:%i' "$1" 2>/dev/null || true)"
-  dst="$(stat -c '%d:%i' "$2" 2>/dev/null || true)"
+  src="$(stat -c '%d:%i' "$1" 2>/dev/null)"
+  dst="$(stat -c '%d:%i' "$2" 2>/dev/null)"
   if [ -z "$src" ] || [ -z "$dst" ]; then
     return 1
   fi
@@ -136,10 +136,12 @@ wait_mounted() {
   return 1
 }
 
-# ensure_mounted(): the 5-step mount chain. Every step is best-effort and
-# non-fatal; returns 0 the moment $DATADIR is mounted, else 1.
+# ensure_mounted(): PURE-LINUX mount chain (no interop). The host has already
+# attached the VHDX as a bare block device; here we only wait for the device to
+# appear (found by UUID), mount it by hand, and confirm. Returns 0 the moment
+# $DATADIR is mounted, else 1. Every step is logged; none is fatal by itself.
 ensure_mounted() {
-  local wx st dev
+  local dev
 
   # 1) already mounted -> nothing to do.
   if is_mounted; then
@@ -153,43 +155,53 @@ ensure_mounted() {
     return 1
   fi
 
-  wx="$(wsl_exe)"
-  st="$(schtasks_exe)"
-  log "正在挂载数据盘… (vhd=$DATA_VHDX)"
-
-  # 3) preferred: trigger the elevated Scheduled Task registered by the installer.
-  if [ -n "$st" ]; then
-    log "调用计划任务 $TASKNAME 挂载数据盘"
-    "$st" /run /tn "$TASKNAME" || log "计划任务 $TASKNAME 运行失败（继续尝试直接挂载）"
-    wait_mounted 30 && return 0
-  fi
-
-  # 4) direct: wsl.exe --mount with an explicit --type ext4 (auto-detection of a
-  #    whole-disk ext4 image fails on some WSL builds).
-  if [ -n "$wx" ]; then
-    log "直接调用 wsl.exe --mount --type ext4"
-    "$wx" --mount --vhd "$DATA_VHDX" --type ext4 --name "$MNTNAME" || log "wsl.exe --mount --type ext4 失败（继续回退）"
-    wait_mounted 30 && return 0
-  fi
-
-  # 5) fallback: --bare attach, then find the device by UUID and mount it manually.
-  log "回退挂载：--bare 附加数据盘，再按 UUID 手动挂载"
-  if [ -n "$wx" ]; then
-    "$wx" --mount --vhd "$DATA_VHDX" --bare || log "wsl.exe --mount --bare 失败（继续按 UUID 探测）"
-  fi
+  # 3) wait up to 30s for the host-sided attach to expose the block device.
+  log "正在按 UUID 查找数据盘… (uuid=$DATA_UUID)"
   dev=""
   for _ in $(seq 1 30); do
-    dev="$(dev_by_uuid)" && break
+    if dev="$(dev_by_uuid)"; then
+      if [ -n "$dev" ]; then
+        break
+      fi
+    fi
     sleep 1
   done
-  if [ -n "$dev" ]; then
-    mkdir -p "$DATADIR"
-    mount -t ext4 "$dev" "$DATADIR" || log "手动挂载 $dev 到 $DATADIR 失败"
-    wait_mounted 10 && return 0
+
+  # 4) device never appeared -> the host task likely has not attached yet.
+  if [ -z "$dev" ]; then
+    log "未找到 UUID=$DATA_UUID 的数据盘设备（宿主计划任务可能尚未附加）"
+    return 1
   fi
 
-  # 6) every strategy failed.
+  # 5) mount the raw device at $DATADIR.
+  mkdir -p "$DATADIR"
+  if ! mount -t ext4 "$dev" "$DATADIR"; then
+    log "挂载 $dev 到 $DATADIR 失败"
+    return 1
+  fi
+
+  # 6) confirm the mount actually took.
+  if is_mounted; then
+    return 0
+  fi
   return 1
+}
+
+# write_maintenance_motd(): fail-closed notice shown to the user on login.
+write_maintenance_motd() {
+  cat > "$MOTD_FILE" <<'EOF'
+*** agent-devbox is in MAINTENANCE MODE / 维护模式 ***
+数据盘未挂载，未初始化也未启动服务。
+The data disk is not mounted, so nothing was seeded or started.
+请运行 Windows 安装器（agent-devbox.bat 或 agent-devbox-core.bat）创建/挂载数据盘。
+Run the Windows installer (agent-devbox.bat / agent-devbox-core.bat) to create/attach the data disk.
+EOF
+}
+
+# clear_motd(): drop any stale maintenance notice on a healthy boot. Best effort;
+# it never masks anything else.
+clear_motd() {
+  : > "$MOTD_FILE"
 }
 
 # main(): the full boot sequence.
@@ -199,22 +211,18 @@ main() {
 
   if ! ensure_mounted; then
     log "FATAL: data disk not mounted at $DATADIR（数据盘未挂载）"
-    cat >/etc/motd <<'EOF'
-*** agent-devbox is in MAINTENANCE MODE / 维护模式 ***
-数据盘未挂载，未初始化也未启动服务。
-The data disk is not mounted, so nothing was seeded or started.
-请运行 Windows 安装器 agent-devbox.bat 创建/挂载数据盘。
-Run the Windows installer (agent-devbox.bat) to create/attach the data disk.
-EOF
+    write_maintenance_motd
     exit 0
   fi
   log "数据盘挂载成功"
+  clear_motd
 
   # --- verify identity; fail closed on UUID mismatch -------------------------
   if [ -n "${DATA_UUID:-}" ]; then
-    cur="$(findmnt -rno UUID --mountpoint "$DATADIR" 2>/dev/null || true)"
+    cur="$(findmnt -rno UUID --mountpoint "$DATADIR" 2>/dev/null)"
     if [ "$cur" != "$DATA_UUID" ]; then
       log "FATAL: data disk UUID mismatch (found='$cur' expected='$DATA_UUID')（数据盘 UUID 不匹配）"
+      write_maintenance_motd
       exit 0
     fi
   fi
@@ -241,6 +249,7 @@ EOF
   bind_and_verify "$DATADIR/workspace" /workspace || bind_ok=0
   if [ "$bind_ok" -ne 1 ]; then
     log "FATAL: /home /root /workspace 未正确绑定到数据盘，拒绝启动服务"
+    write_maintenance_motd
     exit 0
   fi
   chmod 0700 /root

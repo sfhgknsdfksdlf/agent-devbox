@@ -3,10 +3,16 @@
   agent-devbox Windows 一键安装脚本（WSL2）。
 
 .DESCRIPTION
-  - 把发布好的镜像导入为名为 `agent-devbox` 的 WSL2 发行版。
+  - 按变体导入镜像并让两个变体并存：agents 变体导入为 `agent-devbox`，core 变体
+    导入为 `agent-devbox-core`（各自独立的发行版名 / 安装目录 / 计划任务名）。
+  - 默认安装目录：agents = D:\WSL\agent-devbox，core = D:\WSL\agent-devbox-core。
   - 创建并挂载一块 32GB 动态 VHDX 数据磁盘并初始化。
+  - 数据盘的 ext4 标签与挂载名统一为 `devbox-data`（两个变体共用同一标签，同一块
+    数据盘在任一发行版下都能识别）。
   - 把数据磁盘接入发行版，使 /home、/root、/workspace 在镜像升级后依然保留。
-  - 始终注册一个登录时自动重新挂载数据磁盘的计划任务（可用 -NoTask 跳过）。
+  - 始终注册一个登录时自动挂载数据磁盘的计划任务（attach-only：只以 `--bare` 接入
+    裸磁盘，由发行版启动脚本按 UUID 挂载；命令经 -EncodedCommand 隐藏执行，不弹空白
+    `wsl.exe` 控制台窗口，也避免启动脚本被再次触发而重入；可用 -NoTask 跳过）。
 
   幂等：可重复运行；只创建缺失的部分（发行版 / 数据磁盘），并刷新启动配置；
   已存在的数据磁盘永远不会被重新格式化。
@@ -40,12 +46,19 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference    = 'SilentlyContinue'
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 
-$Distro   = 'agent-devbox'
-$DiskName = 'agent-devbox-data'
-$VhdxName = 'data.vhdx'
-$Repo     = 'sfhgknsdfksdlf/agent-devbox'
-$ConfPath = '/etc/agent-devbox.conf'
-$TaskName = 'agent-devbox-mount-datadisk'
+# 数据盘的 ext4 标签与挂载名：两个变体统一，指向同一块可共用的数据盘。
+$Label     = 'devbox-data'
+$MountName = 'devbox-data'
+$VhdxName  = 'data.vhdx'
+$Repo      = 'sfhgknsdfksdlf/agent-devbox'
+$ConfPath  = '/etc/agent-devbox.conf'
+
+# 变体映射：只有发行版名 / 安装目录 / 计划任务名按变体区分，数据盘标签与挂载名统一。
+# $Variant 选定后（见下方变体选择块）再据此展开为 $Distro / $TaskName。
+$VariantMap = @{
+  agents = [pscustomobject]@{ Distro = 'agent-devbox';      InstallDir = 'D:\WSL\agent-devbox';      TaskName = 'agent-devbox-mount-datadisk' }
+  core   = [pscustomobject]@{ Distro = 'agent-devbox-core'; InstallDir = 'D:\WSL\agent-devbox-core'; TaskName = 'agent-devbox-core-mount-datadisk' }
+}
 
 # --- 输出辅助：统一的进度 / 提示样式 ----------------------------------------
 function Step([string]$m) { Write-Host $m -ForegroundColor Cyan }
@@ -75,12 +88,25 @@ function Test-DistroExists { (Get-WslDistros) -contains $Distro }
 function Resolve-ReleaseTag {
   param([string] $Sel)
   $sel = Normalize-ReleaseTag $Sel
+  $hdr = @{ 'User-Agent' = 'agent-devbox-installer' }
+  $api = "https://api.github.com/repos/$Repo/releases"
   if ($sel -eq 'beta') {
-    $api  = "https://api.github.com/repos/$Repo/releases?per_page=100"
-    $rels = Invoke-RestMethod $api -Headers @{ 'User-Agent' = 'agent-devbox-installer' }
+    $rels = Invoke-RestMethod "${api}?per_page=100" -Headers $hdr
     $beta = $rels | Where-Object { $_.prerelease -eq $true -and $_.tag_name -like 'beta-*' } | Select-Object -First 1
     if (-not $beta) { throw '未找到 beta 预发布版本。' }
     return $beta.tag_name
+  }
+  if ($sel -eq 'latest') {
+    # 优先正式（非预发布）Release；若当前只有预发布（beta）Release，则退回最新的一个。
+    try { return (Invoke-RestMethod "$api/latest" -Headers $hdr).tag_name }
+    catch {
+      $first = @(Invoke-RestMethod "${api}?per_page=1" -Headers $hdr | Select-Object -First 1)
+      if ($first.Count -ge 1 -and $first[0].tag_name) {
+        Write-Host "暂无正式版 Release，改用最新的 Release：$($first[0].tag_name)"
+        return $first[0].tag_name
+      }
+      throw '未找到任何 Release。'
+    }
   }
   return $sel
 }
@@ -92,8 +118,15 @@ if (-not $PSBoundParameters.ContainsKey('Variant') -and -not $Yes -and [Environm
   else { $Variant = 'agents' }
 }
 
+# 应用变体映射：按选定变体展开发行版名 / 计划任务名（安装目录在决定安装目录处展开）。
+$v        = $VariantMap[$Variant]
+$Distro   = $v.Distro
+$TaskName = $v.TaskName
+
 # --- 提权一次（UAC）：提权子进程写日志，原窗口等待后回显整份日志 ------------
 if (-not (Test-Admin)) {
+  # Explorer-extracted scripts may carry Mark-of-the-Web, which RemoteSigned
+  # would block; the .bat/.cmd entry points intentionally keep Bypass.
   $argv = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$PSCommandPath`"", '-Variant', $Variant)
   if ($InstallDir) { $argv += @('-InstallDir', "`"$InstallDir`"") }
   if ($ReleaseTag) { $argv += @('-ReleaseTag', $ReleaseTag) }
@@ -101,7 +134,11 @@ if (-not (Test-Admin)) {
   if ($Reinstall)  { $argv += '-Reinstall' }
   if ($NoTask)     { $argv += '-NoTask' }
 
-  $parentLog = if ($LogPath) { $LogPath } else { Join-Path ([System.IO.Path]::GetTempPath()) ("agent-devbox-install-{0}.log" -f (Get-Date -Format 'yyyyMMdd-HHmmss')) }
+  $parentLog = if ($LogPath) { $LogPath } else {
+    $scratch = Join-Path $env:LOCALAPPDATA 'agent-devbox'
+    New-Item -ItemType Directory -Path $scratch -Force | Out-Null
+    Join-Path $scratch ("agent-devbox-install-{0}.log" -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
+  }
   $argv += @('-LogPath', "`"$parentLog`"")
   Write-Host '正在请求管理员权限（会弹出一次 UAC 授权提示）…'
   $p = $null
@@ -132,7 +169,7 @@ if (-not (Test-Admin)) {
         Warn "注意：当前（非提权）用户看不到发行版 '$Distro'。WSL 发行版按用户注册；若 UAC 用了另一个管理员帐户，发行版会落在那个帐户下。请用安装时的同一帐户，或在管理员帐户下运行 wsl -l -v 检查。"
       }
     } catch {}
-    Ok '安装完成。进入环境：wsl -d agent-devbox'
+    Ok "安装完成。进入环境：wsl -d $Distro"
     exit 0
   } finally {
     Remove-Item -LiteralPath $parentLog -Force -ErrorAction SilentlyContinue
@@ -176,7 +213,7 @@ if ($__haveEnsure) {
 
 # --- 决定安装目录 -----------------------------------------------------------
 if (-not $InstallDir) {
-  $default = 'D:\WSL\agent-devbox'
+  $default = $VariantMap[$Variant].InstallDir
   if ($Yes) {
     $InstallDir = $default
   } else {
@@ -185,6 +222,16 @@ if (-not $InstallDir) {
   }
 }
 New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
+
+# --- 手动挂载/卸载助手（复制到安装目录，方便排查或挂载其它数据盘）------------
+foreach ($helper in @('mount-datadisk.ps1', 'mount-datadisk.cmd', 'unmount-datadisk.ps1', 'unmount-datadisk.cmd')) {
+  $helperSrc = Join-Path $PSScriptRoot $helper
+  if (Test-Path -LiteralPath $helperSrc) {
+    Copy-Item -LiteralPath $helperSrc -Destination (Join-Path $InstallDir $helper) -Force
+  } else {
+    Warn "未找到 $helper（跳过复制到安装目录）。"
+  }
+}
 $VhdxPath = Join-Path $InstallDir $VhdxName
 Write-Host "发行版=$Distro  变体=$Variant  安装目录=$InstallDir"
 
@@ -373,18 +420,32 @@ Step '[7/10] 初始化数据磁盘…'
 Invoke-Native 'wsl.exe' @('--mount', '--vhd', $VhdxPath, '--bare') | Out-Null
 Start-Sleep -Seconds 2
 
-$initOut = Invoke-Native 'wsl.exe' @('-d', $Distro, '-u', 'root', '-e', 'bash', '-lc', '/usr/local/bin/datadisk-init.sh')
+$initOut = Invoke-Native 'wsl.exe' @('-d', $Distro, '-u', 'root', '-e', 'bash', '-lc', "/usr/local/bin/datadisk-init.sh $(Quote-Bash $Label)")
 Write-Host $initOut
 $uuid = ''
 foreach ($line in ($initOut -split "`n")) {
   if ($line -match 'UUID=([0-9a-fA-F-]{36})') { $uuid = $Matches[1] }
 }
-# 兜底：按标签读取 UUID。只接受退出码为 0 且形如 UUID 的结果——Invoke-Native 合并了
-# stderr，不能把原生进程的报错文本当成 UUID。
+# 兜底 1（可选）：回读上一次安装写入的 DATA_UUID（重装 / 数据盘已初始化的场景）。
+# 只接受退出码为 0 且形如 UUID 的结果——Invoke-Native 合并了 stderr，不能把原生
+# 进程的报错文本当成 UUID。
 if (-not $uuid) {
-  $blkidOut = Invoke-Native 'wsl.exe' @('-d', $Distro, '-u', 'root', '-e', 'bash', '-lc', "blkid -t LABEL=$DiskName -s UUID -o value")
+  $confOut = Invoke-Native 'wsl.exe' @('-d', $Distro, '-u', 'root', '-e', 'bash', '-lc', "sed -n 's/^DATA_UUID=//p' $ConfPath 2>/dev/null | tr -d `"'`" | tr -d '\r'")
   if ($script:NativeExit -eq 0) {
-    $uuid = ($blkidOut | ForEach-Object { "$_".Trim() } | Where-Object { $_ -match '^[0-9a-fA-F-]{36}$' } | Select-Object -First 1)
+    $uuid = ($confOut | ForEach-Object { "$_".Trim() } | Where-Object { $_ -match '^[0-9a-fA-F-]{36}$' } | Select-Object -First 1)
+  }
+}
+# 兜底 2：按标签读取 UUID。两个变体（agents / core）的数据盘共用同一标签 `devbox-data`，
+# 因此可能匹配到多个不同 UUID —— 此时必须报错，绝不静默取第一个。
+if (-not $uuid) {
+  $blkidOut = Invoke-Native 'wsl.exe' @('-d', $Distro, '-u', 'root', '-e', 'bash', '-lc', "blkid -t LABEL=$Label -s UUID -o value")
+  if ($script:NativeExit -eq 0) {
+    $uuids = @($blkidOut | ForEach-Object { "$_".Trim() } | Where-Object { $_ -match '^[0-9a-fA-F-]{36}$' } | Select-Object -Unique)
+    if ($uuids.Count -eq 1) {
+      $uuid = $uuids[0]
+    } elseif ($uuids.Count -gt 1) {
+      throw "数据盘标签 '$Label' 匹配到多个不同的 UUID（$($uuids -join ', ')）：agents / core 两个变体共用同一标签，请先断开或删除多余的数据盘，再重试安装。"
+    }
   }
 }
 if (-not $uuid) { throw '无法确定数据盘 UUID：datadisk-init 与 blkid 都没有返回有效 UUID，数据盘可能未初始化。' }
@@ -413,7 +474,7 @@ if ([string]::IsNullOrWhiteSpace($pw)) {
 
 # --- [9/10] 写入启动配置 ---------------------------------------------------
 Step '[9/10] 写入启动配置 /etc/agent-devbox.conf…'
-$conf = "DATA_VHDX=$(Quote-Bash $VhdxPath)`nDATA_UUID=$(Quote-Bash $uuid)`nPASEO_PASSWORD=$(Quote-Bash $pw)`nDATA_MNTNAME='agent-devbox-data'`nDATA_TASK='agent-devbox-mount-datadisk'`n"
+$conf = "DATA_VHDX=$(Quote-Bash $VhdxPath)`nDATA_UUID=$(Quote-Bash $uuid)`nPASEO_PASSWORD=$(Quote-Bash $pw)`nDATA_MNTNAME=$(Quote-Bash $MountName)`nDATA_TASK=$(Quote-Bash $TaskName)`n"
 $b64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($conf))
 Invoke-Native 'wsl.exe' @('-d', $Distro, '-u', 'root', '-e', 'bash', '-lc', "set -o pipefail; umask 077; printf '%s' '$b64' | base64 -d > $ConfPath && chmod 600 $ConfPath") | Out-Null
 if ($script:NativeExit -ne 0) { throw "写入 $ConfPath 失败（退出码 $script:NativeExit）" }
@@ -427,23 +488,39 @@ if ($NoTask) {
   if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
     Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
   }
-  $action    = New-ScheduledTaskAction -Execute 'wsl.exe' -Argument "--mount --vhd `"$VhdxPath`" --type ext4 --name agent-devbox-data"
+  # attach-only：只把 VHDX 作为裸磁盘接入（--bare），不指定文件系统类型 / 挂载名，
+  # 由发行版启动脚本按 UUID 自行挂载。命令经 -EncodedCommand 隐藏窗口执行，既避免
+  # 登录时弹出空白 wsl.exe 控制台窗口，也避免 `wsl` 启动发行版而重入启动脚本。
+  $mountVhd  = $VhdxPath.Replace("'", "''")
+  $cmd       = "& wsl.exe --mount --vhd '$mountVhd' --bare"
+  $enc       = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($cmd))
+  $action    = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -EncodedCommand $enc"
   $trigger   = New-ScheduledTaskTrigger -AtLogOn
   $principal = New-ScheduledTaskPrincipal -UserId $RunAsUser -RunLevel Highest
-  Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Principal $principal `
-    -Description 'agent-devbox：登录时自动挂载数据磁盘' | Out-Null
+  $settings  = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 5)
+  Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings `
+    -Description "$Distro：登录时自动挂载数据磁盘" | Out-Null
   Ok "已注册计划任务 '$TaskName'（开机自动挂载数据磁盘）。"
+  # 立即触发一次：安装器末尾会 terminate 并启动发行版，而 [boot] 需要磁盘已附加；
+  # 只注册 AtLogOn 任务的话，本次会话的首次启动会找不到设备而进维护模式。
+  # 任务内的 wsl --mount 可能较慢，但 wsl-boot.sh 会按 UUID 轮询最多 30 秒。
+  try {
+    Start-ScheduledTask -TaskName $TaskName | Out-Null
+    Start-Sleep -Seconds 1
+  } catch {
+    Warn "立即触发计划任务失败（下次登录仍会自动挂载）：$($_.Exception.Message)"
+  }
 }
 
 # --- [完成] 重启发行版并汇总 ----------------------------------------------
 Step '[完成] 重启发行版…'
 Invoke-Native 'wsl.exe' @('--terminate', $Distro) | Out-Null
-$readyOut = Invoke-Native 'wsl.exe' @('-d', $Distro, '-u', 'root', '-e', 'bash', '-lc', 'echo "agent-devbox 已就绪"; mount | grep -E "agent-devbox-data| /home | /root | /workspace " || true')
+$readyOut = Invoke-Native 'wsl.exe' @('-d', $Distro, '-u', 'root', '-e', 'bash', '-lc', "echo `"$Distro 已就绪`"; mount | grep -E `"$MountName| /home | /root | /workspace `" || true")
 Write-Host $readyOut
 Write-Host ''
 Assert-DistroReady -Distro $Distro -InstallDir $InstallDir
 Ok "安装完成。变体=$Variant  Release=$ReleaseTag  安装目录=$InstallDir"
-Write-Host '进入环境：wsl -d agent-devbox'
+Write-Host "进入环境：wsl -d $Distro"
 Write-Host 'paseo 网页界面：在打开的 WSL 里启动 paseo 后，浏览器访问 http://localhost:6767（登录密码即上面设置的 PASEO_PASSWORD）。'
 Write-Host '若要修改 paseo 密码：编辑 /etc/agent-devbox.conf，或在启动前设置环境变量 PASEO_PASSWORD。'
 

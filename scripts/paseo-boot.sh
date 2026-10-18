@@ -8,6 +8,15 @@
 # =============================================================================
 set -euo pipefail
 
+# The WSL `/etc/wsl.conf [boot]` command runs with a minimal PATH (often without
+# /usr/bin), so `gosu` cannot resolve `env` and the daemon never starts. Pin a
+# sane PATH and resolve the tools once; this is a no-op in Docker, where PATH is
+# already complete (the existing value is appended, never dropped).
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:+:$PATH}"
+GOSU_BIN="$(command -v gosu)" || { echo "FATAL: gosu not found in PATH" >&2; exit 1; }
+ENV_BIN="$(command -v env)"   || { echo "FATAL: env not found in PATH" >&2; exit 1; }
+SEED_BIN="$(command -v seed-agent-config.sh)" || { echo "FATAL: seed-agent-config.sh not found in PATH" >&2; exit 1; }
+
 PASEO_USER=paseo
 PASEO_HOME_DIR=/home/paseo
 export PASEO_HOME="$PASEO_HOME_DIR/.paseo"
@@ -31,16 +40,16 @@ chown "$PASEO_USER:$PASEO_USER" "$PASEO_HOME_DIR" 2>/dev/null || true
 if [ -d /workspace ]; then chown "$PASEO_USER:$PASEO_USER" /workspace 2>/dev/null || true; fi
 
 # Seed missing config as paseo.
-gosu "$PASEO_USER" env HOME="$PASEO_HOME_DIR" /usr/local/bin/seed-agent-config.sh
+"$GOSU_BIN" "$PASEO_USER" "$ENV_BIN" HOME="$PASEO_HOME_DIR" "$SEED_BIN"
 
 # Idempotent persisted settings (best-effort: daemon run also gets the env below).
-gosu "$PASEO_USER" env HOME="$PASEO_HOME_DIR" PASEO_HOME="$PASEO_HOME" \
+"$GOSU_BIN" "$PASEO_USER" "$ENV_BIN" HOME="$PASEO_HOME_DIR" PASEO_HOME="$PASEO_HOME" \
   paseo daemon config set daemon.listen 0.0.0.0:6767 >/dev/null 2>&1 || true
-gosu "$PASEO_USER" env HOME="$PASEO_HOME_DIR" PASEO_HOME="$PASEO_HOME" \
+"$GOSU_BIN" "$PASEO_USER" "$ENV_BIN" HOME="$PASEO_HOME_DIR" PASEO_HOME="$PASEO_HOME" \
   paseo daemon config set features.webUi.enabled true >/dev/null 2>&1 || true
 
 # Foreground daemon as paseo, with the deployment env overrides.
-exec gosu "$PASEO_USER" env \
+exec "$GOSU_BIN" "$PASEO_USER" "$ENV_BIN" \
   HOME="$PASEO_HOME_DIR" \
   PASEO_HOME="$PASEO_HOME" \
   PASEO_LISTEN="0.0.0.0:6767" \

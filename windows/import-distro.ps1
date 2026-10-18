@@ -13,8 +13,8 @@
 [CmdletBinding()]
 param(
   [ValidateSet('agents', 'core')] [string] $Variant = 'agents',
-  [string] $Distro = 'agent-devbox',
-  [string] $InstallDir = 'D:\WSL\agent-devbox',
+  [string] $Distro = '',
+  [string] $InstallDir = '',
   [string] $ReleaseTag = 'latest',
   [string] $Repo = 'sfhgknsdfksdlf/agent-devbox'
 )
@@ -29,15 +29,34 @@ $__ensure = Join-Path $PSScriptRoot 'wsl-ensure.ps1'
 if (-not (Test-Path -LiteralPath $__ensure)) { throw '缺少 wsl-ensure.ps1；请从 Release 压缩包中完整解压所有脚本。' }
 . $__ensure
 
+# 变体 -> 发行版名/安装目录 的默认映射；显式传入的 -Distro/-InstallDir 仍然优先。
+$distroMap = @{
+  agents = [pscustomobject]@{ Distro = 'agent-devbox';      InstallDir = 'D:\WSL\agent-devbox' }
+  core   = [pscustomobject]@{ Distro = 'agent-devbox-core'; InstallDir = 'D:\WSL\agent-devbox-core' }
+}
+if (-not $Distro)     { $Distro     = $distroMap[$Variant].Distro }
+if (-not $InstallDir) { $InstallDir = $distroMap[$Variant].InstallDir }
+
 New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
 
 # Beta resolution: `b`/`beta` -> the newest `beta-*` prerelease.
 $ReleaseTag = Normalize-ReleaseTag $ReleaseTag
+$hdr = @{ 'User-Agent' = 'agent-devbox-import' }
+$relBase = "https://api.github.com/repos/$Repo/releases"
 if ($ReleaseTag -eq 'beta') {
-  $rels = Invoke-RestMethod "https://api.github.com/repos/$Repo/releases?per_page=100" -Headers @{ 'User-Agent' = 'agent-devbox-import' }
+  $rels = Invoke-RestMethod "${relBase}?per_page=100" -Headers $hdr
   $beta = $rels | Where-Object { $_.prerelease -eq $true -and $_.tag_name -like 'beta-*' } | Select-Object -First 1
   if (-not $beta) { throw '未找到 beta 预发布版本。' }
   $ReleaseTag = $beta.tag_name
+}
+if ($ReleaseTag -eq 'latest') {
+  # 优先正式 Release；若当前只有预发布（beta）Release，则退回最新的一个。
+  try { $ReleaseTag = (Invoke-RestMethod "$relBase/latest" -Headers $hdr).tag_name }
+  catch {
+    $first = @(Invoke-RestMethod "${relBase}?per_page=1" -Headers $hdr | Select-Object -First 1)
+    if ($first.Count -ge 1 -and $first[0].tag_name) { $ReleaseTag = $first[0].tag_name }
+    else { throw '未找到任何 Release。' }
+  }
 }
 
 $stzName = "rootfs-$Variant-amd64.tar.zst"
