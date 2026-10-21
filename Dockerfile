@@ -176,11 +176,17 @@ RUN set -eux; \
 # -----------------------------------------------------------------------------
 # L11) paseo CLI (daemon + bundled Web UI) + OpenCode = LATEST V1 ONLY.
 #      NEVER install `@opencode/cli` (that is V2 and shares the `opencode` bin).
+#      The symlink in /root/.opencode/bin is what the OpenCode DESKTOP app probes
+#      inside a WSL distro (it never searches PATH); scripts/wsl-boot.sh recreates
+#      it on every boot because /root is bind-mounted from the data disk.
 # -----------------------------------------------------------------------------
 RUN set -eux; \
     npm install -g @getpaseo/cli "opencode-ai@^1"; \
     npm cache clean --force; \
-    paseo --version; opencode --version
+    paseo --version; opencode --version; \
+    mkdir -p /root/.opencode/bin; \
+    ln -sfn /usr/local/bin/opencode /root/.opencode/bin/opencode; \
+    test -x /root/.opencode/bin/opencode
 
 # -----------------------------------------------------------------------------
 # L12) Seed omo/OpenCode config OUTSIDE the mounted /home (bun required: npx is
@@ -213,6 +219,7 @@ RUN set -eux; \
 # L14) config, shared scripts, bundled Windows helper
 # -----------------------------------------------------------------------------
 COPY config/wsl.conf /etc/wsl.conf
+COPY config/wsl-distribution.conf /etc/wsl-distribution.conf
 COPY config/profile.d/ /etc/profile.d/
 COPY scripts/ /usr/local/bin/
 RUN set -eux; chmod +x /usr/local/bin/*.sh; \

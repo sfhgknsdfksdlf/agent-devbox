@@ -161,6 +161,57 @@ SH
   assert_log_lacks 'mount'
 }
 
+# 首次 --import 完、安装器还没写 /etc/agent-devbox.conf 时会跑一次 [boot]。这不是故障：
+# 日志必须是 INFO（不能吓人的 FATAL），也不能去碰 mount。
+@test "missing conf (fresh import): INFO, not FATAL, and no mount call" {
+  base_shims
+  rm -f "$AGENT_DEVBOX_CONF"
+  run bash -c '. "$SCRIPT"; load_conf; ensure_mounted'
+  [ "$status" -eq 1 ]
+  # 先存下来：assert_log_* 内部的 run 会覆盖 $output。
+  boot_out="$output"
+  assert_log_lacks 'mount'
+  printf '%s' "$boot_out" | grep -Fq '尚未写入'
+  ! printf '%s' "$boot_out" | grep -Fq 'FATAL'
+}
+
+# paseo 自己会轮转 daemon.log（10MB x 3），但 /var/log/paseo-boot.log 是本脚本的
+# stdout 重定向，没人管 -> 启动前按大小滚一份（保留 .1）。
+@test "rotate_log: a small log is left untouched" {
+  printf 'hello\n' > "$TMP/paseo.log"
+  run bash -c '. "$SCRIPT"; rotate_log "$1" 100' _ "$TMP/paseo.log"
+  [ "$status" -eq 0 ]
+  [ -s "$TMP/paseo.log" ]
+  [ ! -e "$TMP/paseo.log.1" ]
+}
+
+@test "rotate_log: an oversized log becomes .1 and a second rotation replaces it" {
+  head -c 64 /dev/zero | tr '\0' 'x' > "$TMP/paseo.log"
+  run bash -c '. "$SCRIPT"; rotate_log "$1" 10' _ "$TMP/paseo.log"
+  [ "$status" -eq 0 ]
+  [ ! -e "$TMP/paseo.log" ]
+  [ -s "$TMP/paseo.log.1" ]
+  head -c 64 /dev/zero | tr '\0' 'y' > "$TMP/paseo.log"
+  run bash -c '. "$SCRIPT"; rotate_log "$1" 10' _ "$TMP/paseo.log"
+  [ "$status" -eq 0 ]
+  grep -Fq 'y' "$TMP/paseo.log.1"
+  ! grep -Fq 'x' "$TMP/paseo.log.1"
+}
+
+@test "main: the paseo stdout log is rotated before the child starts" {
+  run grep -nE 'rotate_log "\$PASEO_LOG" "\$PASEO_LOG_MAX"' "$SCRIPT"
+  [ "$status" -eq 0 ]
+}
+
+@test "empty conf (exists but no DATA_VHDX): still reports an unconfigured disk" {
+  base_shims
+  : > "$AGENT_DEVBOX_CONF"
+  run bash -c '. "$SCRIPT"; load_conf; ensure_mounted'
+  [ "$status" -eq 1 ]
+  printf '%s' "$output" | grep -Fq '未配置 DATA_VHDX'
+  ! printf '%s' "$output" | grep -Fq '尚未写入'
+}
+
 @test "UUID resolvable: rc 0 and mount -t ext4 onto the derived target" {
   base_shims
   conf_with_vhdx
@@ -199,13 +250,13 @@ SH
   [ "$output" = "/mnt/custom" ]
 }
 
-@test "write_maintenance_motd names both launchers in the MOTD" {
+@test "write_maintenance_motd points at the install.ps1 web entry" {
   run bash -c '. "$SCRIPT"; write_maintenance_motd'
   [ "$status" -eq 0 ]
   [ -s "$AGENT_DEVBOX_MOTD" ]
-  run grep -Fq 'agent-devbox.bat' "$AGENT_DEVBOX_MOTD"
+  run grep -Fq 'install.ps1' "$AGENT_DEVBOX_MOTD"
   [ "$status" -eq 0 ]
-  run grep -Fq 'agent-devbox-core.bat' "$AGENT_DEVBOX_MOTD"
+  run grep -Fq 'raw.githubusercontent.com' "$AGENT_DEVBOX_MOTD"
   [ "$status" -eq 0 ]
 }
 
@@ -244,4 +295,158 @@ SH
   [ "$status" -ne 0 ]
   run grep -Fq 'install-agent-devbox' "$SCRIPT"
   [ "$status" -ne 0 ]
+}
+
+# ---------------------------------------------------------------------------
+# ensure_opencode_shim(): the OpenCode DESKTOP app resolves the CLI inside a WSL
+# distro ONLY at "$HOME/.opencode/bin/opencode" (no PATH lookup) and then runs
+# "<that path> serve --hostname ... --port ...". The image ships the CLI at
+# /usr/local/bin/opencode, so this shim must exist in every home we boot with.
+# These cases deliberately do NOT call base_shims()/bind_shims(): that would
+# install the harness's no-op `mkdir` and fake `stat` shims and break the real
+# file operations under test.
+# ---------------------------------------------------------------------------
+
+# fake_cli <path>: a stand-in for /usr/local/bin/opencode (prints its version).
+fake_cli() {
+  printf '#!/bin/sh\necho 1.19.3\n' > "$1"
+  chmod +x "$1"
+}
+
+# shim <home>...: source the boot script with a temp CLI and run the shim.
+shim() {
+  env AGENT_DEVBOX_OPENCODE_BIN="$TMP/pkg/opencode" \
+    bash -c '. "$SCRIPT"; ensure_opencode_shim "$@"' _ "$@"
+}
+
+@test "ensure_opencode_shim: creates \$HOME/.opencode/bin/opencode -> CLI" {
+  mkdir -p "$TMP/pkg" "$TMP/h1"
+  fake_cli "$TMP/pkg/opencode"
+  run shim "$TMP/h1"
+  [ "$status" -eq 0 ]
+  [ -L "$TMP/h1/.opencode/bin/opencode" ]
+  [ "$(readlink "$TMP/h1/.opencode/bin/opencode")" = "$TMP/pkg/opencode" ]
+  run "$TMP/h1/.opencode/bin/opencode"
+  [ "$output" = "1.19.3" ]
+}
+
+@test "ensure_opencode_shim: second run is a no-op (same link, rc 0)" {
+  mkdir -p "$TMP/pkg" "$TMP/h1"
+  fake_cli "$TMP/pkg/opencode"
+  run shim "$TMP/h1"
+  [ "$status" -eq 0 ]
+  before="$(readlink "$TMP/h1/.opencode/bin/opencode")"
+  run shim "$TMP/h1"
+  [ "$status" -eq 0 ]
+  [ "$(readlink "$TMP/h1/.opencode/bin/opencode")" = "$before" ]
+}
+
+@test "ensure_opencode_shim: keeps a desktop-installed real CLI untouched" {
+  mkdir -p "$TMP/pkg" "$TMP/h1/.opencode/bin"
+  fake_cli "$TMP/pkg/opencode"
+  printf '#!/bin/sh\necho DESKTOP\n' > "$TMP/h1/.opencode/bin/opencode"
+  chmod +x "$TMP/h1/.opencode/bin/opencode"
+  run shim "$TMP/h1"
+  [ "$status" -eq 0 ]
+  [ ! -L "$TMP/h1/.opencode/bin/opencode" ]
+  run "$TMP/h1/.opencode/bin/opencode"
+  [ "$output" = "DESKTOP" ]
+}
+
+@test "ensure_opencode_shim: chmod +x an existing but non-executable CLI" {
+  mkdir -p "$TMP/pkg" "$TMP/h1/.opencode/bin"
+  fake_cli "$TMP/pkg/opencode"
+  printf '#!/bin/sh\necho KEPT\n' > "$TMP/h1/.opencode/bin/opencode"
+  chmod -x "$TMP/h1/.opencode/bin/opencode"
+  run shim "$TMP/h1"
+  [ "$status" -eq 0 ]
+  [ ! -L "$TMP/h1/.opencode/bin/opencode" ]
+  [ -x "$TMP/h1/.opencode/bin/opencode" ]
+  run "$TMP/h1/.opencode/bin/opencode"
+  [ "$output" = "KEPT" ]
+}
+
+@test "ensure_opencode_shim: replaces a dangling symlink" {
+  mkdir -p "$TMP/pkg" "$TMP/h1/.opencode/bin"
+  fake_cli "$TMP/pkg/opencode"
+  ln -s "$TMP/gone/opencode" "$TMP/h1/.opencode/bin/opencode"
+  run shim "$TMP/h1"
+  [ "$status" -eq 0 ]
+  [ -L "$TMP/h1/.opencode/bin/opencode" ]
+  [ "$(readlink "$TMP/h1/.opencode/bin/opencode")" = "$TMP/pkg/opencode" ]
+}
+
+@test "ensure_opencode_shim: never deletes a directory at the target path" {
+  mkdir -p "$TMP/pkg" "$TMP/h1/.opencode/bin/opencode"
+  fake_cli "$TMP/pkg/opencode"
+  : > "$TMP/h1/.opencode/bin/opencode/keep"
+  run shim "$TMP/h1"
+  [ "$status" -eq 0 ]
+  [ -d "$TMP/h1/.opencode/bin/opencode" ]
+  [ -f "$TMP/h1/.opencode/bin/opencode/keep" ]
+}
+
+@test "ensure_opencode_shim: no CLI shipped -> rc 0 and nothing created" {
+  mkdir -p "$TMP/h1"
+  run shim "$TMP/h1"
+  [ "$status" -eq 0 ]
+  [ ! -e "$TMP/h1/.opencode" ]
+}
+
+@test "ensure_opencode_shim: ignores a home that does not exist" {
+  mkdir -p "$TMP/pkg"
+  fake_cli "$TMP/pkg/opencode"
+  run shim "$TMP/nope"
+  [ "$status" -eq 0 ]
+  [ ! -e "$TMP/nope" ]
+}
+
+@test "ensure_opencode_shim: patches every given home (root + paseo)" {
+  mkdir -p "$TMP/pkg" "$TMP/root" "$TMP/home-paseo"
+  fake_cli "$TMP/pkg/opencode"
+  run shim "$TMP/root" "$TMP/home-paseo"
+  [ "$status" -eq 0 ]
+  [ "$(readlink "$TMP/root/.opencode/bin/opencode")" = "$TMP/pkg/opencode" ]
+  [ "$(readlink "$TMP/home-paseo/.opencode/bin/opencode")" = "$TMP/pkg/opencode" ]
+}
+
+@test "ensure_opencode_shim: logs an already-ready symlink with its target" {
+  mkdir -p "$TMP/pkg" "$TMP/h1"
+  fake_cli "$TMP/pkg/opencode"
+  run shim "$TMP/h1"
+  [ "$status" -eq 0 ]
+  [ -L "$TMP/h1/.opencode/bin/opencode" ]
+  run shim "$TMP/h1"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"已就绪"* ]]
+  [[ "$output" == *"$TMP/h1/.opencode/bin/opencode"* ]]
+  [[ "$output" == *"$TMP/pkg/opencode"* ]]
+}
+
+@test "ensure_opencode_shim: logs an existing executable wrapper as unchanged" {
+  mkdir -p "$TMP/pkg" "$TMP/h1/.opencode/bin"
+  fake_cli "$TMP/pkg/opencode"
+  printf '#!/bin/sh\nexec "%s" "$@"\n' "$TMP/pkg/opencode" > "$TMP/h1/.opencode/bin/opencode"
+  chmod +x "$TMP/h1/.opencode/bin/opencode"
+  run shim "$TMP/h1"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"保持不变"* ]]
+  [ ! -L "$TMP/h1/.opencode/bin/opencode" ]
+  run head -n 1 "$TMP/h1/.opencode/bin/opencode"
+  [ "$output" = '#!/bin/sh' ]
+  run "$TMP/h1/.opencode/bin/opencode"
+  [ "$status" -eq 0 ]
+  [ "$output" = "1.19.3" ]
+}
+
+@test "ensure_opencode_shim: logs a chmod repair" {
+  mkdir -p "$TMP/pkg" "$TMP/h1/.opencode/bin"
+  fake_cli "$TMP/pkg/opencode"
+  printf '#!/bin/sh\nexec "%s" "$@"\n' "$TMP/pkg/opencode" > "$TMP/h1/.opencode/bin/opencode"
+  chmod -x "$TMP/h1/.opencode/bin/opencode"
+  [ ! -x "$TMP/h1/.opencode/bin/opencode" ]
+  run shim "$TMP/h1"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"补充可执行位"* ]]
+  [ -x "$TMP/h1/.opencode/bin/opencode" ]
 }

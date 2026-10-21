@@ -66,13 +66,9 @@ DEV="${candidates[0]}"
 echo "Initializing data disk $DEV with label $LABEL"
 mkfs.ext4 -F -L "$LABEL" "$DEV"
 
-mkdir -p /mnt/agent-init
-mount "$DEV" /mnt/agent-init
-mkdir -p /mnt/agent-init/home /mnt/agent-init/root /mnt/agent-init/workspace
-tar -C /home --numeric-owner -cf - . 2>/dev/null | tar -C /mnt/agent-init/home --numeric-owner -xpf - || true
-tar -C /root --numeric-owner -cf - . 2>/dev/null | tar -C /mnt/agent-init/root --numeric-owner -xpf - || true
-touch /mnt/agent-init/.initialized
-umount /mnt/agent-init
+# No seeding here: wsl-boot.sh seeds /home|/root|/workspace on the first start and
+# only stamps `.initialized` after BOTH tars succeed. Seeding here as well meant a
+# failed tar still marked the disk initialized, so the boot-side retry never ran.
 
 echo "Data disk initialized (label=$LABEL, dev=$DEV)"
 echo "UUID=$(blkid -s UUID -o value "$DEV")"

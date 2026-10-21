@@ -47,17 +47,39 @@ if (-not (Test-Path -LiteralPath $Vhdx)) {
   exit 1
 }
 
-if ($Name) {
-  Write-Host "正在附加并挂载 $Vhdx -> /mnt/wsl/$Name …"
-  & wsl.exe --mount --vhd $Vhdx --type ext4 --name $Name
-} else {
-  Write-Host "正在附加 $Vhdx（--bare，仅附加）…"
-  & wsl.exe --mount --vhd $Vhdx --bare
+function Invoke-WslMount([string[]] $Arguments) {
+  $prev = $ErrorActionPreference
+  $ErrorActionPreference = 'Continue'
+  try {
+    $out = & wsl.exe @Arguments 2>&1 | Out-String
+    return [pscustomobject]@{ ExitCode = $LASTEXITCODE; Output = $out.Trim() }
+  } finally { $ErrorActionPreference = $prev }
 }
-$rc = $LASTEXITCODE
-if ($rc -ne 0) {
-  Write-Host "wsl --mount 失败（退出码 $rc）。若磁盘正在使用，先运行 wsl --shutdown 再重试。" -ForegroundColor Red
-  exit $rc
+
+$script:AttachLog = Join-Path $PSScriptRoot 'datadisk-attach.log'
+function Write-AttachLog([string] $Message) {
+  try { Add-Content -LiteralPath $script:AttachLog -Value ("{0} {1}" -f (Get-Date -Format 's'), $Message) -Encoding UTF8 } catch { }
 }
-Write-Host '完成。进入 WSL 后可用 lsblk / findmnt 检查。' -ForegroundColor Green
+
+$attempts = 3
+$result = $null
+for ($i = 1; $i -le $attempts; $i++) {
+  if ($Name) {
+    Write-Host "正在附加并挂载 $Vhdx -> /mnt/wsl/$Name …（第 $i/$attempts 次）"
+    $result = Invoke-WslMount @('--mount', '--vhd', $Vhdx, '--type', 'ext4', '--name', $Name)
+  } else {
+    Write-Host "正在附加 $Vhdx（--bare，仅附加）…（第 $i/$attempts 次）"
+    $result = Invoke-WslMount @('--mount', '--vhd', $Vhdx, '--bare')
+  }
+  Write-AttachLog ("attempt {0}/{1} exit={2} output={3}" -f $i, $attempts, $result.ExitCode, $result.Output)
+  if ($result.ExitCode -eq 0) { break }
+  if ($i -lt $attempts) { Start-Sleep -Seconds 2 }
+}
+
+if ($result.ExitCode -ne 0) {
+  Write-Host "wsl --mount 失败（退出码 $($result.ExitCode)）：$($result.Output)" -ForegroundColor Red
+  Write-Host "若磁盘正在使用，先 wsl --terminate <发行版> 再重试；仍失败请重启 Windows。诊断记录：$script:AttachLog" -ForegroundColor Red
+  exit $result.ExitCode
+}
+Write-Host "完成。进入 WSL 后可用 lsblk / findmnt 检查。诊断记录：$script:AttachLog" -ForegroundColor Green
 exit 0

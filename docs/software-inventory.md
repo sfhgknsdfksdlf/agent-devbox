@@ -32,7 +32,7 @@ ecosystem it belongs to, plus what was **removed** and **added**.
 | DeepSeek Harness (`@deepseek-ai/dsh`) | DeepSeek harness |
 | Grok Build (`@xai-official/grok`) | xAI agent |
 | zcode (`zcode-app-cli`) | Z.ai ZCode terminal client (community) |
-| Aider (`aider-chat`, via pipx) | Python agent |
+| Aider (`aider-chat`, via `uv tool`, Python 3.12) | Python agent |
 
 ## Language toolchains
 

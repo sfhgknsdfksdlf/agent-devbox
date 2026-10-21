@@ -32,7 +32,7 @@ Linux process inside the distro **cannot** do it. Split of responsibility:
 
 | Who | Does |
 |---|---|
-| Windows installer (`agent-devbox.bat` / `agent-devbox-core.bat` → `install-agent-devbox.ps1`) | create + attach `data.vhdx`, initialize it (only when brand new; ext4 label `devbox-data`), write `/etc/agent-devbox.conf`, **always** register the hidden attach-only logon Scheduled Task (`agent-devbox-mount-datadisk` / `agent-devbox-core-mount-datadisk`; use `-NoTask` to skip), copy the `mount-datadisk.*` / `unmount-datadisk.*` helpers into the install dir |
+| Windows installer (`irm .../windows/install.ps1 \| iex` → `install-agent-devbox.ps1`) | create + attach `data.vhdx`, initialize it (only when brand new; ext4 label `devbox-data`), write `/etc/agent-devbox.conf`, **always** register the hidden attach-only logon Scheduled Task (`agent-devbox-mount-datadisk` / `agent-devbox-core-mount-datadisk`; use `-NoTask` to skip), copy the `mount-datadisk.*` / `unmount-datadisk.*` helpers into the install dir |
 | Image boot (`wsl-boot.sh`) | pure Linux: locate the already-attached device by UUID (`blkid -U`), `mount -t ext4` at `/mnt/devbox-data`, **verify** the disk, bind `/home` `/root` `/workspace`, start the daemon |
 
 ## Safety guarantees
@@ -56,8 +56,12 @@ Linux process inside the distro **cannot** do it. Split of responsibility:
 
 ## First-time setup (recommended)
 
-1. Double-click `agent-devbox.bat` (default = multi-agent) or
-   `agent-devbox-core.bat`.
+1. Run the Windows installer one-liner (agents by default; type `c` at the
+   variant prompt for the lean `core` build):
+
+   ```powershell
+   irm https://raw.githubusercontent.com/sfhgknsdfksdlf/agent-devbox/main/windows/install.ps1 | iex
+   ```
 2. Accept the one UAC prompt.
 3. Press Enter for the default install dir (`D:\WSL\agent-devbox`), or type one.
 4. Enter a paseo password (or press Enter to generate one).
@@ -73,11 +77,11 @@ The script is **idempotent** — re-run it any time to re-check/re-configure.
 ## Upgrade procedure
 
 ```powershell
-wsl --shutdown
+wsl --terminate agent-devbox             # only this distro
 wsl --unregister agent-devbox            # system disk gone; data.vhdx untouched
 # (use `agent-devbox-core` instead if you installed the lean variant)
 # re-run the installer (imports the new rootfs and re-injects the config)
-.\agent-devbox.bat
+irm https://raw.githubusercontent.com/sfhgknsdfksdlf/agent-devbox/main/windows/install.ps1 | iex
 ```
 
 `--unregister` removes only the distro's system disk (`ext4.vhdx`); the `data.vhdx`
@@ -85,8 +89,11 @@ in the install dir is untouched, so your data survives.
 
 Then verify:
 
-```bash
-wsl -d agent-devbox           # or agent-devbox-core
+```powershell
+$Distro = (wsl -l -q) | ForEach-Object { ($_ -replace "`0", '').Trim() } |
+  Where-Object { $_ -like 'agent-devbox*' } | Select-Object -First 1
+wsl -d $Distro                # agent-devbox or agent-devbox-core
+# then, inside the distro:
 mount | grep -E 'devbox-data| /home | /root | /workspace '
 ls -la ~ /workspace
 ```
@@ -98,14 +105,15 @@ ls -la ~ /workspace
 | Data disk mounted | `mount \| grep devbox-data` | present (at `/mnt/devbox-data`) |
 | `/home` from data disk | `findmnt /home` | source under `/mnt/devbox-data/home` |
 | Scheduled Task registered | `schtasks /query /tn agent-devbox-mount-datadisk` (or `agent-devbox-core-mount-datadisk`) | present (RunLevel Highest, trigger AtLogOn, hidden `--bare` action) |
-| Mount is per-boot | `wsl --shutdown` then reopen; `mount \| grep devbox-data` | re-attached by the logon task (or run `mount-datadisk.cmd`), then `mount -t ext4` by the Linux boot |
-| Persists across restart | write file → `wsl --shutdown` → `wsl -d agent-devbox` (attach first if needed) | file present |
+| Mount survives a distro restart | `wsl --terminate $Distro` then reopen; `mount \| grep devbox-data` | still attached and re-mounted by the Linux boot (`wsl --shutdown` only on a confirmed networking-mode change) |
+| Persists across restart | write file → `wsl --terminate $Distro` → `wsl -d $Distro` | file present |
 | Persists across upgrade | `--unregister` + re-import | file present |
 
 ## Automating the re-attach
 
-`wsl --mount` needs admin, and the attach is volatile (`wsl --shutdown` detaches
-the VHDX), so the disk must be re-attached after every shutdown and before the
+`wsl --mount` needs admin, and the attach only survives while the WSL VM lives:
+`wsl --terminate <distro>` keeps it, but a Windows restart (or `wsl --shutdown`, which
+the installer only runs with explicit y/N consent after changing the networking mode) loses it — then the disk must be re-attached before the
 Linux boot can mount it. The split is now strict:
 
 - **Windows side — the only thing that touches `wsl.exe`:** the hidden, attach-only
@@ -124,16 +132,17 @@ Linux boot can mount it. The split is now strict:
      (i.e. `/mnt/devbox-data`);
   3. verify the UUID, seed on first run, verify the three binds, start paseo.
 
-If the device is not attached (for example right after `wsl --shutdown`, which
-cleared the attach), boot enters **MAINTENANCE MODE** (fail closed: nothing is
-seeded or started) and writes a bilingual `/etc/motd` banner naming both launchers
-(`agent-devbox.bat` / `agent-devbox-core.bat`). On a successful boot it clears the
-stale banner. `wsl-boot.sh` never auto-launches the Windows installer.
+If the device is not attached (for example right after a Windows restart, which
+clears the attach), boot enters **MAINTENANCE MODE** (fail closed: nothing is
+seeded or started) and writes a bilingual `/etc/motd` banner naming the Windows
+installer one-liner
+(`irm https://raw.githubusercontent.com/sfhgknsdfksdlf/agent-devbox/main/windows/install.ps1 | iex`).
+On a successful boot it clears the stale banner. `wsl-boot.sh` never auto-launches the Windows installer.
 
 ### Manual helpers
 
-The installer copies four helpers into the install dir (they also ship in the
-Windows zip):
+The installer copies four helpers into the install dir (it fetches them from the
+project source, `main`):
 
 ```powershell
 # attach <InstallDir>\data.vhdx (bare); self-elevates once
@@ -148,8 +157,42 @@ Windows zip):
 
 `.cmd` and `.ps1` variants exist for each.
 
-### `wsl --shutdown` caveat
+### Stopping a distro: `wsl --terminate` (and when `wsl --shutdown` is allowed)
 
-`wsl --shutdown` detaches the mounted VHDX. The next distro start therefore goes
-to MAINTENANCE MODE until the disk is re-attached: run `mount-datadisk.cmd` in
-the install dir, re-run the installer, or log off/on to fire the logon task.
+`wsl --terminate <distro>` stops only that distro and **keeps** the attached
+VHDX, so the next start re-mounts it. `wsl --shutdown` is reserved for exactly
+one case: right after `.wslconfig` `networkingMode` changed, the installer warns
+that it closes every running distro and asks y/N (default No). After a Windows restart
+the attach is gone; the next start stays in MAINTENANCE MODE until the disk is
+re-attached: run `mount-datadisk.cmd` in the install dir, re-run the installer,
+or log off/on to fire the logon task.
+
+### 故障排查：为什么同时看到 `/mnt/wsl/agent-devbox-data` 和 `/mnt/devbox-data`？
+
+**根因**：`/mnt/wsl` 是一个**跨发行版共享**的 tmpfs。如果机器上还留着**旧发行版**或**旧的计划
+任务**，它会在自己的启动里把数据盘挂到 `/mnt/wsl/agent-devbox-data`；而当前安装用的是
+`/mnt/devbox-data`。本仓库**不再**生成 `agent-devbox-data` 这个挂载名，所以同时看到两者，通常
+说明有一个旧残留（旧发行版 / 旧任务）仍在按老名字挂载。它们可能指向**同一块** VHDX，也可能不是，
+所以**不要**直接删。
+
+先在 WSL 里确认挂载来源：
+
+```bash
+mount | grep -E 'agent-devbox-data|devbox-data'
+findmnt -T /mnt/wsl/agent-devbox-data
+findmnt -T /mnt/devbox-data
+cat /etc/agent-devbox.conf
+```
+
+再在 Windows 侧看发行版与计划任务：
+
+```powershell
+wsl -l -v
+schtasks /query /tn agent-devbox-mount-datadisk /v /fo LIST
+schtasks /query /tn agent-devbox-core-mount-datadisk /v /fo LIST
+```
+
+**处理**：重跑 Windows 安装器
+（`irm https://raw.githubusercontent.com/sfhgknsdfksdlf/agent-devbox/main/windows/install.ps1 | iex`），
+让它按当前配置重建挂载；或先注销那个不再用的旧发行版（`wsl --unregister <旧发行版>`）并删除对应
+的旧计划任务。**不要**在看清 `findmnt` 指向哪块设备之前，手工删除或格式化任何目录 / 磁盘。

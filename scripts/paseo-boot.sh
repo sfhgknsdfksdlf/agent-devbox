@@ -8,6 +8,32 @@
 # =============================================================================
 set -euo pipefail
 
+# The pidfile lives on the persistent data disk (/home/paseo/.paseo/paseo.pid), so it
+# survives a WSL restart (and a container restart with a bind-mounted home). If the
+# recorded PID is gone - or the PID was reused by an unrelated process - paseo would
+# refuse to start with "Another Paseo daemon is already running" and the web UI would
+# stay down for every following boot. Drop such a stale pidfile before starting.
+clear_stale_pidfile() {
+  local home="${PASEO_HOME:-/home/paseo/.paseo}"
+  local pidfile="$home/paseo.pid"
+  local pid=""
+  [ -f "$pidfile" ] || return 0
+  pid="$(sed -n 's/.*"pid"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$pidfile" | head -n 1)"
+  if [ -z "$pid" ] || [ ! -d "/proc/$pid" ]; then
+    rm -f "$pidfile"
+    echo "cleared stale paseo pidfile (pid=${pid:-unknown}, process is gone)"
+    return 0
+  fi
+  if ! tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | grep -q 'paseo'; then
+    rm -f "$pidfile"
+    echo "cleared stale paseo pidfile (pid=$pid was reused by another process)"
+  fi
+  return 0
+}
+
+# Sourced by tests: define functions only (no side effects).
+if [ "${BASH_SOURCE[0]}" != "$0" ]; then return 0; fi
+
 # The WSL `/etc/wsl.conf [boot]` command runs with a minimal PATH (often without
 # /usr/bin), so `gosu` cannot resolve `env` and the daemon never starts. Pin a
 # sane PATH and resolve the tools once; this is a no-op in Docker, where PATH is
@@ -43,10 +69,17 @@ if [ -d /workspace ]; then chown "$PASEO_USER:$PASEO_USER" /workspace 2>/dev/nul
 "$GOSU_BIN" "$PASEO_USER" "$ENV_BIN" HOME="$PASEO_HOME_DIR" "$SEED_BIN"
 
 # Idempotent persisted settings (best-effort: daemon run also gets the env below).
-"$GOSU_BIN" "$PASEO_USER" "$ENV_BIN" HOME="$PASEO_HOME_DIR" PASEO_HOME="$PASEO_HOME" \
-  paseo daemon config set daemon.listen 0.0.0.0:6767 >/dev/null 2>&1 || true
-"$GOSU_BIN" "$PASEO_USER" "$ENV_BIN" HOME="$PASEO_HOME_DIR" PASEO_HOME="$PASEO_HOME" \
-  paseo daemon config set features.webUi.enabled true >/dev/null 2>&1 || true
+if ! "$GOSU_BIN" "$PASEO_USER" "$ENV_BIN" HOME="$PASEO_HOME_DIR" PASEO_HOME="$PASEO_HOME" \
+  paseo daemon config set daemon.listen 0.0.0.0:6767 >/dev/null 2>&1; then
+  echo "WARN: could not persist daemon.listen; PASEO_LISTEN=0.0.0.0:6767 still applies to this run."
+fi
+if ! "$GOSU_BIN" "$PASEO_USER" "$ENV_BIN" HOME="$PASEO_HOME_DIR" PASEO_HOME="$PASEO_HOME" \
+  paseo daemon config set features.webUi.enabled true >/dev/null 2>&1; then
+  echo "WARN: could not persist features.webUi.enabled; PASEO_WEB_UI_ENABLED=true still applies to this run."
+fi
+
+# A dead/reused PID in the persisted pidfile must not block the daemon.
+clear_stale_pidfile
 
 # Foreground daemon as paseo, with the deployment env overrides.
 exec "$GOSU_BIN" "$PASEO_USER" "$ENV_BIN" \

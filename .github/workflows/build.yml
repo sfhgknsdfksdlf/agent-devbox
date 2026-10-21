@@ -12,8 +12,8 @@ name: build
 # upstream versions (a cached `npm install -g` layer would be reused otherwise);
 # after such a run the workflow records the resolved versions into versions.json
 # with a `[skip actions]` commit so the scheduled diff-gate can skip next time.
-# The Release carries the WSL rootfs parts + the Windows zip + the 1Panel
-# local-app zip (no loose scripts).
+# The Release carries the WSL rootfs parts (the WSL image) + the 1Panel
+# local-app zip (the local app store entry).
 # amd64 and arm64 are BOTH built on every run - natively on ubuntu-latest and
 # ubuntu-24.04-arm (free for public repos), no QEMU emulation - and merged into
 # one multi-arch manifest. WSL rootfs is packaged with zstd (Windows has no zstd;
@@ -138,6 +138,16 @@ jobs:
         run: docker run --rm -i -v "$PWD:/r" -w /r hadolint/hadolint < Dockerfile || true
       - name: bats
         run: tests/run.sh
+      - name: windows/SHA256SUMS is current
+        run: |
+          set -euo pipefail
+          tmp="$(mktemp)"
+          # `--` so a filename starting with `-` can never be read as an option
+          # (actionlint runs shellcheck, which flags a bare glob as SC2035).
+          (cd windows && sha256sum -- *.ps1 *.cmd | sort -k2) > "$tmp"
+          diff -u windows/SHA256SUMS "$tmp"
+          rm -f "$tmp"
+          echo 'windows/SHA256SUMS is current'
 
   # ---------------------------------------------------------------------------
   # PowerShell parse check on a real Windows runner.
@@ -175,22 +185,22 @@ jobs:
             }
           }
           if ($fail) { exit 1 }
-      - name: Enforce .bat/.cmd encoding policy (.cmd CRLF)
+      - name: Enforce .cmd encoding policy (ASCII, CRLF)
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           $fail = $false
-          # Every launcher/bootstrapper is ASCII-only: cmd.exe reads a BOM-less
-          # file as ANSI, so non-ASCII bytes would be garbled.
-          foreach ($f in @(Get-ChildItem windows -Filter *.bat) + @(Get-ChildItem windows -Filter *.cmd)) {
+          # Every .cmd helper is ASCII-only: cmd.exe reads a BOM-less file as
+          # ANSI, so non-ASCII bytes would be garbled.
+          foreach ($f in @(Get-ChildItem windows -Filter *.cmd)) {
             $b = [System.IO.File]::ReadAllBytes($f.FullName)
             if (@($b | Where-Object { $_ -gt 0x7F }).Count -gt 0) {
               Write-Error "$($f.Name) must be ASCII-only (cmd.exe reads a BOM-less file as ANSI)"
               $fail = $true
             }
           }
-          # The .cmd bootstrapper must additionally be CRLF (its literals/ranges
-          # are round-tripped by cmd.exe; LF-only risks a trailing-byte glitch).
+          # .cmd files must additionally be CRLF (their literals/ranges are
+          # round-tripped by cmd.exe; LF-only risks a trailing-byte glitch).
           foreach ($f in @(Get-ChildItem windows -Filter *.cmd)) {
             $b = [System.IO.File]::ReadAllBytes($f.FullName)
             for ($i = 0; $i -lt $b.Length; $i++) {
@@ -202,44 +212,28 @@ jobs:
             }
           }
           if ($fail) { exit 1 }
-          Write-Host 'bat/cmd encoding policy ok'
+          Write-Host 'cmd encoding policy ok'
       - name: PowerShell unit tests
         shell: pwsh
         run: pwsh -NoProfile -File tests/powershell/run.ps1
-      - name: Installer invariant tripwires
+      - name: In-memory entry smoke (Windows PowerShell 5.1)
+        # The production one-liner runs on PS 5.1: execute install.ps1 from its
+        # text (not -File) and stop at mocked Read-Host/IRM/IWR/Start-Process.
+        # Catches BOM/U+FEFF parse failures and `exit` regressions that AST-only
+        # parsing cannot see.
+        shell: powershell
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File tests/powershell/iex-smoke.ps1
+      - name: In-memory entry smoke (PowerShell 7)
+        shell: pwsh
+        run: pwsh -NoProfile -File tests/powershell/iex-smoke.ps1
+      - name: Pester pure helpers
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $fail = $false
-          $f = Get-Content -Raw windows/install-agent-devbox.ps1
-          if ($f -notmatch 'Assert-DiskSpace') { Write-Error 'installer must pre-check disk space (Assert-DiskSpace missing)'; $fail = $true }
-          # -cmatch (case-SENSITIVE): plain -match would treat [Y/n] as a match for [y/N].
-          if ($f -cmatch '\[y/N\]') { Write-Error 'reinstall prompt must not default to no ([y/N]); use [Y/n]'; $fail = $true }
-          if ($f -cnotmatch '\[Y/n\]') { Write-Error 'reinstall prompt must be [Y/n] (Enter = reinstall)'; $fail = $true }
-          if ($f -notmatch 'Invoke-WslImportStream') { Write-Error 'installer must stream parts into wsl --import (Invoke-WslImportStream missing)'; $fail = $true }
-          foreach ($p in 'windows/install.ps1', 'windows/install-agent-devbox.ps1') {
-            foreach ($line in Get-Content $p) {
-              if ($line -match '-Verb\s+RunAs' -and $line -notmatch '-Wait') {
-                Write-Error "$p : -Verb RunAs elevation must also use -Wait"; $fail = $true
-              }
-            }
+          if (-not (Get-Module -ListAvailable Pester | Where-Object { $_.Version -ge [version]'5.0' })) {
+            Install-Module Pester -Scope CurrentUser -Force -SkipPublisherCheck -MinimumVersion 5.0
           }
-          # AV hygiene: these constructs must never reappear (Huorong static heuristics).
-          $ensureRaw = Get-Content -Raw windows/wsl-ensure.ps1
-          if ($ensureRaw -match 'TypeDefinition|DllImport|HttpWebRequest|GetResponseStream') {
-            Write-Error 'wsl-ensure.ps1 must not contain TypeDefinition/DllImport/HttpWebRequest/GetResponseStream'
-            $fail = $true
-          }
-          # Pass 2: download-and-execute primitives live in the lazily loaded helper.
-          if ($ensureRaw -match 'function\s+Install-WslUi') { Write-Error 'wsl-ensure.ps1 must not define Install-WslUi (wsl-ensure-downloads.ps1 owns it)'; $fail = $true }
-          if ($ensureRaw -match 'facebook/zstd') { Write-Error 'wsl-ensure.ps1 must not contain the facebook/zstd URL'; $fail = $true }
-          if ($ensureRaw -notmatch 'Get-AgentDevboxDownloadHelperPath') { Write-Error 'wsl-ensure.ps1 must resolve the lazy download helper (Get-AgentDevboxDownloadHelperPath missing)'; $fail = $true }
-          $webRaw = Get-Content -Raw windows/install.ps1
-          if ($webRaw -match '(?i)\b(irm|iex)\b') { Write-Error 'install.ps1 must not contain irm/iex tokens'; $fail = $true }
-          if ($webRaw -match 'ExecutionPolicy[^\r\n]*Bypass') { Write-Error 'install.ps1 must not use -ExecutionPolicy Bypass'; $fail = $true }
-          if ($fail) { exit 1 }
-          Write-Host 'installer invariants ok'
-
+          Invoke-Pester -Path tests/powershell/install.Tests.ps1 -CI -Output Detailed
   # ---------------------------------------------------------------------------
   # Decide the version tag / release tag / flags / arch matrix.
   #   schedule / workflow_dispatch -> image <YYYYMMDD.HHMM>, stable Release
@@ -415,6 +409,13 @@ jobs:
           [ "$code" = "200" ]
       - name: Daemon runs as non-root paseo
         run: docker exec smoke sh -lc "ps -o user= -C node | sort -u | grep -q '^paseo$'"
+      - name: Desktop app CLI probe (image contract)
+        run: |
+          set -euo pipefail
+          out=$(docker exec smoke sh -lc 'if [ -x "$HOME/.opencode/bin/opencode" ]; then printf "%s\n" "$HOME/.opencode/bin/opencode"; fi')
+          echo "probe=$out"
+          [ "$out" = "/root/.opencode/bin/opencode" ]
+          docker exec smoke desktop-cli-check.sh --home /root
       - name: PTY works (node-pty path)
         run: docker exec smoke bash -lc 'script -qec "echo pty-ok" /dev/null | grep -q pty-ok'
       - name: Tear down
@@ -423,7 +424,8 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # Export the WSL rootfs (zstd, split <2GiB) and cut a Release carrying the
-  # rootfs parts + the Windows zip + the 1Panel local-app zip (no loose scripts).
+  # rootfs parts (the WSL image) + the 1Panel local-app zip (the local app store
+  # entry).
   #   schedule / workflow_dispatch -> stable Release `build-<ts>` on the dated
   #                                    tag, promote `latest`.
   #   push                          -> dated `beta-<ts>` prerelease so the
@@ -473,23 +475,15 @@ jobs:
             rm -f "rootfs-$v-amd64.tar.zst"
           done
           ls -lh rootfs-*-amd64.tar.zst.part-*
-      - name: Bundle the Windows installer (cmd + bat + ps1) into one zip
+
+      # The installer verifies each part against this file. A length check alone
+      # cannot detect a mixed/truncated part that happens to have the right size -
+      # exactly what made every import tier fail on a real machine.
+      - name: Write SHA256SUMS for the rootfs parts
         run: |
           set -euo pipefail
-          command -v zip >/dev/null 2>&1 || { sudo apt-get update && sudo apt-get install -y zip; }
-          zip -j agent-devbox-windows.zip \
-            windows/agent-devbox.bat \
-            windows/agent-devbox-core.bat \
-            windows/install-agent-devbox.ps1 \
-            windows/import-distro.ps1 \
-            windows/wsl-ensure.ps1 \
-            windows/wsl-ensure-downloads.ps1 \
-            windows/mount-datadisk.ps1 \
-            windows/mount-datadisk.cmd \
-            windows/unmount-datadisk.ps1 \
-            windows/unmount-datadisk.cmd \
-            windows/install.cmd
-          ls -l agent-devbox-windows.zip
+          sha256sum rootfs-*-amd64.tar.zst.part-* > SHA256SUMS
+          cat SHA256SUMS
 
       # -------------------------------------------------------------------------
       # Package the 1Panel local app (top level: agent-devbox/) for the Release.
@@ -509,13 +503,12 @@ jobs:
           prerelease: ${{ needs.plan.outputs.promote != 'true' }}
           make_latest: ${{ needs.plan.outputs.promote == 'true' }}
           overwrite_files: true
-          # The rootfs parts ARE the WSL image; the Windows zip bundles the
-          # installer entry point and the 1Panel zip is the local app store entry.
+          # The rootfs parts ARE the WSL image; the 1Panel zip is the local app
+          # store entry.
           files: |
             rootfs-*-amd64.tar.zst.part-*
-            agent-devbox-windows.zip
+            SHA256SUMS
             agent-devbox-1panel-localapp.zip
-            windows/install.cmd
           generate_release_notes: true
 
       # Prune AFTER creating the new release and never delete the tag this run

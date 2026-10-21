@@ -1,0 +1,28 @@
+﻿<?xml version="1.0" encoding="utf-8" standalone="no"?>
+<test-results xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="nunit_schema_2.5.xsd" name="Pester" total="3" errors="0" failures="0" not-run="0" inconclusive="0" ignored="0" skipped="0" invalid="0" date="2026-10-21" time="22:37:50">
+  <environment clr-version="10.0.13" machine-name="DESKTOP-QRIRKAQ" nunit-version="2.5.8.0" user-domain="" os-version="6.18.54.1-microsoft-standard-WSL2" cwd="/root/agent-devbox" platform="Linux" user="root" />
+  <culture-info current-culture="" current-uiculture="" />
+  <test-suite type="TestFixture" name="Pester" executed="True" result="Success" success="True" time="0.6436" asserts="0" description="Pester">
+    <results>
+      <test-suite type="TestFixture" name="/root/agent-devbox/tests/powershell/install.Tests.ps1" executed="True" result="Success" success="True" time="0.6436" asserts="0" description="/root/agent-devbox/tests/powershell/install.Tests.ps1">
+        <results>
+          <test-suite type="TestFixture" name="Join-Parts" executed="True" result="Success" success="True" time="0.1893" asserts="0" description="Join-Parts">
+            <results>
+              <test-case description="concatenates ordered parts byte-for-byte and overwrites the destination" name="Join-Parts.concatenates ordered parts byte-for-byte and overwrites the destination" time="0.14" asserts="0" success="True" result="Success" executed="True" />
+            </results>
+          </test-suite>
+          <test-suite type="TestFixture" name="Quote-NativeArg" executed="True" result="Success" success="True" time="0.2081" asserts="0" description="Quote-NativeArg">
+            <results>
+              <test-case description="quotes spaces, embedded quotes and a trailing backslash for a native argv" name="Quote-NativeArg.quotes spaces, embedded quotes and a trailing backslash for a native argv" time="0.0101" asserts="0" success="True" result="Success" executed="True" />
+            </results>
+          </test-suite>
+          <test-suite type="TestFixture" name="Remove-DownloadArtifacts" executed="True" result="Success" success="True" time="0.2503" asserts="0" description="Remove-DownloadArtifacts">
+            <results>
+              <test-case description="removes the part and its sidecar but leaves unrelated files alone" name="Remove-DownloadArtifacts.removes the part and its sidecar but leaves unrelated files alone" time="0.0332" asserts="0" success="True" result="Success" executed="True" />
+            </results>
+          </test-suite>
+        </results>
+      </test-suite>
+    </results>
+  </test-suite>
+</test-results>

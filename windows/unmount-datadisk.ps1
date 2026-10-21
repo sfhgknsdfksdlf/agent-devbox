@@ -12,8 +12,8 @@
     .\unmount-datadisk.ps1 -Vhdx "D:\其它\other.vhdx"
         卸载指定的 VHDX
 
-  注意：wsl --unmount 只能分离“已附加”的磁盘；若仍失败，可运行
-  wsl --shutdown（会分离所有磁盘，代价是关闭所有发行版）。
+  注意：wsl --unmount 只能分离“已附加”的磁盘；若仍失败，先 wsl --terminate 正在使用
+  该盘的发行版，仍失败请重启 Windows。
 
 .NOTES
   以 -File 读取，所以本文件是 UTF-8 带 BOM（PS 5.1 否则会按 ANSI 读、中文乱码）。
@@ -44,7 +44,7 @@ Write-Host "正在卸载 $Vhdx …"
 & wsl.exe --unmount ("\\?\" + $Vhdx)
 $rc = $LASTEXITCODE
 if ($rc -ne 0) {
-  Write-Host "wsl --unmount 失败（退出码 $rc）。可尝试 wsl --shutdown（会分离所有磁盘）。" -ForegroundColor Red
+  Write-Host "wsl --unmount 失败（退出码 $rc）。先 wsl --terminate 正在使用该盘的发行版，仍失败请重启 Windows。" -ForegroundColor Red
   exit $rc
 }
 Write-Host '已卸载。' -ForegroundColor Green
