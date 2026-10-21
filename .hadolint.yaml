@@ -1,0 +1,10 @@
+# hadolint configuration (read by the `hadolint` step in .github/workflows/build.yml).
+#
+# The base image is a rolling Debian slim and the toolchain is intentionally NOT
+# version-pinned: a rebuild is meant to pick up the newest upstream, and
+# versions.json + the CI diff-gate record what was actually resolved. So we
+# deliberately do not satisfy the "pin versions" lints here and silence them.
+ignored:
+  - DL3008   # apt-get install: pin versions
+  - DL3016   # npm install: pin versions
+  - DL3062   # go install: pin versions

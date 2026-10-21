@@ -1,0 +1,42 @@
+# agent-devbox — Docker mode (pull-only; the image is built in CI, never locally).
+# Quickstart:
+#   cp .env.example .env   # set PASEO_PASSWORD
+#   docker compose up -d
+#   open http://localhost:6767
+services:
+  agent-devbox:
+    image: "${IMAGE:-ghcr.io/sfhgknsdfksdlf/agent-devbox:latest}"
+    container_name: agent-devbox
+    restart: unless-stopped
+    labels:
+      - autoheal=true
+    # Chromium needs more than the default 64m /dev/shm.
+    shm_size: "1g"
+    # gdb/lldb/strace need ptrace.
+    cap_add:
+      - SYS_PTRACE
+    ports:
+      - "6767:6767"          # ONLY published port (paseo daemon + bundled Web UI)
+    environment:
+      IS_DOCKER: "true"
+      # REQUIRED: the daemon refuses to listen without a password.
+      PASEO_PASSWORD: "${PASEO_PASSWORD:?set PASEO_PASSWORD in .env}"
+      TZ: "${TZ:-Asia/Shanghai}"
+      # To allow extra DNS hostnames (reverse proxy), also add a line like:
+      #   PASEO_HOSTNAMES: "paseo.example.com,.lan"
+    volumes:
+      # ${DATA_DIR}/home    -> paseo state + agent config/credentials
+      # ${DATA_DIR}/project -> your code
+      - "${DATA_DIR:-./data}/home:/home/paseo"
+      - "${DATA_DIR:-./data}/project:/workspace"
+
+  # Health self-healing: restarts the container if its healthcheck fails.
+  autoheal:
+    image: willfarrell/autoheal:latest
+    container_name: autoheal
+    restart: unless-stopped
+    environment:
+      AUTOHEAL_CONTAINER_LABEL: autoheal
+      AUTOHEAL_INTERVAL: "10"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
