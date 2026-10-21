@@ -51,6 +51,8 @@ SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 # -----------------------------------------------------------------------------
 # L1) base CLI, init helpers, build toolchain, python, VCS
 #     git/openssh-client are installed EXPLICITLY (do not rely on transitive deps).
+#     e2fsprogs (mkfs.ext4) is REQUIRED by scripts/datadisk-init.sh to format the
+#     WSL data disk; util-linux does NOT pull it in under --no-install-recommends.
 # -----------------------------------------------------------------------------
 RUN set -eux; \
     apt-get update; \
@@ -60,7 +62,7 @@ RUN set -eux; \
       unzip zip xz-utils file rsync patch \
       less tmux vim nano \
       wget curl gnupg ca-certificates \
-      procps psmisc htop util-linux \
+      procps psmisc htop util-linux e2fsprogs \
       sqlite3 tini gosu \
       git openssh-client \
       python3 python3-full python3-pip python3-venv python3-dev pipx; \

@@ -10,7 +10,32 @@
 # not the root disk. If the choice is ambiguous it refuses to format.
 # =============================================================================
 set -euo pipefail
-LABEL=agent-devbox-data
+
+# ext4 caps filesystem labels at 16 characters and `mkfs.ext4 -L` silently
+# truncates longer ones. Validate here so a bad label fails loudly instead of
+# producing a disk whose label never matches the installer's blkid lookup.
+LABEL="${1:-}"
+
+usage() {
+  echo "Usage: $0 <label>" >&2
+  echo "  <label>: ext4 filesystem label, 1-16 chars, allowed: A-Z a-z 0-9 . _ -" >&2
+}
+
+if [ -z "$LABEL" ]; then
+  echo "FATAL: missing ext4 label." >&2
+  usage
+  exit 2
+fi
+if ! [[ "$LABEL" =~ ^[A-Za-z0-9._-]+$ ]]; then
+  echo "FATAL: invalid ext4 label '$LABEL' (allowed: A-Z a-z 0-9 . _ -)." >&2
+  usage
+  exit 2
+fi
+if [ "${#LABEL}" -gt 16 ]; then
+  echo "FATAL: ext4 label '$LABEL' is ${#LABEL} chars; ext4 labels are capped at 16 chars (mkfs would silently truncate it)." >&2
+  usage
+  exit 2
+fi
 
 # Identify the root disk (so we never touch it).
 root_src="$(findmnt -rno SOURCE /)"

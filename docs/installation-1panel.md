@@ -4,7 +4,7 @@
 
 ## 1. 解压
 
-从 **[最新 Release](https://github.com/sfhgknsdfksdlf/agent-devbox/releases/latest)** 下载
+从 **[Releases 页面](https://github.com/sfhgknsdfksdlf/agent-devbox/releases)** 下载
 **`agent-devbox-1panel-localapp.zip`** 并解压，会得到一个 `agent-devbox/` 目录。
 
 ## 2. 放到本地应用目录

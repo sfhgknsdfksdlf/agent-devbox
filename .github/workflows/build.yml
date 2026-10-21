@@ -165,8 +165,8 @@ jobs:
             $b = [System.IO.File]::ReadAllBytes($f.FullName)
             $hasBom = ($b.Length -ge 3 -and $b[0] -eq 0xEF -and $b[1] -eq 0xBB -and $b[2] -eq 0xBF)
             if ($f.Name -eq 'install.ps1') {
-              # irm|iex must NOT see a BOM (it survives as U+FEFF and breaks the parser).
-              if ($hasBom) { Write-Error "install.ps1 must be UTF-8 WITHOUT a BOM (breaks 'irm | iex')"; $fail = $true }
+              # The legacy in-memory web entry must NOT see a BOM (it survives as U+FEFF and breaks the parser).
+              if ($hasBom) { Write-Error "install.ps1 must be UTF-8 WITHOUT a BOM (a BOM breaks the legacy in-memory web entry)"; $fail = $true }
               else { Write-Host "ok (no BOM): $($f.Name)" }
             } else {
               # -File path: PS 5.1 reads a BOM-less file as ANSI, garbling the Chinese.
@@ -175,6 +175,34 @@ jobs:
             }
           }
           if ($fail) { exit 1 }
+      - name: Enforce .bat/.cmd encoding policy (.cmd CRLF)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $fail = $false
+          # Every launcher/bootstrapper is ASCII-only: cmd.exe reads a BOM-less
+          # file as ANSI, so non-ASCII bytes would be garbled.
+          foreach ($f in @(Get-ChildItem windows -Filter *.bat) + @(Get-ChildItem windows -Filter *.cmd)) {
+            $b = [System.IO.File]::ReadAllBytes($f.FullName)
+            if (@($b | Where-Object { $_ -gt 0x7F }).Count -gt 0) {
+              Write-Error "$($f.Name) must be ASCII-only (cmd.exe reads a BOM-less file as ANSI)"
+              $fail = $true
+            }
+          }
+          # The .cmd bootstrapper must additionally be CRLF (its literals/ranges
+          # are round-tripped by cmd.exe; LF-only risks a trailing-byte glitch).
+          foreach ($f in @(Get-ChildItem windows -Filter *.cmd)) {
+            $b = [System.IO.File]::ReadAllBytes($f.FullName)
+            for ($i = 0; $i -lt $b.Length; $i++) {
+              if ($b[$i] -eq 0x0A -and ($i -eq 0 -or $b[$i - 1] -ne 0x0D)) {
+                Write-Error "$($f.Name) must use CRLF line endings"
+                $fail = $true
+                break
+              }
+            }
+          }
+          if ($fail) { exit 1 }
+          Write-Host 'bat/cmd encoding policy ok'
       - name: PowerShell unit tests
         shell: pwsh
         run: pwsh -NoProfile -File tests/powershell/run.ps1
@@ -196,6 +224,19 @@ jobs:
               }
             }
           }
+          # AV hygiene: these constructs must never reappear (Huorong static heuristics).
+          $ensureRaw = Get-Content -Raw windows/wsl-ensure.ps1
+          if ($ensureRaw -match 'TypeDefinition|DllImport|HttpWebRequest|GetResponseStream') {
+            Write-Error 'wsl-ensure.ps1 must not contain TypeDefinition/DllImport/HttpWebRequest/GetResponseStream'
+            $fail = $true
+          }
+          # Pass 2: download-and-execute primitives live in the lazily loaded helper.
+          if ($ensureRaw -match 'function\s+Install-WslUi') { Write-Error 'wsl-ensure.ps1 must not define Install-WslUi (wsl-ensure-downloads.ps1 owns it)'; $fail = $true }
+          if ($ensureRaw -match 'facebook/zstd') { Write-Error 'wsl-ensure.ps1 must not contain the facebook/zstd URL'; $fail = $true }
+          if ($ensureRaw -notmatch 'Get-AgentDevboxDownloadHelperPath') { Write-Error 'wsl-ensure.ps1 must resolve the lazy download helper (Get-AgentDevboxDownloadHelperPath missing)'; $fail = $true }
+          $webRaw = Get-Content -Raw windows/install.ps1
+          if ($webRaw -match '(?i)\b(irm|iex)\b') { Write-Error 'install.ps1 must not contain irm/iex tokens'; $fail = $true }
+          if ($webRaw -match 'ExecutionPolicy[^\r\n]*Bypass') { Write-Error 'install.ps1 must not use -ExecutionPolicy Bypass'; $fail = $true }
           if ($fail) { exit 1 }
           Write-Host 'installer invariants ok'
 
@@ -432,7 +473,7 @@ jobs:
             rm -f "rootfs-$v-amd64.tar.zst"
           done
           ls -lh rootfs-*-amd64.tar.zst.part-*
-      - name: Bundle the Windows installer (bat + ps1) into one zip
+      - name: Bundle the Windows installer (cmd + bat + ps1) into one zip
         run: |
           set -euo pipefail
           command -v zip >/dev/null 2>&1 || { sudo apt-get update && sudo apt-get install -y zip; }
@@ -442,7 +483,12 @@ jobs:
             windows/install-agent-devbox.ps1 \
             windows/import-distro.ps1 \
             windows/wsl-ensure.ps1 \
-            windows/install.ps1
+            windows/wsl-ensure-downloads.ps1 \
+            windows/mount-datadisk.ps1 \
+            windows/mount-datadisk.cmd \
+            windows/unmount-datadisk.ps1 \
+            windows/unmount-datadisk.cmd \
+            windows/install.cmd
           ls -l agent-devbox-windows.zip
 
       # -------------------------------------------------------------------------
@@ -469,6 +515,7 @@ jobs:
             rootfs-*-amd64.tar.zst.part-*
             agent-devbox-windows.zip
             agent-devbox-1panel-localapp.zip
+            windows/install.cmd
           generate_release_notes: true
 
       # Prune AFTER creating the new release and never delete the tag this run

@@ -16,8 +16,8 @@ passes its own `-Variant`; running `install-agent-devbox.ps1` directly, or via t
 The `.bat` launcher re-launches itself elevated (one UAC prompt); the original
 window closes, so only the elevated window remains, and it prints the whole 10-step
 log and `pause`s at the end (success or failure) so the result stays on screen.
-When you instead run `install-agent-devbox.ps1` directly (or use the `irm | iex`
-path), the non-elevated window waits for the elevated one and echoes its full log
+When you instead run `install-agent-devbox.ps1` directly (or use the `install.cmd`
+bootstrap path), the non-elevated window waits for the elevated one and echoes its full log
 plus a final summary and exit code, so the result is visible where you started.
 All installer prompts are Chinese, and it prints a **10-step progress banner**:
 
@@ -41,7 +41,10 @@ What it does:
    the streaming tier `base = C + V` with `C` = compressed parts and
    `V` = uncompressed × 1.05 (the `ext4.vhdx` grows on demand; its 1 TiB size is
    virtual). It is re-run if the installer falls back to a tier with a higher peak;
-3. download the released rootfs and import it as the distro `agent-devbox`, in
+3. download the released rootfs and import it as the WSL distro — `agent-devbox`
+   for the multi-agent build, `agent-devbox-core` for the lean build — with a
+   **per-variant default install dir** (`D:\WSL\agent-devbox` for agents,
+   `D:\WSL\agent-devbox-core` for core), in
    **three tiers** (the happy path is Tier 1):
    - **Tier 1** streams the downloaded parts straight into
      `wsl --import <Distro> <InstallDir> -`; WSL2's built-in bsdtar decompresses
@@ -56,18 +59,35 @@ What it does:
    including the per-user caveat: WSL distros are registered per Windows user, so
    elevating via UAC into a **different** admin account makes the distro invisible
    to the original user (`WSL_E_DISTRO_NOT_FOUND`);
-5. create a 32 GB dynamic `data.vhdx` in the install dir and initialize it;
+5. create a 32 GB dynamic `data.vhdx` in the install dir and initialize it with
+   the ext4 label `devbox-data` (each variant gets its own `data.vhdx` in its own
+   install dir; the two variants do **not** share a data disk);
 6. fix the VHDX owner/ACLs so a non-elevated user can reopen it;
 7. write `/etc/agent-devbox.conf` (5 keys: `DATA_VHDX`, `DATA_UUID`,
    `PASEO_PASSWORD`, `DATA_MNTNAME`, `DATA_TASK`);
-8. **always** register the logon Scheduled Task `agent-devbox-mount-datadisk`
-   (highest privileges) that re-attaches the disk; pass `-NoTask` to skip it;
-9. restart the distro, and the boot script mounts the disk through a fallback
-   chain (see `wsl-persistence.md`);
+8. **always** register the hidden, **attach-only** logon Scheduled Task
+   (`agent-devbox-mount-datadisk` for agents, `agent-devbox-core-mount-datadisk`
+   for core; highest privileges) whose action is a **hidden** PowerShell
+   (`-WindowStyle Hidden -EncodedCommand`) that runs only
+   `wsl --mount --vhd "<vhdx>" --bare` (no `--type ext4`, no `--name`), with
+   `MultipleInstances IgnoreNew`; pass `-NoTask` to skip it. The hidden wrapper is
+   what removes the blank console window. The Linux side does the actual
+   `mount -t ext4` (see step 9). The installer also copies the manual
+   `mount-datadisk.cmd` / `unmount-datadisk.cmd` helpers (and their `.ps1`) into
+   the install dir;
+9. restart the distro. Boot (`wsl-boot.sh`) is now **pure Linux** and never calls
+   `wsl.exe` / `schtasks.exe` (the old boot-time callback re-entered WSL and caused
+   a boot loop). It finds the already-attached block device by UUID (`blkid -U`)
+   and `mount -t ext4` it at `/mnt/devbox-data`, verifies it, then binds `/home`
+   `/root` `/workspace` and starts paseo; on failure it goes to MAINTENANCE MODE.
+   Caveat: `wsl --shutdown` detaches the VHDX, so the next start stays in
+   MAINTENANCE until the disk is re-attached (run `mount-datadisk.cmd` in the
+   install dir, re-run the installer, or log off/on to fire the logon task) — see
+   `wsl-persistence.md`;
 10. delete the downloaded parts, any merged `.zst`, and any `.tar`, after success
     and on failure.
 
-Then: `wsl -d agent-devbox`.
+Then: `wsl -d agent-devbox` (agents) or `wsl -d agent-devbox-core` (core).
 
 See `wsl-persistence.md` for the data model, safety guarantees and upgrade steps.
 
@@ -80,7 +100,8 @@ Docker/Podman image using its own OCI implementation (no Docker required):
 2. New Distribution → **Container Images** → reference
    `ghcr.io/sfhgknsdfksdlf/agent-devbox:latest`
    (or `.../agent-devbox-core:latest`).
-3. Name it **`agent-devbox`**.
+3. Name it **`agent-devbox`** (multi-agent build) or **`agent-devbox-core`**
+   (lean build).
 
 Then run the data-disk part via the script (double-click `agent-devbox.bat`; it
 detects the existing distro and only creates/attaches the data disk and writes
@@ -134,7 +155,7 @@ while `-Yes` stays idempotent (no reinstall unless `-Reinstall` is also passed).
 ## After installing
 
 ```bash
-wsl -d agent-devbox
+wsl -d agent-devbox          # multi-agent build; use agent-devbox-core for the lean build
 # root shell; paseo daemon configured on http://localhost:6767 (from Windows)
 ```
 
@@ -151,12 +172,30 @@ or enable mirrored networking (`%UserProfile%\.wslconfig` → `[wsl2] networking
 ## Requirements
 
 - Windows 11 (or a WSL build that supports `wsl --mount --vhd`).
+- PowerShell (built in) for `install.cmd`: it downloads the installer scripts from
+  the project source (`main`) with `Invoke-WebRequest`. The rootfs parts are fetched
+  with the OS's `curl.exe` (resume + retries), falling back to `Invoke-WebRequest`
+  when `curl.exe` is unavailable.
 - `New-VHD` (Hyper-V module) if available, otherwise the built-in `diskpart`
   fallback creates the dynamic VHDX.
 - No extra program for the import itself on the happy path: WSL2's built-in bsdtar
   decompresses the zstd stream. `zstd.exe` is only fetched as the last-resort tier.
+- Manual disk helpers ship in the Windows zip and the installer copies them into the
+  install dir: `mount-datadisk.cmd` / `mount-datadisk.ps1` and
+  `unmount-datadisk.cmd` / `unmount-datadisk.ps1` (each self-elevates once).
+
+Both `install.cmd` and `install.ps1` fetch the installer scripts from the project
+source (`main`) and use the Release ONLY for the rootfs parts. `install.ps1`'s elevated
+child copy is started with `-ExecutionPolicy RemoteSigned` (the copy is written by the
+parent, so it carries no Mark-of-the-Web and `RemoteSigned` is sufficient).
 
 Both `install-agent-devbox.ps1` and `import-distro.ps1` dot-source
 `windows/wsl-ensure.ps1`, which holds the shared helpers (release-tag
 normalization, disk-space math, streaming import, the zstd fallback, and the
-distro-ready assertion).
+distro-ready assertion). The download-and-execute helpers used by that preflight
+(`Install-WslUi`, `Get-ZstdExeFromRelease`) live in a separate, lazily loaded
+`windows/wsl-ensure-downloads.ps1`, resolved by `Get-AgentDevboxDownloadHelperPath`.
+It is dot-sourced only when actually needed (installing the wsl-ui GUI, or the
+last-resort `zstd.exe` tier), so the happy path never loads it. Keep both files
+together when extracting the release zip; the installer throws a clear Chinese
+error if `wsl-ensure-downloads.ps1` is missing.

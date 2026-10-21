@@ -29,11 +29,11 @@ docker compose up -d
 
 ## 快速开始 —— WSL
 
-1. 到 **[最新 Release](https://github.com/sfhgknsdfksdlf/agent-devbox/releases/latest)** 下载
-   **`agent-devbox-windows.zip`** 并解压（安装脚本都在里面）。
+1. 到 **[Releases 页面](https://github.com/sfhgknsdfksdlf/agent-devbox/releases)** 选择要装的版本，
+   下载 **`agent-devbox-windows.zip`** 并解压（安装脚本都在里面）。
 2. 双击 **`agent-devbox.bat`**（默认，多助手版）或 **`agent-devbox-core.bat`**（精简版），
    同意一次管理员授权（UAC）。这两个启动器不询问变体（各自固定为 agents / core）。
-3. 执行 `wsl -d agent-devbox`
+3. 执行 `wsl -d agent-devbox`（agents）或 `wsl -d agent-devbox-core`（core）
 
 **一行安装**（不想手动下载也可以）：
 
@@ -51,9 +51,32 @@ irm https://raw.githubusercontent.com/sfhgknsdfksdlf/agent-devbox/main/windows/i
 不合并分片、不产生中间 `.tar`），失败才合并分片后按文件导入，最后才下载 `zstd.exe` 解压为
 `.tar`；因此**正常路径在 Windows 11 和 Windows 10 上都不会下载 `zstd.exe`**。装完会校验
 发行版确实注册成功，失败则注销这次残缺的注册并给出可操作的中文提示；临时文件（分片 /
-合并出的 `.zst` / 解压出的 `.tar`）在**成功和失败后都会清理**。开机时启动脚本还会走一条
-尽力而为的回退挂载链，尽量在计划任务缺失时也能把数据盘挂上；若全部失败则进入维护模式，
-并提示你手动运行安装脚本。重复运行也没问题。
+合并出的 `.zst` / 解压出的 `.tar`）在**成功和失败后都会清理**。重复运行也没问题。
+
+两个变体现在**互不冲突、可以同时安装同时运行**：agents 版注册成 WSL 发行版 `agent-devbox`
+（默认安装目录 `D:\WSL\agent-devbox`），core 版注册成 `agent-devbox-core`
+（默认 `D:\WSL\agent-devbox-core`）；各自在自己安装目录里有**独立**的 `data.vhdx`
+（两份 `/home`、`/root`、`/workspace` 互不共享）。数据盘统一用 ext4 卷标 **`devbox-data`**
+（`DATA_MNTNAME` 也是 `devbox-data`），在 WSL 里固定挂到 **`/mnt/devbox-data`**；安装器
+写 `/etc/agent-devbox.conf`（仍是 5 个键）并注册一个**只做附加**的登录计划任务（agents 为
+`agent-devbox-mount-datadisk`，core 为 `agent-devbox-core-mount-datadisk`）。
+
+这块计划任务是**隐藏**的：它的动作是一个 `-WindowStyle Hidden -EncodedCommand` 的
+PowerShell，只运行 `wsl --mount --vhd "<vhdx>" --bare`（只附加，**不带** `--type ext4` /
+`--name`），因此不会再闪出那个空白控制台窗口。真正的 `mount -t ext4` 交给**纯 Linux** 的
+开机脚本 —— `scripts/wsl-boot.sh` 现在只在 Linux 侧按 UUID（`blkid -U`）找到已附加的块设备、
+挂到 `/mnt/devbox-data`，**再也不会调用 `wsl.exe` / `schtasks.exe`**（旧版从开机里回调
+Windows 工具会重进 WSL，造成开不机的死循环）。挂载失败则进入维护模式（fail closed，什么都
+不初始化、不启动），并在 `/etc/motd` 里用中英文提示你两个启动器 `agent-devbox.bat` /
+`agent-devbox-core.bat`。
+
+安装器还会把几个**手动排障脚本**复制进安装目录：`mount-datadisk.cmd` / `mount-datadisk.ps1`
+（不带参数＝附加本目录的 `data.vhdx`；`-Vhdx "D:\其它\x.vhdx"`＝附加指定磁盘；再加
+`-Name mydisk`＝附加并自动挂到 `/mnt/wsl/mydisk`）和 `unmount-datadisk.cmd` /
+`unmount-datadisk.ps1`（`wsl --unmount` 分离）。注意 **`wsl --shutdown` 会分离已挂载的
+VHDX**，之后首次启动会进维护模式，直到磁盘重新附加（在安装目录跑 `mount-datadisk.cmd`、
+重跑安装器，或注销/重新登录触发计划任务）。已装的旧版本建议重跑一次安装器，以采用新的任务
+动作和新的 `DATA_MNTNAME=devbox-data`（旧配置也能用：会继续按它旧的 `DATA_MNTNAME` 挂载）。
 
 详见 **[docs/installation-wsl.md](docs/installation-wsl.md)** 和
 **[docs/wsl-persistence.md](docs/wsl-persistence.md)**。
@@ -135,8 +158,14 @@ irm https://raw.githubusercontent.com/sfhgknsdfksdlf/agent-devbox/main/windows/i
 |---|---|---|
 | 容器镜像（`agent-devbox`、`agent-devbox-core`，多架构） | **ghcr.io** | Docker 用户；WSL 的 wsl-ui 导入 |
 | WSL 镜像包（`rootfs-*.tar.zst.part-*`，分片） | **GitHub Releases** | Windows 双击安装脚本 |
-| Windows 安装包（`agent-devbox-windows.zip`；Release 只提供这个 zip，不再单独附 `.bat`/`.ps1`） | **GitHub Releases**（每个 Release 附带） | 第一次安装的入口 |
+| Windows 安装包（`agent-devbox-windows.zip` + 独立的 `install.cmd`） | **GitHub Releases**（每个 Release 附带） | 第一次安装的入口 |
 | 1Panel 本地应用包（`agent-devbox-1panel-localapp.zip`） | **GitHub Releases** | 1Panel 应用商店（本地应用） |
+
+> `agent-devbox-windows.zip` 里是 `install.cmd` 引导器、`.bat` 启动器和 `.ps1` 安装脚本
+> （`install-agent-devbox.ps1`、`import-distro.ps1`、`wsl-ensure.ps1`、`wsl-ensure-downloads.ps1`），
+> 以及手动挂载 / 卸载数据盘的辅助脚本 `mount-datadisk.ps1`、`mount-datadisk.cmd`、
+> `unmount-datadisk.ps1`、`unmount-datadisk.cmd`（安装器也会把它们复制进安装目录）；
+> **不含** `install.ps1`；`install.ps1` 只作为旧的原始网页入口保留，推荐走上面的 `install.cmd`。
 
 > 结论：**容器镜像在 ghcr**；**给 Windows 一键安装用的打包文件在 GitHub Releases**。
 > 之所以不把 WSL 包也放进 ghcr：WSL 导入需要"扁平的文件系统 tar"，没法直接当 OCI 镜像用。
@@ -155,7 +184,7 @@ docker-compose.yml      # 只拉取（Docker 模式）
 1panel/                 # 1Panel 商店本地应用包
 scripts/                # 入口、启动、初始化、数据盘初始化
 config/                 # wsl.conf、profile.d
-windows/                # 一键安装脚本（.ps1）+ 启动器（.bat）+ 导入脚本 + 共享辅助 wsl-ensure.ps1
+windows/                # 安装引导 install.cmd + 安装脚本（.ps1）+ 启动器（.bat）+ 导入脚本 + 共享辅助 wsl-ensure.ps1 + 手动挂载 / 卸载辅助 mount-datadisk.* / unmount-datadisk.*
 .github/workflows/      # build.yml、keepalive.yml
 docs/                   # 软件清单、基础镜像、问答、安装、数据持久化、组网访问
 tests/                  # bats 测试（tests/run.sh）+ PowerShell 单元测试（tests/powershell）

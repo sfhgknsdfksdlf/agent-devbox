@@ -3,22 +3,25 @@
   agent-devbox one-click bootstrap for Windows (WSL2).
 
 .DESCRIPTION
-  Self-elevating bootstrap for the `irm | iex` web path:
-
-      irm https://raw.githubusercontent.com/sfhgknsdfksdlf/agent-devbox/main/windows/install.ps1 | iex
+  Self-elevating bootstrap for the raw web entry: the script is fetched and
+  executed in memory by the PowerShell host. Prefer `install.cmd` (a local
+  bootstrapper) or the Release zip's `.bat` launchers for local runs.
 
   It:
     1. re-launches itself elevated (one UAC prompt);
-    2. downloads the matching `agent-devbox-windows.zip` Release asset;
-    3. extracts it and runs the WSL preflight (install WSL + mirrored networking);
-    4. runs the bundled installer, then always deletes the temp directory.
+    2. fetches the installer scripts (wsl-ensure.ps1, wsl-ensure-downloads.ps1,
+       install-agent-devbox.ps1) from the project SOURCE (main), not the Release;
+    3. runs the WSL preflight (install WSL + mirrored networking);
+    4. runs the installer (which pulls the rootfs from the Release), then always
+       deletes its scratch directory.
 
-  For a local run use the .bat launchers from the Release zip instead.
+  For a local run use install.cmd (the recommended bootstrapper) or the .bat
+  launchers from the Release zip instead.
 
 .NOTES
-  ENCODING: this file is deliberately UTF-8 WITHOUT a BOM. `irm` returns the
-  body as a string with the BOM surviving as U+FEFF, which makes `iex` fail to
-  parse `[CmdletBinding()]` on PowerShell 5.1 (the CI ps-lint step enforces
+  ENCODING: this file is deliberately UTF-8 WITHOUT a BOM. An in-memory fetch
+  returns the body as a string with the BOM surviving as U+FEFF, which breaks
+  parsing of `[CmdletBinding()]` on PowerShell 5.1 (the CI ps-lint step enforces
   this). The other windows/*.ps1 files ARE BOM-encoded because they are read
   from disk via -File, where PowerShell 5.1 would otherwise decode them as ANSI
   and garble the Chinese text. $PSCommandPath is only used behind a guard.
@@ -51,17 +54,34 @@ if (-not $PSBoundParameters.ContainsKey('Variant') -and [Environment]::UserInter
 
 $SelfUrl = 'https://raw.githubusercontent.com/sfhgknsdfksdlf/agent-devbox/main/windows/install.ps1'
 $Repo    = 'sfhgknsdfksdlf/agent-devbox'
+# 发行版名随镜像变体变化（core = agent-devbox-core，agents = agent-devbox）。
+$Distro  = if ($Variant -eq 'core') { 'agent-devbox-core' } else { 'agent-devbox' }
 
 # Beta resolution: `b`/`beta` -> the newest `beta-*` prerelease (same logic in every script).
+$relApi = "https://api.github.com/repos/$Repo/releases"
+$hdr    = @{ 'User-Agent' = 'agent-devbox' }
 if ($ReleaseTag -match '^(b|beta)$') {
-  $rels = Invoke-RestMethod "https://api.github.com/repos/$Repo/releases?per_page=100" -Headers @{ 'User-Agent' = 'agent-devbox' }
+  $rels = Invoke-RestMethod "${relApi}?per_page=100" -Headers $hdr
   $beta = $rels | Where-Object { $_.prerelease -eq $true -and $_.tag_name -like 'beta-*' } | Select-Object -First 1
   if (-not $beta) { throw '未找到 beta 预发布版本。' }
   $ReleaseTag = $beta.tag_name
 }
 if ($ReleaseTag -match '^\d{8}\.\d{4}$') { $ReleaseTag = "build-$ReleaseTag" }
+# `latest`: prefer the non-prerelease release; if none exists yet, use the newest release.
+if ($ReleaseTag -eq 'latest') {
+  try { $ReleaseTag = (Invoke-RestMethod "$relApi/latest" -Headers $hdr).tag_name }
+  catch {
+    $first = @(Invoke-RestMethod "${relApi}?per_page=1" -Headers $hdr | Select-Object -First 1)
+    if ($first.Count -ge 1 -and $first[0].tag_name) { $ReleaseTag = $first[0].tag_name }
+    else { throw '未找到任何 Release。' }
+  }
+}
 
-$ZipUrl  = if ($ReleaseTag -eq 'latest') { "https://github.com/$Repo/releases/latest/download/agent-devbox-windows.zip" } else { "https://github.com/$Repo/releases/download/$ReleaseTag/agent-devbox-windows.zip" }
+# The installer scripts are fetched from the SOURCE tree (this entry is served
+# from `main` too), NOT from the Release zip. The zip is built per-Release and
+# lags behind `main`, so fetching scripts from it made every script fix invisible
+# until a new Release was cut. The Release is only used for the rootfs parts.
+$ScriptsBase = "https://raw.githubusercontent.com/$Repo/main/windows"
 
 function Test-IsAdmin {
   $id = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -69,14 +89,16 @@ function Test-IsAdmin {
 }
 
 # --- Scratch dir (cleaned by every path that creates it) -------------------
-$work = Join-Path ([System.IO.Path]::GetTempPath()) ('agent-devbox-' + [System.IO.Path]::GetRandomFileName())
+$scratch = Join-Path $env:LOCALAPPDATA 'agent-devbox'
+New-Item -ItemType Directory -Path $scratch -Force | Out-Null
+$work = Join-Path $scratch ('run-' + [System.IO.Path]::GetRandomFileName())
 New-Item -ItemType Directory -Path $work -Force | Out-Null
 
 # --- Non-elevated: hand off to an elevated copy of this script --------------
 if (-not (Test-IsAdmin)) {
   # The installer writes its full transcript to this log; we echo it into THIS
   # (original) window after the elevated window closes, so the result is visible.
-  $log = Join-Path ([System.IO.Path]::GetTempPath()) ('agent-devbox-install-' + [System.IO.Path]::GetRandomFileName() + '.log')
+  $log = Join-Path $scratch ('install-' + [System.IO.Path]::GetRandomFileName() + '.log')
   try {
     $scriptToRun = Join-Path $work 'install.ps1'
     if ($PSCommandPath -and (Test-Path -LiteralPath $PSCommandPath)) {
@@ -86,10 +108,12 @@ if (-not (Test-IsAdmin)) {
     }
     # The elevated copy is re-read with `-File`: write it as UTF-8 WITH a BOM so
     # PowerShell 5.1 does not decode its Chinese text as ANSI. install.ps1 ITSELF
-    # stays BOM-less for the `irm | iex` path.
+    # stays BOM-less for the in-memory web entry.
     [System.IO.File]::WriteAllText($scriptToRun, $text, (New-Object System.Text.UTF8Encoding($true)))
     Write-Host '正在请求管理员权限（会弹一次 UAC）…'
-    $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$scriptToRun`"",
+    # The elevated copy is freshly written by us (no Mark-of-the-Web), so
+    # RemoteSigned is sufficient and avoids the stronger Bypass signal.
+    $argList = @('-NoProfile', '-ExecutionPolicy', 'RemoteSigned', '-File', "`"$scriptToRun`"",
       '-ReleaseTag', $ReleaseTag, '-Variant', $Variant, '-LogPath', "`"$log`"")
     $p = $null
     try {
@@ -115,8 +139,8 @@ if (-not (Test-IsAdmin)) {
       # 从当前（非提权）用户角度确认发行版可见（WSL 发行版按用户注册）。
       try {
         $names = @((& wsl.exe -l -q 2> $null) | ForEach-Object { ("$_" -replace "`0", '').Trim() } | Where-Object { $_ })
-        if ($names -notcontains 'agent-devbox') {
-          Write-Host "注意：当前（非提权）用户看不到发行版 'agent-devbox'。WSL 发行版按用户注册；若 UAC 用了另一个管理员帐户，发行版会落在那个帐户下。" -ForegroundColor Yellow
+        if ($names -notcontains $Distro) {
+          Write-Host "注意：当前（非提权）用户看不到发行版 '$Distro'。WSL 发行版按用户注册；若 UAC 用了另一个管理员帐户，发行版会落在那个帐户下。" -ForegroundColor Yellow
         }
       } catch {}
     }
@@ -125,24 +149,29 @@ if (-not (Test-IsAdmin)) {
     Remove-Item -LiteralPath $log -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath "$log.rc" -Force -ErrorAction SilentlyContinue
   }
-  # `return` (not `exit`) so a piped `irm | iex` does not close the caller's shell.
+  # `return` (not `exit`) so an in-memory invocation does not close the caller's shell.
   return
 }
 
-# --- Elevated: download, extract, preflight, install ------------------------
+# --- Elevated: fetch the installer scripts from SOURCE, preflight, install ---
+# Fetch the sibling scripts from the same SOURCE tree as this entry (not the
+# Release zip, which lags behind `main`). Byte-for-byte download (-OutFile) so
+# each script keeps its encoding/BOM exactly as in the repo.
 try {
-  $zipPath = Join-Path $work 'agent-devbox-windows.zip'
-  $dest    = Join-Path $work 'win'
+  $dest = Join-Path $work 'win'
+  New-Item -ItemType Directory -Path $dest -Force | Out-Null
 
-  Write-Host '正在下载 agent-devbox-windows.zip…'
-  $gotZip = $false
-  for ($i = 1; $i -le 4 -and -not $gotZip; $i++) {
-    try { Invoke-WebRequest -Uri $ZipUrl -OutFile $zipPath -UseBasicParsing -ErrorAction Stop; $gotZip = $true }
-    catch { Write-Warning "下载中断，重试 $i/4…"; Start-Sleep -Seconds (3 * $i) }
+  Write-Host '正在获取安装脚本（来自源码 main 分支）…'
+  foreach ($name in @('wsl-ensure.ps1', 'wsl-ensure-downloads.ps1', 'install-agent-devbox.ps1', 'mount-datadisk.ps1', 'mount-datadisk.cmd', 'unmount-datadisk.ps1', 'unmount-datadisk.cmd')) {
+    $url = "$ScriptsBase/$name"
+    $out = Join-Path $dest $name
+    $got = $false
+    for ($i = 1; $i -le 4 -and -not $got; $i++) {
+      try { Invoke-WebRequest -Uri $url -OutFile $out -UseBasicParsing -ErrorAction Stop; $got = $true }
+      catch { Write-Warning "获取 $name 中断，重试 $i/4…"; Start-Sleep -Seconds (3 * $i) }
+    }
+    if (-not $got) { throw "获取安装脚本失败：$url" }
   }
-  if (-not $gotZip) { throw "下载 agent-devbox-windows.zip 失败：$ZipUrl" }
-  Write-Host '正在解压安装包…'
-  Expand-Archive -Path $zipPath -DestinationPath $dest -Force
 
   $ensure = Join-Path $dest 'wsl-ensure.ps1'
   if (Test-Path -LiteralPath $ensure) {

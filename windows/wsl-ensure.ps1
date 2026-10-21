@@ -9,7 +9,8 @@
   Exposes:
     Test-WslInstalled    - is a functional WSL present? (no interactive block)
     Ensure-Wsl           - install WSL if missing (asks base-only vs base+wsl-ui)
-    Install-WslUi        - install the wsl-ui GUI from its latest GitHub release
+    Get-AgentDevboxDownloadHelperPath - locate the lazily loaded download helper
+                           (wsl-ensure-downloads.ps1: Install-WslUi, Get-ZstdExeFromRelease)
     Get-WslNetworkingMode- read the active networking mode
     Set-MirroredNetworking - switch .wslconfig [wsl2] networkingMode=mirrored
 
@@ -18,6 +19,11 @@
   (it blocks interactively when WSL is missing) and never `Get-Command wsl`
   (the System32 stub always exists even when WSL is not installed).
 #>
+
+# Location of the sibling, lazily loaded download helper. Recorded from this
+# file (not the caller's $PSScriptRoot) so `Get-AgentDevboxDownloadHelperPath`
+# works no matter which script dot-sourced us.
+$script:AgentDevboxEnsureDir = $PSScriptRoot
 
 function Test-WslInstalled {
   [CmdletBinding()]
@@ -62,6 +68,7 @@ function Ensure-Wsl {
   # reboot is still pending; a failure here must not abort the whole install.
   if ($withUi) {
     try {
+      . (Get-AgentDevboxDownloadHelperPath)
       Install-WslUi
     } catch {
       Write-Warning "wsl-ui 未安装：$($_.Exception.Message)"
@@ -74,36 +81,6 @@ function Ensure-Wsl {
     return 'reboot-required'
   }
   return 'ok'
-}
-
-function Install-WslUi {
-  [CmdletBinding()]
-  param()
-
-  $ErrorActionPreference = 'Stop'
-  $arch = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { 'arm64' } else { 'x64' }
-
-  Write-Host "正在安装 wsl-ui ($arch)…"
-  $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ('wslui-' + [System.IO.Path]::GetRandomFileName())
-  New-Item -ItemType Directory -Path $tmp -Force | Out-Null
-  try {
-    # The winget copy lags the releases, so take the latest NSIS installer
-    # straight from GitHub and run it silently (/S); no cert trust needed.
-    $rel = Invoke-RestMethod 'https://api.github.com/repos/octasoft-ltd/wsl-ui/releases/latest' -Headers @{ 'User-Agent' = 'agent-devbox' }
-    $asset = $rel.assets | Where-Object { $_.name -like "*_$arch-setup.exe" } | Select-Object -First 1
-    if (-not $asset) { throw "在最新的 wsl-ui 发布中未找到 $arch 安装包。" }
-
-    $exe = Join-Path $tmp $asset.name
-    Write-Host "  正在下载 $($asset.name)…"
-    Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $exe
-    Unblock-File -LiteralPath $exe -ErrorAction SilentlyContinue
-    Write-Host '  正在静默安装…'
-    $p = Start-Process -FilePath $exe -ArgumentList '/S' -Wait -PassThru
-    if ($p.ExitCode -ne 0) { throw "wsl-ui setup.exe 退出码 $($p.ExitCode)" }
-  } finally {
-    Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
-  }
-  Write-Host 'wsl-ui 已安装。'
 }
 
 function Get-WslNetworkingMode {
@@ -213,6 +190,21 @@ function Set-MirroredNetworking {
 # Installer shared helpers (dot-source-safe: definitions only, no side effects).
 # ===========================================================================
 
+# Resolve the lazily loaded download-and-execute helper next to this file. It is
+# never dot-sourced at load time: the happy path (WSL present, Tier 1 streaming
+# import) needs none of its primitives, so the download/execute shape stays out
+# of the always-loaded working file. Throws a clear Chinese error when the
+# Release zip was not fully extracted.
+function Get-AgentDevboxDownloadHelperPath {
+  [CmdletBinding()]
+  param()
+  $path = Join-Path $script:AgentDevboxEnsureDir 'wsl-ensure-downloads.ps1'
+  if (-not (Test-Path -LiteralPath $path)) {
+    throw '缺少 wsl-ensure-downloads.ps1；请从 Release 压缩包中完整解压所有脚本。'
+  }
+  return $path
+}
+
 # Run a native command with stderr merged into the output while locally relaxing
 # $ErrorActionPreference: with 'Stop', PowerShell 5.1 can turn a native command's
 # stderr (mkfs/zstd progress, icacls errors) into a terminating error. The exit
@@ -307,8 +299,8 @@ function Join-Parts {
 }
 
 # Free bytes available to the current user on the volume that holds $Path.
-# P/Invoke GetDiskFreeSpaceEx (handles directory mount points / junctions);
-# falls back to DriveInfo on the path root. $Override is a test hook.
+# Managed System.IO.DriveInfo only (no Add-Type / P/Invoke); walks up to the
+# nearest existing parent. $Override is a test hook.
 function Get-FreeDiskSpaceBytes {
   [CmdletBinding()]
   param([Parameter(Mandatory)][string] $Path, [Nullable[long]] $Override = $null)
@@ -316,34 +308,16 @@ function Get-FreeDiskSpaceBytes {
 
   $full = [System.IO.Path]::GetFullPath($Path)
   try {
-    if (-not ('AgentDevbox.DiskSpace' -as [type])) {
-      Add-Type -TypeDefinition @'
-using System;
-using System.Runtime.InteropServices;
-namespace AgentDevbox {
-  public static class DiskSpace {
-    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-    [return: MarshalAs(UnmanagedType.Bool)]
-    public static extern bool GetDiskFreeSpaceEx(string lpDirectoryName,
-      out ulong lpFreeBytesAvailable, out ulong lpTotalNumberOfBytes, out ulong lpTotalNumberOfFreeBytes);
-  }
-}
-'@
-    }
-    # GetDiskFreeSpaceEx needs an existing path; walk up to the nearest parent.
     $probe = $full
     while (-not (Test-Path -LiteralPath $probe)) {
       $parent = [System.IO.Path]::GetDirectoryName($probe)
       if ([string]::IsNullOrEmpty($parent) -or $parent -eq $probe) { break }
       $probe = $parent
     }
-    [uint64]$avail = 0; [uint64]$total = 0; [uint64]$totalFree = 0
-    if ([AgentDevbox.DiskSpace]::GetDiskFreeSpaceEx($probe, [ref]$avail, [ref]$total, [ref]$totalFree)) {
-      return [long]$avail
-    }
-  } catch { }
-  $root = [System.IO.Path]::GetPathRoot($full)
-  return [long]([System.IO.DriveInfo]::new($root)).AvailableFreeSpace
+    return [long]([System.IO.DriveInfo]::new([System.IO.Path]::GetPathRoot($probe))).AvailableFreeSpace
+  } catch {
+    return [long]([System.IO.DriveInfo]::new([System.IO.Path]::GetPathRoot($full))).AvailableFreeSpace
+  }
 }
 
 # Parse the uncompressed size out of a zstd frame header (RFC 8878). Returns
@@ -391,20 +365,31 @@ function Get-ZstdUncompressedSize {
   } finally { $fs.Dispose() }
 }
 
-# Read the first bytes of a remote part via an HTTP Range request (raw stream,
-# never a decoded string) and parse the frame header. Returns $null on failure.
+# Read the first bytes of a remote part via a managed HttpClient range request;
+# never buffers the body (ResponseHeadersRead) and parses the frame header.
+# Returns $null on failure.
 function Get-ZstdUncompressedSizeFromUrl {
   [CmdletBinding()]
   param([Parameter(Mandatory)][string] $Url)
   $ErrorActionPreference = 'Stop'
+  $client = $null
+  $req = $null
+  $resp = $null
   try {
-    $req = [System.Net.HttpWebRequest]::Create($Url)
-    $req.UserAgent = 'agent-devbox-installer'
-    $req.AddRange(0, 17)
-    $req.Timeout = 30000
-    $resp = $req.GetResponse()
+    if (-not ('System.Net.Http.HttpClient' -as [type])) {
+      Add-Type -AssemblyName System.Net.Http -ErrorAction Stop
+    }
+    $client = [System.Net.Http.HttpClient]::new()
+    $client.Timeout = [TimeSpan]::FromSeconds(30)
+    $client.DefaultRequestHeaders.UserAgent.ParseAdd('agent-devbox-installer')
+    $req = [System.Net.Http.HttpRequestMessage]::new([System.Net.Http.HttpMethod]::Get, $Url)
+    $req.Headers.Range = [System.Net.Http.Headers.RangeHeaderValue]::new(0, 17)
+    # ResponseHeadersRead: if a server ignores Range, we read 18 bytes and
+    # dispose instead of buffering the whole multi-GB part.
+    $resp = $client.SendAsync($req, [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead).GetAwaiter().GetResult()
+    if (-not $resp.IsSuccessStatusCode) { return $null }
+    $stream = $resp.Content.ReadAsStreamAsync().GetAwaiter().GetResult()
     try {
-      $stream = $resp.GetResponseStream()
       $buf = New-Object byte[] 18
       $read = 0
       while ($read -lt $buf.Length) {
@@ -415,9 +400,13 @@ function Get-ZstdUncompressedSizeFromUrl {
       if ($read -le 0) { return $null }
       if ($read -lt $buf.Length) { $buf = $buf[0..($read - 1)] }
       return (Get-ZstdUncompressedSizeFromBytes $buf)
-    } finally { $resp.Close() }
+    } finally { $stream.Dispose() }
   } catch {
     return $null
+  } finally {
+    if ($resp) { $resp.Dispose() }
+    if ($req) { $req.Dispose() }
+    if ($client) { $client.Dispose() }
   }
 }
 
@@ -504,24 +493,14 @@ function Invoke-WslImportStream {
   return $p.ExitCode
 }
 
-# Fetch (once) the pinned zstd.exe from the official facebook/zstd release.
+# Fetch (once) the pinned zstd.exe through the lazily loaded download helper.
+# Same name/signature as before, so Tier 3 callers are unchanged; the
+# download+expand body lives in wsl-ensure-downloads.ps1.
 function Get-ZstdExe {
   [CmdletBinding()]
   param([Parameter(Mandatory)][string] $InstallDir)
-  $zstdExe = Join-Path $InstallDir 'zstd.exe'
-  if (Test-Path -LiteralPath $zstdExe) { return $zstdExe }
-  $zstdVer = '1.5.7'
-  $zstdUrl = "https://github.com/facebook/zstd/releases/download/v$zstdVer/zstd-v$zstdVer-win64.zip"
-  $tmpZip = Join-Path $InstallDir 'zstd.zip'
-  $tmpDir = Join-Path $InstallDir 'zstd-tmp'
-  Write-Host "正在获取 zstd $zstdVer（用于解压）…"
-  Invoke-WebRequest -Uri $zstdUrl -OutFile $tmpZip
-  Expand-Archive -Path $tmpZip -DestinationPath $tmpDir -Force
-  $found = Get-ChildItem -Path $tmpDir -Recurse -Filter 'zstd.exe' | Select-Object -First 1
-  if (-not $found) { throw '下载的压缩包中未找到 zstd.exe。' }
-  Copy-Item $found.FullName $zstdExe -Force
-  Remove-Item -Path $tmpZip, $tmpDir -Recurse -Force -ErrorAction SilentlyContinue
-  return $zstdExe
+  . (Get-AgentDevboxDownloadHelperPath)
+  return (Get-ZstdExeFromRelease -InstallDir $InstallDir)
 }
 
 # Robust download: curl.exe with resume + retries when available (Windows 10
