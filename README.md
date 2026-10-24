@@ -39,23 +39,30 @@ irm https://raw.githubusercontent.com/sfhgknsdfksdlf/agent-devbox/main/windows/i
 
 - 自动请求一次管理员授权（UAC），自动装好 WSL（可选带上 [wsl-ui](https://github.com/octasoft-ltd/wsl-ui) 图形界面）并建议开启镜像网络；
 - 安装脚本（`install-agent-devbox.ps1`、`wsl-ensure.ps1`、`wsl-ensure-downloads.ps1`）从**所选的代码分支/标签（默认 `main`）**取回，只有 rootfs 镜像分片来自 Release；每个脚本都会按同分支的 `windows/SHA256SUMS` 校验（旧版本没有清单时才需要 `-AllowUnverifiedScripts`）；rootfs 分片按架构命名（`rootfs-<variant>-<arch>.tar.zst.part-*`，`arch` 为 `amd64` / `arm64`），安装器按宿主**原生**架构自动选择，不需要额外参数；
-- 交互运行时询问装哪个镜像（回车＝完整版多助手 `agents`，输入 `c`＝精简版 `core`）和哪个版本（回车＝`latest`，输入 `b`＝最新 `beta`，也可直接输入版本号），最后询问代码分支（回车＝`main`，输入 `?` 列出全部分支；开发测试用）；
+- 交互运行时询问装哪个镜像（回车＝完整版多助手 `agents`，输入 `c`＝精简版 `core`）和哪个版本（回车＝`latest`，输入 `b`＝最新 `beta`，也可直接输入版本号），最后询问代码分支（回车＝`main`，输入 `?` 列出全部分支；非 `main` 的 ref 会装进完全隔离的 beta 通道，见下文）；
 - 装完自动清理临时文件。
 
-装好后用**哪个名字取决于你装的变体**：完整版是 `agent-devbox`，精简版是 `agent-devbox-core`。
-记不住、或者怕粘贴错，就在 Windows PowerShell 里粘一次下面这段——它自动认出已装的变体并设为默认：
+装好后用**哪个名字取决于「变体 × 通道」**：正式通道是 `agent-devbox`（多助手 agents）和
+`agent-devbox-core`（core），beta 通道是 `agent-devbox-beta` 和 `agent-devbox-core-beta`。
+记不住、或者怕粘贴错，就在 Windows PowerShell 里粘一次下面这段——它按通道自动认出已装的发行版并设为默认：
 
 ```powershell
 $env:WSL_UTF8 = 1
+$Channel = 'stable'   # 装的是 beta 通道就改成 'beta'
+$names = @('agent-devbox', 'agent-devbox-core', 'agent-devbox-beta', 'agent-devbox-core-beta')
 $Distro = (wsl -l -q) | ForEach-Object { ($_ -replace "`0", '').Trim() } |
-  Where-Object { $_ -like 'agent-devbox*' } | Select-Object -First 1
-if (-not $Distro) { throw '没找到 agent-devbox / agent-devbox-core，请先跑上面那条安装命令' }
+  Where-Object {
+    $_ -in $names -and
+    (($_ -notlike '*-beta') -eq ($Channel -eq 'stable'))
+  } | Select-Object -First 1
+if (-not $Distro) { throw "没找到 $Channel 通道的 agent-devbox（$($names -join ' / ')），请先跑上面那条安装命令" }
 wsl --set-default $Distro
 "使用发行版：$Distro"
 ```
 
 之后在**同一个 PowerShell 窗口**里，所有命令都可以直接写 `wsl -d $Distro ...`；不想用变量就显式写
-`wsl -d agent-devbox`（agents）或 `wsl -d agent-devbox-core`（core）。
+`wsl -d agent-devbox`（agents/stable）、`wsl -d agent-devbox-core`（core/stable）、
+`wsl -d agent-devbox-beta`（agents/beta）或 `wsl -d agent-devbox-core-beta`（core/beta）。
 
 安装脚本会自动：**下载前先检查目标磁盘空间**（不够就用中文报错中止），再导入系统、创建
 一块 32GB 的动态数据磁盘并初始化、写入开机配置，并自己附加这块数据盘（下次启动起由
@@ -71,19 +78,22 @@ wsl --set-default $Distro
 x64 版本，因此会跳过 Tier 3。两级都失败时安装器提示先 `wsl --update` 再重装，已下载的分片会
 保留供重试（详见 [docs/installation-wsl.md](docs/installation-wsl.md) 的 ARM64 一节）。
 
-两个变体现在**互不冲突、可以同时安装同时运行**：agents 版注册成 WSL 发行版 `agent-devbox`
-（默认安装目录 `D:\WSL\agent-devbox`），core 版注册成 `agent-devbox-core`
-（默认 `D:\WSL\agent-devbox-core`）；各自在自己安装目录里有**独立**的 `data.vhdx`
-（两份 `/home`、`/root`、`/workspace` 互不共享）。数据盘统一用 ext4 卷标 **`devbox-data`**
-（`DATA_MNTNAME` 也是 `devbox-data`），在 WSL 里固定挂到 **`/mnt/devbox-data`**；安装器
-写 `/etc/agent-devbox.conf`（5 个键：`DATA_VHDX`、`DATA_UUID`、`PASEO_PASSWORD`、
-`DATA_MNTNAME`、`DATA_DISTRO`）。安装器只自己附加一次数据盘，**不再注册任何 Windows 任务**；
+四个组合（变体 × 通道）现在**互不冲突、可以同时安装同时运行**：正式通道沿用发行版 `agent-devbox`
+（默认安装目录 `D:\WSL\agent-devbox`）和 `agent-devbox-core`（默认 `D:\WSL\agent-devbox-core`）；
+beta 通道是 `agent-devbox-beta`（默认 `D:\WSL\agent-devbox-beta`）和 `agent-devbox-core-beta`
+（默认 `D:\WSL\agent-devbox-core-beta`）。每个组合在自己的安装目录里有**独立**的 `data.vhdx`
+（`/home`、`/root`、`/workspace` 互不共享）。数据盘的 ext4 卷标和挂载名**按通道区分**：正式通道是
+**`devbox-data`**，beta 通道是 **`devbox-data-beta`**（正好 16 个字符，ext4 卷标上限），分别固定挂到
+**`/mnt/devbox-data`** 和 **`/mnt/devbox-data-beta`**；安装器写 `/etc/agent-devbox.conf`
+（6 个键：`DATA_VHDX`、`DATA_UUID`、`DATA_LABEL`、`PASEO_PASSWORD`、`DATA_MNTNAME`、`DATA_DISTRO`）。
+安装器只自己附加一次数据盘，**不再注册任何 Windows 任务**；
 如果检测到旧版本留下的 `agent-devbox-mount-datadisk` / `agent-devbox-core-mount-datadisk`
 旧任务，会直接注销它们。
 
 真正的挂载由**发行版自己在每次启动时完成**：`scripts/wsl-boot.sh` 先发起一次**硬超时**的
 `wsl.exe --mount --vhd ... --bare`（设备已在则跳过；这是 `[boot]` 里唯一一次 interop 调用），
-再等待设备出现、按 UUID（`blkid -t UUID=`）找到它（找不到再按 `devbox-data` 标签），挂到 `/mnt/devbox-data`，最后 bind
+再等待设备出现、按 UUID（`blkid -t UUID=`）找到它（找不到再按本通道的标签 `devbox-data` / `devbox-data-beta`），挂到
+`/mnt/<DATA_MNTNAME>`（`/mnt/devbox-data` 或 `/mnt/devbox-data-beta`），最后 bind
 `/home` `/root` `/workspace`。它**不调用** `schtasks.exe`、`wsl -d` 或 `--unmount`
 （旧版从开机里回调 Windows 工具会重进 WSL，造成开不机的死循环）。挂载失败则进入维护模式
 （fail closed，什么都不初始化、不启动），`/etc/motd` 用中英文给出两条可复制粘贴的修复命令：
@@ -105,13 +115,15 @@ UAC）：`mount-datadisk.cmd`（不带参数＝附加本目录的 `data.vhdx`，
 正常使用不用管这些：**发行版每次启动，boot 脚本都会自己重新附加并挂载**。只有 boot attach
 失败（进了维护模式）时才需要手动修复：先跑 `<安装目录>\mount-datadisk.cmd`，再
 `wsl --terminate <发行版>`，然后重新打开发行版。已装的旧版本建议重跑一次安装器：它会注销
-旧版本残留的挂载任务，并写入新的 5 键配置（旧配置也能用：会继续按它旧的 `DATA_MNTNAME`
+旧版本残留的挂载任务，并写入新的 6 键配置（旧配置也能用：会继续按它旧的 `DATA_MNTNAME`
 挂载）。
 
-两个变体的数据盘可以互换：它们用同一个 ext4 卷标（也是挂载名）`devbox-data`，把一个变体的
-`data.vhdx` 复制到另一个变体的安装目录后，boot 会先按 conf 里的 UUID 找设备，找不到再按
-`devbox-data` 标签找，所以复制盘（保留源 UUID）也能正常挂载，conf 里的 UUID 不会被改写。
-两个变体各自的盘 UUID 不同，同时附加也不会互相误认；但如果 UUID 命中不止一块（复制盘保留了
+**同一通道内**的两个变体（agents / core）数据盘可以互换：它们用同一个 ext4 卷标（也是挂载名），
+正式通道是 `devbox-data`、beta 通道是 `devbox-data-beta`；把一个变体的 `data.vhdx` 复制到**同通道**
+另一个变体的安装目录后，boot 会先按 conf 里的 UUID 找设备，找不到再按该通道的标签找，所以复制盘
+（保留源 UUID）也能正常挂载，conf 里的 UUID 不会被改写。**跨通道不行**：正式盘不能给 beta 用，
+beta 盘也不能给正式用（卷标 / 挂载名不同，安装器的目录所有权校验也会拒绝）。
+同一通道内两个变体各自的盘 UUID 不同，同时附加也不会互相误认；但如果 UUID 命中不止一块（复制盘保留了
 源 UUID、原盘又还附加着），或 UUID 完全找不到而标签命中多块，boot 会 fail closed 进入维护
 模式而不是随便挑一块：按提示用安装目录的 `unmount-datadisk.cmd` 分离多余的那块，再重新打开
 发行版。复制出来的两份是彼此独立的文件系统（不会同步），复制前请先分离源盘。
@@ -119,12 +131,69 @@ UAC）：`mount-datadisk.cmd`（不带参数＝附加本目录的 `data.vhdx`，
 详见 **[docs/installation-wsl.md](docs/installation-wsl.md)** 和
 **[docs/wsl-persistence.md](docs/wsl-persistence.md)**。
 
+## Beta 通道（完全隔离）
+
+从**非 `main` 的代码 ref** 安装时，安装器会把这次安装放进 **beta 通道**：
+`$Channel = 'beta'` 当且仅当 `$Ref -ne 'main'`，否则是 `stable`。`$Ref` 的取值顺序是
+`-Ref` > 环境变量 `$env:AGENT_DEVBOX_REF` > 交互式询问（回车 = `main`）> `main`。
+
+> **关键**：`irm https://raw.githubusercontent.com/<owner>/<repo>/<branch>/windows/install.ps1 | iex`
+> 这种写法**拿不到 URL 里的分支名**。只改 URL 里的分支，安装的仍然是 `main` 的脚本，并且会装进
+> **stable** 通道。要从某个分支安装，必须显式传 `-Ref <branch>`，或先设置
+> `$env:AGENT_DEVBOX_REF = '<branch>'`：
+
+```powershell
+# 方式一：环境变量（对后面的 irm | iex 生效）
+$env:AGENT_DEVBOX_REF = 'my-branch'
+irm https://raw.githubusercontent.com/sfhgknsdfksdlf/agent-devbox/main/windows/install.ps1 | iex
+
+# 方式二：直接给入口脚本传 -Ref
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/sfhgknsdfksdlf/agent-devbox/main/windows/install.ps1))) -Ref my-branch
+```
+
+beta 通道会在发行版名、默认安装目录、数据盘 ext4 卷标和挂载名上追加 `-beta`：
+
+| 变体 | 通道 | 发行版 | 默认安装目录 | ext4 卷标 | 挂载名 |
+|---|---|---|---|---|---|
+| agents | stable | `agent-devbox` | `D:\WSL\agent-devbox` | `devbox-data` | `devbox-data` |
+| agents | beta | `agent-devbox-beta` | `D:\WSL\agent-devbox-beta` | `devbox-data-beta` | `devbox-data-beta` |
+| core | stable | `agent-devbox-core` | `D:\WSL\agent-devbox-core` | `devbox-data` | `devbox-data` |
+| core | beta | `agent-devbox-core-beta` | `D:\WSL\agent-devbox-core-beta` | `devbox-data-beta` | `devbox-data-beta` |
+
+`devbox-data-beta` 正好 16 个字符（ext4 卷标上限）。**同一通道内** agents / core 的数据盘仍可互换；
+**跨通道不行**，正式盘与 beta 盘不通用。
+
+显式 `-InstallDir` 会**原样使用，绝不追加 `-beta`**。一个目录只属于一个通道：如果目录里已经有
+`data.vhdx` **或** `ext4.vhdx`，安装器会读 `<目录>\.agent-devbox-channel`（没有标记 = 通道功能之前
+的旧安装，按 `stable` 处理）；通道不一致时直接拒绝，并提示去掉 `-InstallDir` 用默认目录，或换一个
+新目录。这样 beta 安装不会覆盖正式安装的系统盘或数据盘。
+
+stable 与 beta 可以同时安装、同时运行：发行版、安装目录、`data.vhdx`、paseo 密码、Windows Terminal
+fragment（beta 是 `agent-devbox-beta.json` / `agent-devbox-core-beta.json`）以及固定 GUID 都各自独立。
+`%LOCALAPPDATA%\agent-devbox` 下的暂存目录是两者共用的，但每次运行都用随机子目录，互不覆盖。
+
+仍然有几项是**主机级**的，beta 安装也躲不开：`.wslconfig`（例如镜像网络）、`Set-MirroredNetworking`
+和 `wsl --shutdown` 影响整台机器，一次 beta 安装同样可能改动主机网络设置或停掉其它发行版。
+
+数据盘初始化（`datadisk-init`：卷标不合法、候选盘有歧义、`mkfs` 失败等）现在**直接失败**，不再继续
+写配置，因此另一个通道的磁盘 UUID / 密码不会被写进本通道的 `/etc/agent-devbox.conf`；失败时
+`data.vhdx` 保留，方便重试或换目录。
+
+> beta **通道**不是 beta **发布**：上文的 `beta-<YYYYMMDD.HHMM>` / `:beta` 是 Release / 镜像标签，
+> `-ReleaseTag b|beta` 选的是最新的 `beta-*` 预发布（rootfs）；`-Ref` 选的才是代码分支。
+> beta 通道用正式 rootfs 或 beta rootfs 都行，**前提是该 rootfs 里的 `wsl-boot.sh` 支持通道标签
+> （`DATA_LABEL`）**；更旧的镜像会被直接拒绝：安装器注销刚导入的发行版、保留 `data.vhdx`，并提示改用
+> `-ReleaseTag beta` 或更新的构建。
+> 另外，只有包含 beta 通道实现的 ref 才会装出 beta 通道；更旧的标签 / commit 里还是没加 `-Channel`
+> 的旧 `install.ps1`，会按 stable 入口安装。
+
 ## 日志与密码（WSL）
 
 为降低杀软误报，安装脚本**不会把 paseo 密码打印到控制台或安装日志**。安装后这样取：
 
 ```powershell
-# Windows 侧（先跑上面那段定义 $Distro；也可直接把 $Distro 换成 agent-devbox / agent-devbox-core）
+# Windows 侧（先跑上面那段定义 $Distro；也可直接把 $Distro 换成
+# agent-devbox / agent-devbox-core / agent-devbox-beta / agent-devbox-core-beta）
 wsl -d $Distro -u root -e cat /etc/agent-devbox.conf
 ```
 
@@ -133,12 +202,17 @@ wsl -d $Distro -u root -e cat /etc/agent-devbox.conf
 cat /etc/agent-devbox.conf
 ```
 
-安装日志**持久保存**在安装目录（默认 agents 为 `D:\WSL\agent-devbox`，core 为
-`D:\WSL\agent-devbox-core`），文件名形如 `agent-devbox-install-<yyyyMMdd-HHmmss>.log`；
+每个通道的 `PASEO_PASSWORD` 各自独立，互不沿用；数据盘上的副本也在各自的挂载点：
+`/mnt/devbox-data/.paseo-password`（stable）或 `/mnt/devbox-data-beta/.paseo-password`（beta）。
+
+安装日志**持久保存**在安装目录（正式通道 agents 为 `D:\WSL\agent-devbox`、core 为
+`D:\WSL\agent-devbox-core`；beta 通道为 `D:\WSL\agent-devbox-beta` /
+`D:\WSL\agent-devbox-core-beta`），文件名形如 `agent-devbox-install-<yyyyMMdd-HHmmss>.log`；
 `%LOCALAPPDATA%` 下的那份只是临时转播日志，原窗口回显后即删除：
 
 ```powershell
-Get-ChildItem 'D:\WSL\agent-devbox\agent-devbox-install-*.log' |
+$InstallDir = 'D:\WSL\agent-devbox'   # beta：D:\WSL\agent-devbox-beta；core 同理
+Get-ChildItem "$InstallDir\agent-devbox-install-*.log" |
   Sort-Object LastWriteTime -Descending | Select-Object -First 1 | Get-Content -Tail 200
 ```
 
@@ -179,7 +253,8 @@ Remove-Item "$env:LOCALAPPDATA\wsl-ui\distro-metadata.json" -Force -ErrorAction 
 4. Windows Terminal 的 profile 由安装器**固定 GUID**：镜像里关掉了 WSL 的自动 profile 生成
    （`/etc/wsl-distribution.conf` 的 `[windowsterminal] enabled=false`），安装器写一条
    `%LOCALAPPDATA%\Microsoft\Windows Terminal\Fragments\AgentDevbox\<发行版>.json`
-   （固定 GUID、`wsl.exe -d <发行版>` 启动、起始目录 `/root`），并删掉 WSL 以前生成的
+   （固定 GUID、`wsl.exe -d <发行版>` 启动、起始目录 `/root`；beta 通道的发行版名自带 `-beta`，
+   例如 `agent-devbox-beta.json`），并删掉 WSL 以前生成的
    `Fragments\Microsoft.WSL` 旧条目。重装/升级都不会换 GUID，你在 profile 上的字体/配色/
    起始目录会一直保留。若 wsl-ui 仍打不开终端，关掉 Windows Terminal 与 wsl-ui 后重开。
 
@@ -187,7 +262,7 @@ Remove-Item "$env:LOCALAPPDATA\wsl-ui\distro-metadata.json" -Force -ErrorAction 
 
 - 你登录用的用户：**root**。
 - paseo 后台服务：以非 root 的 **`paseo`** 用户运行（uid/gid 1000）。
-- `PASEO_PASSWORD` **必填** —— 没设置密码时服务会拒绝启动。
+- `PASEO_PASSWORD` **必填** —— 没设置密码时服务会拒绝启动。stable 与 beta 通道各自有一份密码，互不沿用。
 
 ## 端口
 
@@ -254,10 +329,12 @@ Remove-Item "$env:LOCALAPPDATA\wsl-ui\distro-metadata.json" -Force -ErrorAction 
 > （`build-YYYYMMDD.HHMM`／`beta-YYYYMMDD.HHMM`，裸日期如 `20261018.0731` 会自动补 `build-` 前缀）。
 > **已装过时，交互式运行会问一行：回车 = 覆盖升级，`n` = 取消** —— 换系统盘，但数据盘
 > （`/home`、`/root`、`/workspace`）和 **paseo 密码都保留**（密码存在数据盘
-> `/mnt/devbox-data/.paseo-password`）。一键命令会在 UAC 提权之后、改动镜像网络之前提问；
+> `/mnt/<DATA_MNTNAME>/.paseo-password`：正式通道 `devbox-data`，beta 通道 `devbox-data-beta`）。一键命令会在 UAC 提权之后、改动镜像网络之前提问；
 > 取消就什么都不做（不下载、不注销、不改 `.wslconfig`，退出码 0）。想保留现有安装不动就加
 > `-KeepExisting`；`-Yes` 或重定向/无人值守运行不提问，直接升级；无人值守还可用
 > `-ReleaseTag <版本>`。稳定版仍是定时的 `latest` / Release。
+> 这里的 beta 是**发布标签**，和上面的 beta **通道**不是一回事：`-ReleaseTag b` 只换 rootfs，
+> 通道由 `-Ref` 决定（见「Beta 通道（完全隔离）」）。
 
 ## 产物在哪
 
@@ -269,10 +346,11 @@ Remove-Item "$env:LOCALAPPDATA\wsl-ui\distro-metadata.json" -Force -ErrorAction 
 | 1Panel 本地应用包（`agent-devbox-1panel-localapp.zip`） | **GitHub Releases** | 1Panel 应用商店（本地应用） |
 
 > Windows 端**不再**随 Release 分发旧的安装压缩包或独立的引导脚本；安装入口
-> 就是项目源码 `main` 上的 `windows/install.ps1`（`irm ... | iex`）。它按需从 `main` 取回
-> `install-agent-devbox.ps1`、`wsl-ensure.ps1`、`wsl-ensure-downloads.ps1`，并把手动挂载 / 卸载
+> 就是项目源码 `main` 上的 `windows/install.ps1`（`irm ... | iex`）。它按需从**所选 ref（默认 `main`）**
+> 取回 `install-agent-devbox.ps1`、`wsl-ensure.ps1`、`wsl-ensure-downloads.ps1`，并把手动挂载 / 卸载
 > 数据盘的辅助脚本 `mount-datadisk.cmd`、`unmount-datadisk.cmd` 复制进安装目录。Release
-> 现在只承载 rootfs 分片和 1Panel 本地应用包。
+> 现在只承载 rootfs 分片和 1Panel 本地应用包。从分支安装必须传 `-Ref <分支>`（或设
+> `$env:AGENT_DEVBOX_REF`），否则装的是 `main` 脚本 + stable 通道。
 
 > 结论：**容器镜像在 ghcr**；**Windows 一键安装的入口是项目源码里的 `install.ps1`（`irm`）**，
 > **给 WSL 用的 rootfs 分片在 GitHub Releases**。

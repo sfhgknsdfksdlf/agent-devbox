@@ -2630,3 +2630,53 @@ function Assert-PaseoHealthy {
   $log = Invoke-Native 'wsl.exe' @('-d', $Distro, '-u', 'root', '-e', 'tail', '-n', '20', '/var/log/paseo-boot.log')
   throw ("paseo 未在 {0}s 内就绪（/api/health 不是 200）。`n{1}" -f $TimeoutSeconds, $log)
 }
+
+# ===========================================================================
+# Channel identity: stable (main) vs beta (any other ref)
+# ===========================================================================
+# A channel is a separate PRODUCT IDENTITY, not a path suffix: its own distro,
+# install dir, ext4 label, mount name and Windows Terminal GUIDs, so a beta
+# install can never unregister, mount or profile-clobber the stable install.
+# The stable rows are the pre-channel literals and must stay byte-identical.
+function Get-AgentDevboxChannelIdentity {
+  [CmdletBinding()]
+  param(
+    [Parameter(Mandatory)][ValidateSet('agents', 'core')][string] $Variant,
+    [Parameter(Mandatory)][ValidateSet('stable', 'beta')][string] $Channel
+  )
+  $suffix = if ($Channel -eq 'beta') { '-beta' } else { '' }
+  $label  = if ($Channel -eq 'beta') { 'devbox-data-beta' } else { 'devbox-data' }
+  $base   = if ($Variant -eq 'core') { 'agent-devbox-core' } else { 'agent-devbox' }
+  $distro = "$base$suffix"
+
+  $terminalGuid = ''
+  $hideGuid     = ''
+  if ($Variant -eq 'core') {
+    if ($Channel -eq 'beta') {
+      $terminalGuid = '{9c0a398c-65c5-4a2f-85e5-220af66bac1b}'
+      $hideGuid     = '{e6647892-a55a-456d-841d-4c4faed607b9}'
+    } else {
+      $terminalGuid = '{c2d7e9a4-3f61-4b08-8e52-7a1d9c4b6f30}'
+      $hideGuid     = '{82ea5eb7-e460-5790-9192-d6a59b44f009}'
+    }
+  } else {
+    if ($Channel -eq 'beta') {
+      $terminalGuid = '{2af7958c-5167-48b1-a6bd-acaabdca12d2}'
+      $hideGuid     = '{0c3f8933-9ad0-429b-a9b8-43861e7fa812}'
+    } else {
+      $terminalGuid = '{6f4a1c2e-8b3d-4a97-9c51-0e7d2b8f3a64}'
+      $hideGuid     = '{04014822-8112-5520-a687-27d5f19a9da6}'
+    }
+  }
+
+  return [pscustomobject]@{
+    Variant      = $Variant
+    Channel      = $Channel
+    Distro       = $distro
+    InstallDir   = ('D:\WSL\{0}' -f $distro)
+    Label        = $label
+    MountName    = $label
+    TerminalGuid = $terminalGuid
+    HideGuid     = $hideGuid
+  }
+}

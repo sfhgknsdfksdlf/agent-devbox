@@ -133,6 +133,7 @@ SH
 label_blkid() {
   cat > "$BINDIR/blkid" <<'SH'
 #!/bin/sh
+echo "blkid $*" >> "$CALL_LOG"
 case "$*" in
   *"UUID="*)
     if [ -n "${BLKID_UUID_DEVS:-}" ]; then
@@ -175,6 +176,12 @@ conf_with_vhdx() {
 # conf_with_mntname <name>: a temp conf declaring only DATA_MNTNAME.
 conf_with_mntname() {
   printf "DATA_MNTNAME='%s'\n" "$1" > "$AGENT_DEVBOX_CONF"
+}
+
+# conf_with_label <label>: a temp conf declaring the VHDX + UUID (as the
+# installer writes them) plus the per-channel data-disk ext4 label.
+conf_with_label() {
+  printf 'DATA_VHDX="%s"\nDATA_UUID="test-uuid-1234"\nDATA_LABEL="%s"\n' "$VHDX" "$1" > "$AGENT_DEVBOX_CONF"
 }
 
 # assert_log_has <substr>: the mount/blkid shims recorded this substring.
@@ -444,6 +451,87 @@ SH
   assert_log_lacks 'mount'
   grep -Fq '多块' "$TMP/same-uuid.boot.log"
   grep -Fq 'boot failed: maintenance mode' "$TMP/same-uuid.boot.log"
+}
+
+# ---------------------------------------------------------------------------
+# per-channel data-disk label: stable uses `devbox-data`, beta uses
+# `devbox-data-beta` (16 chars, the ext4 limit). Precedence is
+# AGENT_DEVBOX_DATA_LABEL > conf DATA_LABEL > devbox-data, and the env override
+# must survive load_conf()'s reset-then-source of the installer-written conf.
+# ---------------------------------------------------------------------------
+
+@test "conf DATA_LABEL drives the label lookup (beta channel)" {
+  base_shims
+  label_blkid
+  conf_with_label 'devbox-data-beta'
+  unset AGENT_DEVBOX_DATA_LABEL
+  export BLKID_LABEL_DEVS='/dev/betadisk'
+  run bash -c '. "$SCRIPT"; load_conf; ensure_mounted'
+  [ "$status" -eq 0 ]
+  assert_log_has 'LABEL=devbox-data-beta'
+  assert_log_has 'mount -t ext4 /dev/betadisk'
+}
+
+@test "AGENT_DEVBOX_DATA_LABEL beats the conf label" {
+  base_shims
+  label_blkid
+  conf_with_label 'devbox-data-beta'
+  export AGENT_DEVBOX_DATA_LABEL='devbox-data-env' BLKID_LABEL_DEVS='/dev/envdisk'
+  run bash -c '. "$SCRIPT"; load_conf; ensure_mounted'
+  [ "$status" -eq 0 ]
+  assert_log_has 'LABEL=devbox-data-env'
+  assert_log_lacks 'LABEL=devbox-data-beta'
+  assert_log_has 'mount -t ext4 /dev/envdisk'
+}
+
+@test "env-only beta label works with a stable conf" {
+  base_shims
+  label_blkid
+  conf_with_label 'devbox-data'
+  export AGENT_DEVBOX_DATA_LABEL='devbox-data-beta' BLKID_LABEL_DEVS='/dev/betadisk'
+  run bash -c '. "$SCRIPT"; load_conf; ensure_mounted'
+  [ "$status" -eq 0 ]
+  assert_log_has 'LABEL=devbox-data-beta'
+  run grep -Fxq 'blkid -o device -t LABEL=devbox-data' "$CALL_LOG"
+  [ "$status" -ne 0 ]
+  assert_log_has 'mount -t ext4 /dev/betadisk'
+}
+
+@test "legacy conf without DATA_LABEL still uses the stable label" {
+  base_shims
+  label_blkid
+  conf_with_vhdx
+  unset AGENT_DEVBOX_DATA_LABEL
+  export BLKID_LABEL_DEVS='/dev/stabledisk'
+  run bash -c '. "$SCRIPT"; load_conf; ensure_mounted'
+  [ "$status" -eq 0 ]
+  run grep -Fxq 'blkid -o device -t LABEL=devbox-data' "$CALL_LOG"
+  [ "$status" -eq 0 ]
+  assert_log_has 'mount -t ext4 /dev/stabledisk'
+}
+
+@test "static guard: load_conf re-applies the env label after sourcing the conf" {
+  # The env value is snapshotted at source time (before load_conf may reset
+  # DATA_LABEL), then re-applied AFTER the conf is sourced. Order matters: if the
+  # re-apply ran first, sourcing a conf with DATA_LABEL would silently win.
+  run grep -Fq 'DATA_LABEL_ENV="${AGENT_DEVBOX_DATA_LABEL:-}"' "$SCRIPT"
+  [ "$status" -eq 0 ]
+  run awk '
+    /^load_conf\(\)/ { infn = 1 }
+    infn { body = body $0 "\n"; if ($0 == "}") exit }
+    END {
+      n = split(body, L, "\n")
+      reset = source = apply = 0
+      for (i = 1; i <= n; i++) {
+        if (L[i] ~ /DATA_LABEL="devbox-data"/ && !reset) reset = i
+        if (L[i] ~ /^[[:space:]]*\. "[$]CONF"$/ && !source) source = i
+        if (index(L[i], "DATA_LABEL=\"${DATA_LABEL_ENV:-${DATA_LABEL:-devbox-data}}\"") && !apply) apply = i
+      }
+      if (reset && source && apply && reset < source && source < apply) print "ORDER_OK"
+      else print "ORDER_BAD reset=" reset " source=" source " apply=" apply
+    }
+  ' "$SCRIPT"
+  [ "$output" = "ORDER_OK" ]
 }
 
 @test "write_maintenance_motd gives both copy-paste repair commands" {

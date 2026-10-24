@@ -10,11 +10,12 @@
 #   that existed while only a Windows logon task could attach the disk.
 #   Everything after the attach stays in Linux:
 #     1. Wait for the attached block device up to DEVICE_WAIT seconds. Only ONE
-#        wait per boot. Identity is resolved by UUID first, then by the shared
-#        ext4 label (`devbox-data`), which is what makes the agents and core
-#        variants' data disks interchangeable: a copied VHDX keeps the source
-#        UUID, so it only resolves by label. Two matches (original + copy both
-#        attached) fail closed — boot never picks one.
+#        wait per boot. Identity is resolved by UUID first, then by the channel's
+#        ext4 label (`devbox-data` stable / `devbox-data-beta` beta), which is
+#        what makes same-channel agents and core data disks interchangeable: a
+#        copied VHDX keeps the source UUID, so it only resolves by label. Two
+#        matches (original + copy both attached) fail closed — boot never picks
+#        one.
 #     2. `mount -t ext4 <dev> /mnt/<mntname>` (mntname from DATA_MNTNAME,
 #        default `devbox-data`, read out of /etc/agent-devbox.conf).
 #     3. VERIFY the mount identity (mountpoint + UUID) — fail closed.
@@ -53,9 +54,11 @@
 #   MAINTENANCE MOTD. So we check every exit status explicitly instead. Errors stay
 #   loud: they are logged and turned into a fail-closed exit 0 (MAINTENANCE MODE).
 #
-# Layout: credentials/identity come from /etc/agent-devbox.conf (5 keys written
+# Layout: credentials/identity come from /etc/agent-devbox.conf (6 keys written
 # by the Windows installer): DATA_VHDX, DATA_UUID, PASEO_PASSWORD, DATA_MNTNAME,
-# DATA_DISTRO.
+# DATA_DISTRO, DATA_LABEL. Label precedence: AGENT_DEVBOX_DATA_LABEL (env) >
+# conf DATA_LABEL > `devbox-data`. Labels are per channel: `devbox-data` (stable)
+# / `devbox-data-beta` (beta, exactly 16 chars — the ext4 limit).
 #
 # This file is safe to SOURCE — every side effect lives in a function, and the
 # entry point is guarded by the BASH_SOURCE check at the bottom.
@@ -84,11 +87,15 @@ PASEO_LOG_MAX="${AGENT_DEVBOX_PASEO_LOG_MAX:-5242880}"
 # stays inside the installer's 45s assertion.
 ATTACH_TIMEOUT="${AGENT_DEVBOX_ATTACH_TIMEOUT:-8}"
 DEVICE_WAIT="${AGENT_DEVBOX_DEVICE_WAIT:-20}"
-# Data-disk shared identity: both variants use the SAME ext4 label, so a data
-# disk copied from one variant can boot the other. Resolve by UUID first, then
-# by label. A copied VHDX keeps the source UUID, so the original and its copy can
-# be attached together -> multiple matches are an ERROR, never a coin flip.
-DATA_LABEL="${AGENT_DEVBOX_DATA_LABEL:-devbox-data}"
+# Data-disk channel identity: same-channel variants (agents/core) use the SAME
+# ext4 label, so a data disk copied within a channel can boot the other variant.
+# Labels are per channel (stable `devbox-data`, beta `devbox-data-beta`).
+# Precedence: AGENT_DEVBOX_DATA_LABEL (snapshotted below, survives load_conf's
+# reset) > conf DATA_LABEL > `devbox-data`. Resolve by UUID first, then by label.
+# A copied VHDX keeps the source UUID, so the original and its copy can be
+# attached together -> multiple matches are an ERROR, never a coin flip.
+DATA_LABEL_ENV="${AGENT_DEVBOX_DATA_LABEL:-}"
+DATA_LABEL="${DATA_LABEL_ENV:-devbox-data}"
 
 # Installer-populated values (reloaded by load_conf). Pre-declared empty so the
 # functions stay safe under `set -u` even when called directly, or when the file
@@ -117,15 +124,19 @@ log() {
 }
 
 # load_conf(): reset the installer-written values, source the config if present,
-# then resolve the mount name and the concrete DATADIR, and export
-# PASEO_PASSWORD for the daemon child. The data disk is resolved by UUID first,
-# then by the shared label (DATA_LABEL), so the two variants' VHDX files are
-# interchangeable; more than one match fails closed instead of picking one.
+# then resolve the channel label, the mount name and the concrete DATADIR, and
+# export PASEO_PASSWORD for the daemon child. Resetting DATA_LABEL BEFORE the
+# source keeps a second call from leaking the previous conf's label; the env
+# override is snapshotted at source time (DATA_LABEL_ENV) and re-applied AFTER
+# the source, because sourcing the conf would otherwise clobber it. The data
+# disk is resolved by UUID first, then by the channel label (DATA_LABEL), so
+# same-channel VHDX files are interchangeable; more than one match fails closed.
 load_conf() {
   DATA_VHDX=""
   DATA_UUID=""
   DATA_DISTRO=""
   PASEO_PASSWORD=""
+  DATA_LABEL="devbox-data"
   CONF_MISSING=0
   # shellcheck source=/dev/null
   if [ -f "$CONF" ]; then
@@ -133,6 +144,7 @@ load_conf() {
   else
     CONF_MISSING=1
   fi
+  DATA_LABEL="${DATA_LABEL_ENV:-${DATA_LABEL:-devbox-data}}"
   MNTNAME="${DATA_MNTNAME:-devbox-data}"
   if [ -n "${AGENT_DEVBOX_DATADIR:-}" ]; then
     DATADIR="$AGENT_DEVBOX_DATADIR"
@@ -238,9 +250,10 @@ ensure_opencode_shim() {
 }
 
 # data_devs(): print the attached device(s) for the data disk. UUID wins whenever
-# it matches anything: the two variants' own disks have different UUIDs, so both
-# can stay attached without being mistaken for each other. Only when the UUID is
-# absent (a disk copied from the other variant) does the shared label apply.
+# it matches anything: two variants' own disks have different UUIDs, so both can
+# stay attached without being mistaken for each other. Only when the UUID is
+# absent (a disk copied from another variant in the same channel) does the
+# channel label apply.
 # `-t UUID=` (not -U) on purpose: a copied VHDX keeps the source UUID, so all
 # devices sharing it must be enumerated for the multi-match guard to see them.
 data_devs() {

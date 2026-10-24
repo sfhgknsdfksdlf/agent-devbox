@@ -13,8 +13,8 @@ irm https://raw.githubusercontent.com/sfhgknsdfksdlf/agent-devbox/main/windows/i
 This is the **only** install entry point. There is nothing to download by hand and
 no launcher to double-click: `install.ps1` fetches the kept installer scripts
 (`install-agent-devbox.ps1`, `wsl-ensure.ps1`, `wsl-ensure-downloads.ps1`) from the
-project source (`main`) and uses the Release **only** for the rootfs parts. It
-asks for admin rights once and, when run interactively, asks which image to
+project source (`main` by default, or the selected `-Ref`) and uses the Release
+**only** for the rootfs parts. It asks for admin rights once and, when run interactively, asks which image to
 install (Enter = the full multi-agent `agents` build, `c` = the lean `core` build)
 and which release to install (Enter = `latest`, `b` = the newest beta, or paste a
 specific tag).
@@ -29,6 +29,64 @@ All installer output is Chinese, and it prints a **10-step progress banner**:
 [10/10] 附加数据磁盘 / 清理旧版任务…   [完成] 重启发行版…
 ```
 
+## Channels (stable / beta)
+
+The installer derives the channel from the **code ref**, not from the release tag:
+`beta` when `$Ref -ne 'main'`, otherwise `stable`. `$Ref` comes from `-Ref`, then
+`$env:AGENT_DEVBOX_REF`, then the interactive prompt (Enter = `main`), then `main`.
+
+> **The URL's branch is not the channel.** A plain
+> `irm .../<branch>/windows/install.ps1 | iex` cannot see which branch it was
+> fetched from: it installs the `main` scripts into the **stable** channel. To
+> install from a branch, pass `-Ref <branch>` or set
+> `$env:AGENT_DEVBOX_REF = '<branch>'`:
+>
+> ```powershell
+> # environment variable, then the usual one-liner
+> $env:AGENT_DEVBOX_REF = 'my-branch'
+> irm https://raw.githubusercontent.com/sfhgknsdfksdlf/agent-devbox/main/windows/install.ps1 | iex
+>
+> # or pass -Ref to the entry script itself
+> & ([scriptblock]::Create((irm https://raw.githubusercontent.com/sfhgknsdfksdlf/agent-devbox/main/windows/install.ps1))) -Ref my-branch
+> ```
+
+Beta appends `-beta` to the distro name, the default install dir, the ext4 label
+and the mount name (the four-row table is in step 3 below). `devbox-data-beta` is
+exactly 16 characters, the ext4 label limit. Within a channel the agents and core
+data disks stay interchangeable; **across channels they are not**.
+
+An explicit `-InstallDir` is used **verbatim** and is never suffixed. A directory
+is owned by exactly one channel: if it already contains `data.vhdx` **or**
+`ext4.vhdx`, the installer reads `<dir>\.agent-devbox-channel` (a missing marker
+means a legacy stable install) and refuses a different channel, telling you to
+drop `-InstallDir` and use the channel's default dir, or choose a new directory.
+
+Stable and beta can be installed and run at the same time: distinct distro,
+install dir, `data.vhdx`, paseo password, Windows Terminal fragment
+(`agent-devbox-beta.json` / `agent-devbox-core-beta.json`) and fixed GUIDs.
+`%LOCALAPPDATA%\agent-devbox` staging is shared, but every run uses a random
+subdirectory.
+
+A few things stay **host-global**: `.wslconfig` (for example mirrored
+networking), `Set-MirroredNetworking` and `wsl --shutdown` affect the whole
+machine, so a beta install can still change the host's networking settings or
+stop other distros.
+
+Data-disk initialization is **fatal** now: an invalid label, an ambiguous
+candidate disk or an `mkfs` failure aborts the install before
+`/etc/agent-devbox.conf` is written, so another channel's disk UUID/password can
+never be written into this channel's config. `data.vhdx` is kept for a retry.
+
+This **channel** is not the beta **release tag**: `-ReleaseTag b|beta` selects the
+newest `beta-*` GitHub prerelease (the rootfs), while `-Ref` selects the code
+branch. A beta-channel install may use a stable rootfs or a beta rootfs **as long
+as its `/usr/local/bin/wsl-boot.sh` supports the channel label (`DATA_LABEL`)**;
+an older rootfs is refused (the just-imported distro is unregistered and
+`data.vhdx` is kept) with a hint to use `-ReleaseTag beta` or a newer build.
+Only refs that contain the beta-channel implementation produce the beta channel;
+older tags and commits still ship the old `install.ps1` (no `-Channel`) and fall
+back to the stable entry.
+
 ## What the installer does
 
 1. make sure WSL2 is installed — if it is missing it asks whether to install
@@ -42,12 +100,18 @@ All installer output is Chinese, and it prints a **10-step progress banner**:
    `V` = uncompressed × 1.05 (the `ext4.vhdx` grows on demand; its 1 TiB size is
    virtual). It is re-run if the installer falls back to a tier with a higher peak;
 3. download the released rootfs for the host's **native** architecture (`amd64`
-   or `arm64`) and import it as the WSL distro — `agent-devbox`
-   for the multi-agent build, `agent-devbox-core` for the lean build — with a
-   **per-variant default install dir** (`D:\WSL\agent-devbox` for agents,
-   `D:\WSL\agent-devbox-core` for core), in
-   **three tiers** (the happy path is Tier 1; ARM64 has only Tier 1 and Tier 2,
-   see "ARM64 (Windows 11)"):
+   or `arm64`) and import it as the WSL distro, using the **variant × channel**
+   identity (an explicit `-InstallDir` is used verbatim, never suffixed):
+
+   | variant | channel | distro | default install dir | ext4 label / mount name |
+   |---|---|---|---|---|
+   | agents | stable | `agent-devbox` | `D:\WSL\agent-devbox` | `devbox-data` |
+   | agents | beta | `agent-devbox-beta` | `D:\WSL\agent-devbox-beta` | `devbox-data-beta` |
+   | core | stable | `agent-devbox-core` | `D:\WSL\agent-devbox-core` | `devbox-data` |
+   | core | beta | `agent-devbox-core-beta` | `D:\WSL\agent-devbox-core-beta` | `devbox-data-beta` |
+
+   It imports in **three tiers** (the happy path is Tier 1; ARM64 has only Tier 1
+   and Tier 2, see "ARM64 (Windows 11)"):
    - **Tier 1** streams the downloaded parts straight into
      `wsl --import <Distro> <InstallDir> -`; WSL2's built-in bsdtar decompresses
      zstd, so there is no `zstd.exe`, no merged `.zst`, and no `.tar`;
@@ -62,13 +126,14 @@ All installer output is Chinese, and it prints a **10-step progress banner**:
    elevating via UAC into a **different** admin account makes the distro invisible
    to the original user (`WSL_E_DISTRO_NOT_FOUND`);
 5. create a 32 GB dynamic `data.vhdx` in the install dir and initialize it with
-   the ext4 label `devbox-data` (each variant gets its own `data.vhdx` in its own
-   install dir; the two variants do **not** share a data disk). See
+   the channel-scoped ext4 label (`devbox-data` for stable, `devbox-data-beta`
+   for beta; each variant × channel gets its own `data.vhdx` in its own
+   install dir, so no two installs share a data disk). See
    "Creating the data disk" below for the `New-VHD` probe and the `diskpart`
    fallback;
 6. fix the VHDX owner/ACLs so a non-elevated user can reopen it;
-7. write `/etc/agent-devbox.conf` (5 keys: `DATA_VHDX`, `DATA_UUID`,
-   `PASEO_PASSWORD`, `DATA_MNTNAME`, `DATA_DISTRO`);
+7. write `/etc/agent-devbox.conf` (6 keys: `DATA_VHDX`, `DATA_UUID`,
+   `DATA_LABEL`, `PASEO_PASSWORD`, `DATA_MNTNAME`, `DATA_DISTRO`);
 8. **attach the disk itself** (it is already elevated) with
    `wsl --mount --vhd "<vhdx>" --bare` (attach only: no `--type ext4`, no
    `--name`), and unregister any legacy `agent-devbox-mount-datadisk` /
@@ -83,8 +148,9 @@ All installer output is Chinese, and it prints a **10-step progress banner**:
    unless the device is already present it makes **exactly one** bounded
    `wsl.exe --mount --vhd <path> --bare` interop call (hard timeout, kill grace),
    waits once for the device by UUID (`blkid -t UUID=`), falling back to the
-   `devbox-data` label, and `mount -t ext4` it at
-   `/mnt/devbox-data`, verifies it, then binds `/home` `/root` `/workspace` and
+   channel's label (`devbox-data` stable / `devbox-data-beta` beta), and
+   `mount -t ext4` it at `/mnt/<DATA_MNTNAME>` (`/mnt/devbox-data` or
+   `/mnt/devbox-data-beta`), verifies it, then binds `/home` `/root` `/workspace` and
    starts paseo. Other Windows-tool calls stay forbidden: it must never call
    `schtasks.exe` / `wsl -d` / `--unmount` (the old boot-time callback re-entered
    WSL and caused a boot loop). On failure it goes to MAINTENANCE MODE, logs
@@ -99,16 +165,22 @@ All installer output is Chinese, and it prints a **10-step progress banner**:
 10. delete the downloaded parts, any merged `.zst`, and any `.tar`, after success
     and on failure.
 
-Then enter it. The distro name depends on the variant: `agent-devbox` (agents) or
-`agent-devbox-core` (core). If you do not want to remember which one you installed,
-paste this once into Windows PowerShell — it detects the variant and makes it the
-default distro:
+Then enter it. The distro name depends on **variant × channel**: `agent-devbox` /
+`agent-devbox-core` (stable) or `agent-devbox-beta` / `agent-devbox-core-beta`
+(beta). If you do not want to remember which one you installed, paste this once
+into Windows PowerShell; it detects the install for the selected channel and
+makes it the default distro:
 
 ```powershell
 $env:WSL_UTF8 = 1
+$Channel = 'stable'   # use 'beta' for a beta-channel install
+$names = @('agent-devbox', 'agent-devbox-core', 'agent-devbox-beta', 'agent-devbox-core-beta')
 $Distro = (wsl -l -q) | ForEach-Object { ($_ -replace "`0", '').Trim() } |
-  Where-Object { $_ -like 'agent-devbox*' } | Select-Object -First 1
-if (-not $Distro) { throw 'no agent-devbox / agent-devbox-core found - run the installer first' }
+  Where-Object {
+    $_ -in $names -and
+    (($_ -notlike '*-beta') -eq ($Channel -eq 'stable'))
+  } | Select-Object -First 1
+if (-not $Distro) { throw "no $Channel agent-devbox found ($($names -join ' / ')) - run the installer first" }
 wsl --set-default $Distro
 "using distro: $Distro"
 ```
@@ -167,8 +239,9 @@ their SHA256 and resumes; a successful import removes this run's parts.
 
 Support scope: **Windows 11 ARM64 only, build 22000 or later**. Windows 10 ARM64
 is **not** supported: the installer rejects it early with a Chinese error, before
-downloading anything. Distro names do not change (`agent-devbox` /
-`agent-devbox-core`); only the asset names carry the architecture.
+downloading anything. Distro names do not change with the architecture (the four
+variant × channel names above, including `-beta` when the ref is not `main`);
+only the asset names carry the architecture.
 
 CI publishes both architectures as
 `rootfs-<variant>-<arch>.tar.zst.part-*`, where `<arch>` is `amd64` or `arm64`,
@@ -210,8 +283,8 @@ reports `AMD64` in its process environment, and a 32-bit (WOW64) shell reports
 `x86`, while the machine value still says `ARM64`. If no source is recognisable,
 the installer throws instead of assuming amd64.
 
-QA on a real ARM64 device (replace `<distro>` with `agent-devbox` or
-`agent-devbox-core`):
+QA on a real ARM64 device (replace `<distro>` with `agent-devbox`,
+`agent-devbox-core`, `agent-devbox-beta` or `agent-devbox-core-beta`):
 
 ```powershell
 wsl -d <distro> -u root -e uname -m
@@ -244,16 +317,21 @@ first probes `Get-Command New-VHD`:
   **non-empty `data.vhdx`** was actually produced, so a silent failure does not
   get mistaken for success.
 
-Either path ends with the same initialized ext4 disk (label `devbox-data`).
+Either path ends with the same initialized ext4 disk (label `devbox-data` for
+stable, `devbox-data-beta` for beta).
 
-Because both variants use that same label, their `data.vhdx` files are
-interchangeable: copy one into the other variant's install dir and boot resolves
-the device by UUID first (every device carrying it), then — only when no device
-carries that UUID — by the `devbox-data` label, so the copied disk (which keeps
-the source UUID) still mounts. The two variants' own disks have different UUIDs,
-so both may stay attached. If more than one device shares the resolved identity,
-boot fails closed to maintenance mode instead of picking one — detach the extra
-with the install dir's `unmount-datadisk.cmd`, then reopen the distro.
+Because both variants in a channel use that channel's label, their `data.vhdx`
+files are interchangeable **within the same channel**: copy one into the other
+variant's install dir and boot resolves the device by UUID first (every device
+carrying it), then — only when no device carries that UUID — by the channel's
+label (`devbox-data` / `devbox-data-beta`), so the copied disk (which keeps the
+source UUID) still mounts. The two variants' own disks have different UUIDs, so
+both may stay attached. **Cross-channel copies are not supported**: a stable disk
+and a beta disk do not share a label or mount name, and the installer's directory
+ownership check refuses to install one channel over the other. If more than one
+device shares the resolved identity, boot fails closed to maintenance mode
+instead of picking one — detach the extra with the install dir's
+`unmount-datadisk.cmd`, then reopen the distro.
 
 ## Install log
 
@@ -263,25 +341,31 @@ The installer writes a **persistent** log next to the data disk in the install d
 <InstallDir>\agent-devbox-install-<yyyyMMdd-HHmmss>.log
 ```
 
-That is `D:\WSL\agent-devbox\agent-devbox-install-*.log` for agents and
-`D:\WSL\agent-devbox-core\agent-devbox-install-*.log` for core. The copy under
+That is `D:\WSL\agent-devbox\agent-devbox-install-*.log` for agents/stable,
+`D:\WSL\agent-devbox-core\agent-devbox-install-*.log` for core/stable,
+`D:\WSL\agent-devbox-beta\agent-devbox-install-*.log` for agents/beta and
+`D:\WSL\agent-devbox-core-beta\agent-devbox-install-*.log` for core/beta. The copy
+under
 `%LOCALAPPDATA%\agent-devbox` is only a **temporary relay**: the original
 (non-elevated) window echoes it after the elevated run finishes, then it is
 deleted. Read the newest persistent one with:
 
 ```powershell
-Get-ChildItem 'D:\WSL\agent-devbox\agent-devbox-install-*.log' |
+$InstallDir = 'D:\WSL\agent-devbox'   # beta: D:\WSL\agent-devbox-beta; core likewise
+Get-ChildItem "$InstallDir\agent-devbox-install-*.log" |
   Sort-Object LastWriteTime -Descending | Select-Object -First 1 | Get-Content -Tail 200
 ```
 
 ## The paseo password
 
 The installer **does not print the paseo password** to the console or to the
-install log. It is stored only in the distro's `/etc/agent-devbox.conf`. Read it
+install log. It is stored only in the distro's `/etc/agent-devbox.conf`. Each
+channel has its own password. Read it
 back with:
 
 ```powershell
-# from Windows (define $Distro first, or write agent-devbox / agent-devbox-core)
+# from Windows (define $Distro first, or write agent-devbox / agent-devbox-core /
+# agent-devbox-beta / agent-devbox-core-beta)
 wsl -d $Distro -u root -e cat /etc/agent-devbox.conf
 ```
 
@@ -289,6 +373,10 @@ wsl -d $Distro -u root -e cat /etc/agent-devbox.conf
 # inside the distro (do NOT prefix with wsl -d ...)
 cat /etc/agent-devbox.conf
 ```
+
+The data-disk copy used across upgrades lives at
+`/mnt/<DATA_MNTNAME>/.paseo-password`: `/mnt/devbox-data/.paseo-password` for
+stable, `/mnt/devbox-data-beta/.paseo-password` for beta.
 
 ## Antivirus prompt and the elevated window
 
@@ -360,9 +448,11 @@ inside the distro with **one** bounded `wsl.exe --mount --vhd <path> --bare` cal
 tools stay forbidden: `schtasks.exe`, `wsl -d` and `--unmount` must never be called
 from `[boot]` (the old boot-time callback re-entered WSL and caused a boot loop).
 The script finds the device by UUID (`blkid -t UUID=`, every device carrying it),
-falling back to the label `devbox-data` only when no device carries that UUID,
+falling back to the channel's label (`devbox-data` stable / `devbox-data-beta`
+beta) only when no device carries that UUID,
 and refuses to pick one if more than one device matches; it
-mounts it at `/mnt/devbox-data`, verifies it and binds `/home` `/root` `/workspace`.
+mounts it at `/mnt/<DATA_MNTNAME>` (`/mnt/devbox-data` or
+`/mnt/devbox-data-beta`), verifies it and binds `/home` `/root` `/workspace`.
 If the attach fails, the disk is not attached, no device matches the UUID or the
 label (or several do), or a bind does not land on the data disk,
 boot enters **MAINTENANCE MODE**: it seeds nothing, starts nothing, and writes a
@@ -389,7 +479,8 @@ key that a restart clears.
 ## Manual data-disk helpers
 
 The installer copies two pure-batch helpers into the install dir (it fetches them
-from the project source, `main`). Neither needs PowerShell or administrator/UAC:
+from the selected ref, `main` by default). Neither needs PowerShell or
+administrator/UAC:
 
 ```bat
 # attach <InstallDir>\data.vhdx (bare); retries 3x, logs datadisk-attach.log,
@@ -411,12 +502,16 @@ Docker/Podman image using its own OCI implementation (no Docker required):
    `ghcr.io/sfhgknsdfksdlf/agent-devbox:latest`
    (or `.../agent-devbox-core:latest`).
 3. Name it **`agent-devbox`** (multi-agent build) or **`agent-devbox-core`**
-   (lean build).
+   (lean build). For a beta-channel install use **`agent-devbox-beta`** /
+   **`agent-devbox-core-beta`** instead and pass `-Ref` (see "Channels").
 
 Then run the `irm` one-liner above: it detects the existing distro and only
 creates/attaches the data disk and writes the boot config.
 
 ## Testing a beta (pre-release) build
+
+This section is about the beta **release tag** (`beta-*`). The beta **channel** is
+a separate thing, selected by `-Ref` (see "Channels" above).
 
 Every `push` publishes a **dated** `beta-<YYYYMMDD.HHMM>` prerelease carrying the
 WSL rootfs parts + the 1Panel zip, and moves the **`:beta`** image alias to the
@@ -442,11 +537,20 @@ branches; a branch, tag, or commit can be typed):
 
 Branch testing does **not** need a new image build: the scripts come from the
 selected ref, while the rootfs still comes from the selected Release. `-Ref`
-(or `$env:AGENT_DEVBOX_REF`) skips the prompt. Note that the picker switches the
-sibling scripts; the elevated re-fetch also uses the ref, but to test changes to
-`install.ps1` itself, run that branch's `install.ps1` URL. For unattended runs
-pass `-ReleaseTag` (default `latest`); the fetched `install-agent-devbox.ps1`
-also accepts `-Variant` directly:
+(or `$env:AGENT_DEVBOX_REF`) skips the prompt, and **any non-`main` ref that
+contains the beta-channel implementation selects the beta channel** (separate
+distro / dir / data disk, see "Channels"); older tags and commits fall back to
+the stable entry.
+
+> **Running a branch's `install.ps1` URL is not enough to select that branch.**
+> The script cannot see which branch the URL pointed at, so a plain
+> `irm .../<branch>/windows/install.ps1 | iex` still uses `main` and installs into
+> the stable channel. Set `-Ref` (or `$env:AGENT_DEVBOX_REF`) as well. That also
+> covers testing changes to `install.ps1` itself: fetch the branch URL **and**
+> pass the matching ref so the sibling scripts and the channel agree.
+
+For unattended runs pass `-ReleaseTag` (default `latest`); the fetched
+`install-agent-devbox.ps1` also accepts `-Variant` directly:
 
 ```powershell
 .\install-agent-devbox.ps1 -Variant agents -ReleaseTag beta
@@ -455,16 +559,17 @@ also accepts `-Variant` directly:
 Every sibling is verified against `windows/SHA256SUMS` from the same ref before
 it is dot-sourced. A missing manifest (legacy refs) requires the explicit
 `-AllowUnverifiedScripts` switch; a manifest that does not cover a file, or a
-hash mismatch, is fatal. For a reproducible production install, fetch both the
-entry and `-Ref` from the same immutable tag/commit:
+hash mismatch, is fatal. For a reproducible **stable** install, keep the entry and
+the ref on `main` and pin only the rootfs release:
 
 ```powershell
-$env:AGENT_DEVBOX_REF = 'build-20261020.1200'
-irm https://raw.githubusercontent.com/sfhgknsdfksdlf/agent-devbox/build-20261020.1200/windows/install.ps1 | iex
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/sfhgknsdfksdlf/agent-devbox/main/windows/install.ps1))) -ReleaseTag build-20261020.1200
 ```
 
-Use a `build-*` tag for stable installs, or a commit SHA; branch testing keeps
-using `-Ref`.
+Pinning the **code ref** to an immutable tag or commit is also possible
+(`$env:AGENT_DEVBOX_REF = '<tag-or-sha>'`), but any non-`main` ref that contains
+the beta-channel implementation is the beta channel: that installs beside the
+stable one instead of replacing it (older tags/commits fall back to stable).
 
 If the distro is already installed, an interactive console asks once:
 **Enter = upgrade**, `n` = cancel (exit 0, nothing downloaded or unregistered).
@@ -473,7 +578,8 @@ skipped (the upgrade proceeds) when stdin/stdout is redirected, with `-Yes`, or
 with `-KeepExisting` (keep the current install). The data disk (`/home`,
 `/root`, `/workspace`) is kept,
 and the **paseo password is preserved**: it is stored on the data disk at
-`/mnt/devbox-data/.paseo-password` (mode 600), read back during `[7/10]`, and
+`/mnt/<DATA_MNTNAME>/.paseo-password` (`/mnt/devbox-data` for stable,
+`/mnt/devbox-data-beta` for beta; mode 600), read back during `[7/10]`, and
 rewritten after the first install. (Installs that predate this get the password
 migrated once from the old `/etc/agent-devbox.conf`.) `-Reinstall` is still
 accepted for compatibility (an upgrade is the default), and `-Yes` stays
@@ -487,7 +593,9 @@ The Windows Terminal profile now has a **fixed GUID**: the image disables WSL's 
 generator (`/etc/wsl-distribution.conf` -> `[windowsterminal] enabled=false`, which would
 otherwise mint a new profile GUID on every import), and the installer writes
 `%LOCALAPPDATA%\Microsoft\Windows Terminal\Fragments\AgentDevbox\<distro>.json` with a
-constant GUID, `wsl.exe -d <distro>` and `startingDirectory = \\wsl$\<distro>\root`. It also
+constant GUID, `wsl.exe -d <distro>` and `startingDirectory = \\wsl$\<distro>\root`. The
+beta channel's distro names already carry `-beta` (for example `agent-devbox-beta.json`),
+and each channel has its own fixed GUID. It also
 deletes the stale `Fragments\Microsoft.WSL\*.json` entry for this distro. Reinstalls keep the
 same profile, so per-profile customizations survive. If wsl-ui still cannot open a terminal,
 close Windows Terminal and wsl-ui and reopen them.
@@ -497,7 +605,7 @@ close Windows Terminal and wsl-ui and reopen them.
 ## After installing
 
 ```powershell
-wsl -d $Distro    # $Distro = agent-devbox (multi-agent) or agent-devbox-core (lean)
+wsl -d $Distro    # agent-devbox / agent-devbox-core / agent-devbox-beta / agent-devbox-core-beta
 # root shell; paseo daemon configured on http://localhost:6767 (from Windows)
 ```
 
@@ -522,7 +630,8 @@ or enable mirrored networking (`%UserProfile%\.wslconfig` → `[wsl2] networking
 - Windows 11 (or a WSL build that supports `wsl --mount --vhd`). Windows 11
   ARM64 build 22000+ is supported; Windows 10 ARM64 is not.
 - PowerShell (built in). The `irm` entry fetches the installer scripts from the
-  project source (`main`) with `Invoke-WebRequest`. The rootfs parts are fetched
+  project source (`main` by default, or the selected `-Ref`) with
+  `Invoke-WebRequest`. The rootfs parts are fetched
   with the managed .NET HTTP client: it resolves the Windows system proxy
   (WinINET/PAC — the same proxy the browser uses), resumes with a Range request,
   shows live `MiB/s` progress, and reconnects when a transfer stalls. The final
@@ -539,10 +648,10 @@ or enable mirrored networking (`%UserProfile%\.wslconfig` → `[wsl2] networking
   real exit code).
 
 The `irm` one-liner and the fetched installer use the Release **only** for the
-rootfs parts; every installer script comes from the project source (`main`). The
-elevated child is started with `-ExecutionPolicy RemoteSigned` (the copy is
-written by the parent, so it carries no Mark-of-the-Web and `RemoteSigned` is
-sufficient).
+rootfs parts; every installer script comes from the project source (the selected
+ref, `main` by default). The elevated child is started with
+`-ExecutionPolicy RemoteSigned` (the copy is written by the parent, so it carries
+no Mark-of-the-Web and `RemoteSigned` is sufficient).
 
 `install-agent-devbox.ps1` dot-sources `windows/wsl-ensure.ps1`, which holds the
 shared helpers (release-tag normalization, disk-space math, streaming import, the

@@ -5,10 +5,13 @@
 .DESCRIPTION
   - 按变体导入镜像并让两个变体并存：agents 变体导入为 `agent-devbox`，core 变体
     导入为 `agent-devbox-core`（各自独立的发行版名 / 安装目录）。
-  - 默认安装目录：agents = D:\WSL\agent-devbox，core = D:\WSL\agent-devbox-core。
+  - 通道（-Channel）：stable（main）沿用上面的名字；beta（任何非 main 的 ref）全部
+    加 `-beta`：agent-devbox-beta / agent-devbox-core-beta，默认安装目录为
+    D:\WSL\agent-devbox-beta / D:\WSL\agent-devbox-core-beta。beta 与 stable 是两套
+    完全独立的身份（目录 / 发行版 / 数据盘标签 / 挂载名 / WT GUID），互不影响。
   - 创建并挂载一块 32GB 动态 VHDX 数据磁盘并初始化。
-  - 数据盘的 ext4 标签与挂载名统一为 `devbox-data`（两个变体共用同一标签，同一块
-    数据盘在任一发行版下都能识别）。
+  - 数据盘的 ext4 标签与挂载名按通道区分：stable = `devbox-data`，beta =
+    `devbox-data-beta`（同一通道内两个变体可互换数据盘；跨通道绝不互相挂载）。
   - 把数据磁盘接入发行版，使 /home、/root、/workspace 在镜像升级后依然保留。
   - 完全不注册任何计划任务：数据盘由发行版开机时的 guest 侧 wsl-boot.sh 自己 attach。
     boot 失败时维护横幅会打印安装目录里的 `mount-datadisk.cmd`；安装器只负责删除旧版本
@@ -29,6 +32,7 @@
 [CmdletBinding()]
 param(
   [ValidateSet('agents', 'core')] [string] $Variant = 'agents',
+  [ValidateSet('stable', 'beta')] [string] $Channel = 'stable',
   [string] $InstallDir = '',
   [string] $ReleaseTag = '',
   [switch] $Yes,
@@ -56,27 +60,9 @@ $script:ContentSuspect  = $false
 $ProgressPreference    = 'SilentlyContinue'
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 
-# 数据盘的 ext4 标签与挂载名：两个变体统一，指向同一块可共用的数据盘。
-$Label     = 'devbox-data'
-$MountName = 'devbox-data'
 $VhdxName  = 'data.vhdx'
 $Repo      = 'sfhgknsdfksdlf/agent-devbox'
 $ConfPath  = '/etc/agent-devbox.conf'
-
-# 变体映射：只有发行版名 / 安装目录按变体区分，数据盘标签与挂载名统一。
-# $Variant 选定后（见下方变体选择块）再据此展开为 $Distro。
-$VariantMap = @{
-  agents = [pscustomobject]@{
-    Distro = 'agent-devbox'; InstallDir = 'D:\WSL\agent-devbox'
-    TerminalGuid = '{6f4a1c2e-8b3d-4a97-9c51-0e7d2b8f3a64}'
-    HideGuid     = '{04014822-8112-5520-a687-27d5f19a9da6}'
-  }
-  core = [pscustomobject]@{
-    Distro = 'agent-devbox-core'; InstallDir = 'D:\WSL\agent-devbox-core'
-    TerminalGuid = '{c2d7e9a4-3f61-4b08-8e52-7a1d9c4b6f30}'
-    HideGuid     = '{82ea5eb7-e460-5790-9192-d6a59b44f009}'
-  }
-}
 
 # --- 输出辅助：统一的进度 / 提示样式 ----------------------------------------
 # 折行 / 宽度感知由 wsl-ensure.ps1 的共享 UI 辅助提供；拿不到时退回普通 Write-Host
@@ -155,16 +141,22 @@ if (-not $PSBoundParameters.ContainsKey('Variant') -and -not $Yes -and [Environm
   else { $Variant = 'agents' }
 }
 
-# 应用变体映射：按选定变体展开发行版名。
-$v        = $VariantMap[$Variant]
-$Distro   = $v.Distro
+# 应用通道身份：发行版名 / 安装目录 / 数据盘标签与挂载名 / Terminal GUID 全部由
+# (变体, 通道) 决定；stable 与正式安装逐字一致，beta 是一套独立的身份。
+if (-not (Get-Command Get-AgentDevboxChannelIdentity -ErrorAction SilentlyContinue)) {
+  throw '缺少 Get-AgentDevboxChannelIdentity（wsl-ensure.ps1 未加载）。请通过 install.ps1 安装；直接运行本脚本时请把 wsl-ensure.ps1 放在同一目录。'
+}
+$v = Get-AgentDevboxChannelIdentity -Variant $Variant -Channel $Channel
+$Distro = $v.Distro
+$Label = $v.Label
+$MountName = $v.MountName
 
 # --- 决定安装目录（必须早于 UAC 提权与升级确认）------------------------------
 # 提权子进程只能靠 -InstallDir 收到用户的选择，升级提示也要显示同一个目录。
-# 默认值随变体变化；-Yes / 重定向 / 非交互一律用默认值，绝不阻塞。
+# 默认值随「变体 + 通道」变化；-Yes / 重定向 / 非交互一律用默认值，绝不阻塞。
 # 这里只确定路径，目录本身仍然等到 [1/10] 之后才真正创建（取消升级不留痕迹）。
 if (-not $InstallDir) {
-  $default = $VariantMap[$Variant].InstallDir
+  $default = $v.InstallDir
   $__dirInteractive = if (Get-Command Test-InteractiveConsole -ErrorAction SilentlyContinue) {
     Test-InteractiveConsole
   } else {
@@ -179,13 +171,40 @@ if (-not $InstallDir) {
 }
 $InstallDir = $InstallDir.Trim()
 if ($InstallDir -notmatch '^[A-Za-z]:\\$') { $InstallDir = $InstallDir.TrimEnd('\') }
-if ([string]::IsNullOrWhiteSpace($InstallDir)) { $InstallDir = $VariantMap[$Variant].InstallDir }
+if ([string]::IsNullOrWhiteSpace($InstallDir)) { $InstallDir = $v.InstallDir }
+
+# --- 通道所有权闸门：一个安装目录只属于一个通道（早于 UAC / 任何改动）------
+# beta 绝不能接管正式安装的目录/数据盘，stable 也不能接管 beta 的目录。
+# 占用判定 = 已有数据盘（data.vhdx）或系统盘（ext4.vhdx）：旧安装可能在数据盘创建
+# 之前就失败，只留下 ext4.vhdx；只看 data.vhdx 会让 beta 的 import 覆盖正式系统盘。
+# 标记文件缺失 = 通道功能之前的旧安装（按 stable 处理）。
+$ChannelMarker = Join-Path $InstallDir '.agent-devbox-channel'
+$ownedByDisk = (
+  (Test-Path -LiteralPath (Join-Path $InstallDir $VhdxName)) -or
+  (Test-Path -LiteralPath (Join-Path $InstallDir 'ext4.vhdx'))
+)
+if ($ownedByDisk) {
+  $markedChannel = 'stable'
+  if (Test-Path -LiteralPath $ChannelMarker) {
+    try {
+      $markedRaw = [System.IO.File]::ReadAllText($ChannelMarker).Trim()
+    } catch {
+      throw ("无法读取通道标记 $ChannelMarker：$($_.Exception.Message)。请修复权限后重试，或换一个新的 -InstallDir。")
+    }
+    if (-not [string]::IsNullOrWhiteSpace($markedRaw)) { $markedChannel = $markedRaw }
+  }
+  if ($markedChannel -ne $Channel) {
+    throw ("安装目录 $InstallDir 属于 $markedChannel 通道（$ChannelMarker），不能用 $Channel 通道安装。" +
+      "beta 与 stable 各自使用独立目录与数据盘；请去掉 -InstallDir 使用 $Channel 通道的默认目录，或为 $Channel 通道指定一个新目录。")
+  }
+}
 
 # --- 提权一次（UAC）：提权子进程写日志，原窗口等待后回显整份日志 ------------
 if (-not (Test-Admin)) {
   # Explorer-extracted scripts may carry Mark-of-the-Web, which RemoteSigned
   # would block; the .bat/.cmd entry points intentionally keep Bypass.
   $argv = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$PSCommandPath`"", '-Variant', $Variant)
+  $argv += @('-Channel', $Channel)
   if ($InstallDir) { $argv += @('-InstallDir', "`"$InstallDir`"") }
   if ($ReleaseTag) { $argv += @('-ReleaseTag', $ReleaseTag) }
   if ($Yes)        { $argv += '-Yes' }
@@ -341,6 +360,8 @@ if ($__haveEnsure) {
 
 # --- 创建安装目录（路径早在提权前就已确定，这里才真正落盘）------------------
 New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
+# 记录本目录所属通道：同一目录不允许换个通道再来一次（否则会串用数据盘）。
+[System.IO.File]::WriteAllText($ChannelMarker, $Channel, (New-Object System.Text.UTF8Encoding($false)))
 $script:InstallLog = Join-Path $InstallDir ("agent-devbox-install-{0}.log" -f $script:RunStamp)
 if (-not $script:Logging) {
   try {
@@ -361,7 +382,7 @@ foreach ($helper in @('mount-datadisk.cmd', 'unmount-datadisk.cmd')) {
   }
 }
 $VhdxPath = Join-Path $InstallDir $VhdxName
-Write-Host "发行版=$Distro  变体=$Variant  安装目录=$InstallDir"
+Write-Host "发行版=$Distro  变体=$Variant  通道=$Channel  安装目录=$InstallDir"
 
 # --- 版本通道：正式版（latest）、滚动 beta 测试版，或指定版本号 ------------
 if (-not $ReleaseTag) {
@@ -754,7 +775,13 @@ if ($script:NativeExit -ne 0 -and "$earlyAttach" -notmatch 'ALREADY_ATTACHED|alr
 Start-Sleep -Seconds 2
 
 $expectedMachine = if ($Arch -eq 'arm64') { 'aarch64' } else { 'x86_64' }
-$probe = 'm=$(uname -m); [ "$m" = {0} ] || {{ echo "ARCH_MISMATCH:$m" >&2; exit 42; }}; /usr/local/bin/datadisk-init.sh {1}' -f $expectedMachine, (Quote-Bash $Label)
+# beta 通道的 rootfs 必须带 DATA_LABEL 支持（见 scripts/wsl-boot.sh）：旧镜像的
+# wsl-boot.sh 没有 DATA_LABEL，数据盘未附加时会退回共享标签 devbox-data，从而挂到
+# 正式通道的数据盘。stable 不加任何内容，探针与今天逐字一致。
+$channelBootGuard = if ($Channel -eq 'beta') {
+  'grep -q "DATA_LABEL" /usr/local/bin/wsl-boot.sh || { echo "CHANNEL_BOOT_UNSUPPORTED" >&2; exit 43; }; '
+} else { '' }
+$probe = $channelBootGuard + ('m=$(uname -m); [ "$m" = {0} ] || {{ echo "ARCH_MISMATCH:$m" >&2; exit 42; }}; /usr/local/bin/datadisk-init.sh {1}' -f $expectedMachine, (Quote-Bash $Label))
 $initOut = Invoke-Native 'wsl.exe' @('-d', $Distro, '-u', 'root', '-e', 'bash', '-lc', $probe)
 $initExit = $script:NativeExit
 if ($initExit -ne 0 -and ("$initOut" -match 'ARCH_MISMATCH:(\S+)' -or "$initOut" -match '(?i)exec format error')) {
@@ -767,14 +794,27 @@ if ($initExit -ne 0 -and ("$initOut" -match 'ARCH_MISMATCH:(\S+)' -or "$initOut"
     "本次导入已注销；数据盘 data.vhdx 保留。重跑安装器会重新校验/下载所需分片；若反复出现，" +
     "说明该 Release 的 $Arch 分片内容有误（wsl --import 本身不校验架构）。")
 }
+if ($initExit -eq 43 -or "$initOut" -match 'CHANNEL_BOOT_UNSUPPORTED') {
+  # 探针在 datadisk-init 之前就退出，所以这块 rootfs 从未被 mkfs 过。
+  try { Invoke-Native 'wsl.exe' @('--unregister', $Distro) | Out-Null } catch {}
+  if (Get-Command Clear-StaleImportArtifacts -ErrorAction SilentlyContinue) {
+    Clear-StaleImportArtifacts -Distro $Distro -InstallDir $InstallDir | Out-Null
+  }
+  throw 'beta 通道需要包含 DATA_LABEL 支持的 rootfs（当前镜像的 /usr/local/bin/wsl-boot.sh 过旧，attach 失败时可能按 devbox-data 挂到正式数据盘）；请用 -ReleaseTag beta 或包含该修复的构建重试。本次导入已注销，data.vhdx 保留。'
+}
+if ($initExit -ne 0) {
+  throw ("数据盘初始化失败（标签 $Label，退出码 $initExit）：无法确认这块 data.vhdx 可以安全地作为 $Channel 通道的数据盘，" +
+    "继续下去会把另一个通道的数据盘写进 $ConfPath。data.vhdx 已保留；请检查上面的错误输出后重试，或换一个新的 -InstallDir。")
+}
 Write-Host $initOut
 $uuid = ''
 foreach ($line in ($initOut -split "`n")) {
   if ($line -match 'UUID=([0-9a-fA-F-]{36})') { $uuid = $Matches[1] }
 }
-# 兜底 1：按标签读取 UUID。两个变体（agents / core）的数据盘共用同一标签 `devbox-data`，
-# 所以把另一个变体的 data.vhdx 复制过来也能正确识别（复制盘保留源盘的 UUID，
-# 与本变体旧 conf 里的 UUID 不同）。多个不同 UUID -> 报错，绝不静默取第一个。
+# 兜底 1：按本通道标签读取 UUID。同一通道（stable = devbox-data / beta =
+# devbox-data-beta）的两个变体共用标签，所以把另一变体的 data.vhdx 复制过来也能识别
+# （复制盘保留源盘 UUID，与本变体旧 conf 里的 UUID 不同）。多个不同 UUID -> 报错，
+# 绝不静默取第一个。
 if (-not $uuid) {
   $blkidOut = Invoke-Native 'wsl.exe' @('-d', $Distro, '-u', 'root', '-e', 'bash', '-lc', "blkid -t LABEL=$Label -s UUID -o value")
   if ($script:NativeExit -eq 0) {
@@ -782,12 +822,13 @@ if (-not $uuid) {
     if ($uuids.Count -eq 1) {
       $uuid = $uuids[0]
     } elseif ($uuids.Count -gt 1) {
-      throw "数据盘标签 '$Label' 匹配到多个不同的 UUID（$($uuids -join ', ')）：agents / core 两个变体共用同一标签，请先断开或删除多余的数据盘，再重试安装。"
+      throw "数据盘标签 '$Label' 匹配到多个不同的 UUID（$($uuids -join ', ')）：同一通道（$Channel）只应有一块数据盘（stable 用 devbox-data，beta 用 devbox-data-beta），请先断开或删除多余的数据盘，再重试安装。"
     }
   }
 }
 # 旧 conf 里的 DATA_UUID 只是兜底提示，所以无论前面是否解析成功都读取它（用于下面的
-# 变化日志）：两个变体的数据盘可以互换，复制盘保留源盘的 UUID，与本变体旧 conf 不同。
+# 变化日志）：同一通道的两个变体数据盘可以互换，复制盘保留源盘 UUID，与本变体旧 conf
+# 不同。
 # 只接受退出码为 0 且形如 UUID 的结果——Invoke-Native 合并了 stderr，不能把原生
 # 进程的报错文本当成 UUID。
 $confUuid = ''
@@ -855,7 +896,7 @@ if ([string]::IsNullOrWhiteSpace($pw)) {
 
 # --- [9/10] 写入启动配置 ---------------------------------------------------
 Step '[9/10] 写入启动配置 /etc/agent-devbox.conf…'
-$conf = "DATA_VHDX=$(Quote-Bash $VhdxPath)`nDATA_UUID=$(Quote-Bash $uuid)`nPASEO_PASSWORD=$(Quote-Bash $pw)`nDATA_MNTNAME=$(Quote-Bash $MountName)`nDATA_DISTRO=$(Quote-Bash $Distro)`n"
+$conf = "DATA_VHDX=$(Quote-Bash $VhdxPath)`nDATA_UUID=$(Quote-Bash $uuid)`nDATA_LABEL=$(Quote-Bash $Label)`nPASEO_PASSWORD=$(Quote-Bash $pw)`nDATA_MNTNAME=$(Quote-Bash $MountName)`nDATA_DISTRO=$(Quote-Bash $Distro)`n"
 $b64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($conf))
 Invoke-Native 'wsl.exe' @('-d', $Distro, '-u', 'root', '-e', 'bash', '-lc', "set -o pipefail; umask 077; printf '%s' '$b64' | base64 -d > $ConfPath && chmod 600 $ConfPath") | Out-Null
 if ($script:NativeExit -ne 0) { throw "写入 $ConfPath 失败（退出码 $script:NativeExit）" }
@@ -950,6 +991,7 @@ try {
 
 Ok '安装完成。'
 Ok "变体：$Variant"
+Ok "通道=$Channel"
 Ok "Release：$ReleaseTag"
 Ok "安装目录：$InstallDir"
 Ok "进入环境：wsl -d $Distro"
