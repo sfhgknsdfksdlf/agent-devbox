@@ -27,9 +27,13 @@
 [CmdletBinding()]
 param(
   [ValidateSet('agents', 'core')] [string] $Variant = 'agents',
+  [string] $InstallDir = '',
   [string] $ReleaseTag = 'latest',
   [string] $LogPath = '',
   [string] $Ref = '',
+  [switch] $Yes,
+  [switch] $KeepExisting,
+  [ValidateRange(1, 8)] [int] $Connections = 4,
   [switch] $AllowUnverifiedScripts
 )
 
@@ -40,14 +44,16 @@ $ProgressPreference = 'SilentlyContinue'
 $Repo = 'sfhgknsdfksdlf/agent-devbox'
 
 # Ask which release to install when run interactively without -ReleaseTag.
-if (-not $PSBoundParameters.ContainsKey('ReleaseTag') -and [Environment]::UserInteractive) {
+# -Yes, redirected stdin or redirected stdout always means unattended: never block.
+$interactive = [Environment]::UserInteractive -and -not [Console]::IsInputRedirected -and -not [Console]::IsOutputRedirected
+if (-not $PSBoundParameters.ContainsKey('ReleaseTag') -and -not $Yes -and $interactive) {
   $sel = Read-Host '选择版本 [回车 = 正式版(latest)，b = beta 测试版，或输入版本号，例如 build-20261018.0731]'
   if ([string]::IsNullOrWhiteSpace($sel)) { $ReleaseTag = 'latest' }
   else                                    { $ReleaseTag = $sel.Trim() }
 }
 
 # Ask which image to install when run interactively without -Variant.
-if (-not $PSBoundParameters.ContainsKey('Variant') -and [Environment]::UserInteractive) {
+if (-not $PSBoundParameters.ContainsKey('Variant') -and -not $Yes -and $interactive) {
   $vsel = Read-Host '选择镜像 [回车 = 完整版（多助手 agents），c = 精简版（core）]'
   if (-not [string]::IsNullOrWhiteSpace($vsel) -and $vsel.Trim() -match '^(?i:c|core)$') { $Variant = 'core' }
   else { $Variant = 'agents' }
@@ -55,7 +61,7 @@ if (-not $PSBoundParameters.ContainsKey('Variant') -and [Environment]::UserInter
 
 # Ask which code ref (branch/tag/commit) when run interactively without -Ref.
 if (-not $Ref) { $Ref = $env:AGENT_DEVBOX_REF }
-if (-not $Ref -and [Environment]::UserInteractive) {
+if (-not $Ref -and -not $Yes -and $interactive) {
   $rsel = Read-Host '选择代码分支 [回车 = main，? = 列出全部分支，或输入分支名/commit]'
   if ([string]::IsNullOrWhiteSpace($rsel)) {
     $Ref = 'main'
@@ -87,6 +93,22 @@ if ($Ref -notmatch '^[A-Za-z0-9][A-Za-z0-9._/-]*$' -or $Ref -match '\.\.' -or $R
   throw "非法的分支/ref：$Ref"
 }
 
+# 安装目录必须在 UAC 提权与升级确认之前就定下来：提权子进程要收到它，升级提示也要
+# 显示它。默认值随变体变化；-Yes / 重定向 / 非交互一律用默认值，绝不阻塞。
+# 去掉首尾空白与末尾的反斜杠，避免拼进命令行参数时把引号转义掉（路径里有空格没关系）。
+$DefaultInstallDir = if ($Variant -eq 'core') { 'D:\WSL\agent-devbox-core' } else { 'D:\WSL\agent-devbox' }
+if ([string]::IsNullOrWhiteSpace($InstallDir)) {
+  if ($Yes -or -not $interactive) {
+    $InstallDir = $DefaultInstallDir
+  } else {
+    $answer = Read-Host "安装目录 [$DefaultInstallDir]（直接回车使用默认值）"
+    $InstallDir = if ([string]::IsNullOrWhiteSpace($answer)) { $DefaultInstallDir } else { $answer }
+  }
+}
+$InstallDir = $InstallDir.Trim()
+if ($InstallDir -notmatch '^[A-Za-z]:\\$') { $InstallDir = $InstallDir.TrimEnd('\') }
+if ([string]::IsNullOrWhiteSpace($InstallDir)) { $InstallDir = $DefaultInstallDir }
+
 $SelfUrl = "https://raw.githubusercontent.com/$Repo/$Ref/windows/install.ps1"
 # 发行版名随镜像变体变化（core = agent-devbox-core，agents = agent-devbox）。
 $Distro  = if ($Variant -eq 'core') { 'agent-devbox-core' } else { 'agent-devbox' }
@@ -111,7 +133,7 @@ if ($ReleaseTag -eq 'latest') {
   }
 }
 if ($Ref -ne 'main') {
-  Write-Host "开发通道：安装脚本来自 $Ref；rootfs 仍使用 Release $ReleaseTag。" -ForegroundColor Yellow
+  Write-Host "开发通道：安装脚本来自 $Ref；rootfs 使用 $ReleaseTag。" -ForegroundColor Yellow
 }
 
 # The installer scripts are fetched from the SOURCE tree at the selected ref
@@ -151,7 +173,11 @@ if (-not (Test-IsAdmin)) {
     # The elevated copy is freshly written by us (no Mark-of-the-Web), so
     # RemoteSigned is sufficient and avoids the stronger Bypass signal.
     $argList = @('-NoProfile', '-ExecutionPolicy', 'RemoteSigned', '-File', "`"$scriptToRun`"",
-      '-ReleaseTag', $ReleaseTag, '-Variant', $Variant, '-Ref', $Ref, '-LogPath', "`"$log`"")
+      '-ReleaseTag', $ReleaseTag, '-Variant', $Variant, '-Ref', $Ref, '-LogPath', "`"$log`"",
+      '-InstallDir', "`"$InstallDir`"")
+    if ($Yes) { $argList += '-Yes' }
+    if ($KeepExisting) { $argList += '-KeepExisting' }
+    $argList += @('-Connections', "$Connections")
     if ($AllowUnverifiedScripts) { $argList += '-AllowUnverifiedScripts' }
     $p = $null
     try {
@@ -169,6 +195,12 @@ if (-not (Test-IsAdmin)) {
     $rc = 0
     if (Test-Path -LiteralPath "$log.rc") { $rc = [int](Get-Content -LiteralPath "$log.rc") }
     elseif ($p -and $null -ne $p.ExitCode) { $rc = [int]$p.ExitCode }
+    # A cancel exits 0 but changed nothing: never report success (or check the
+    # distro) on that path.
+    if (Test-Path -LiteralPath "$log.cancel") {
+      Write-Host '已取消升级（未做任何更改）。' -ForegroundColor Yellow
+      return
+    }
     if ($rc -ne 0 -and (Test-Path -LiteralPath "$log.err")) {
       Write-Host ''
       Write-Host '===== 失败原因 =====' -ForegroundColor Red
@@ -184,7 +216,9 @@ if (-not (Test-IsAdmin)) {
       try {
         $names = @((& wsl.exe -l -q 2> $null) | ForEach-Object { ("$_" -replace "`0", '').Trim() } | Where-Object { $_ })
         if ($names -notcontains $Distro) {
-          Write-Host "注意：当前（非提权）用户看不到发行版 '$Distro'。WSL 发行版按用户注册；若 UAC 用了另一个管理员帐户，发行版会落在那个帐户下。" -ForegroundColor Yellow
+          Write-Host "注意：当前（非提权）用户看不到发行版 '$Distro'。" -ForegroundColor Yellow
+          Write-Host 'WSL 发行版按用户注册；若 UAC 用了另一个管理员帐户，发行版会落在那个帐户下。' -ForegroundColor Yellow
+          Write-Host '请切到该帐户，运行 wsl -l -v 确认。' -ForegroundColor Yellow
         }
       } catch {}
     }
@@ -192,6 +226,7 @@ if (-not (Test-IsAdmin)) {
     Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $log -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath "$log.rc" -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath "$log.cancel" -Force -ErrorAction SilentlyContinue
   }
   # `return` (not `exit`) so an in-memory invocation does not close the caller's shell.
   return
@@ -205,7 +240,7 @@ try {
   $dest = Join-Path $work 'win'
   New-Item -ItemType Directory -Path $dest -Force | Out-Null
 
-  $scriptNames = @('wsl-ensure.ps1', 'wsl-ensure-downloads.ps1', 'install-agent-devbox.ps1', 'mount-datadisk.ps1', 'mount-datadisk.cmd', 'unmount-datadisk.ps1', 'unmount-datadisk.cmd')
+  $scriptNames = @('wsl-ensure.ps1', 'wsl-ensure-downloads.ps1', 'install-agent-devbox.ps1', 'mount-datadisk.cmd', 'unmount-datadisk.cmd')
   Write-Host "正在获取安装脚本（来自源码 $Ref）…"
   foreach ($name in $scriptNames) {
     $url = "$ScriptsBase/$name"
@@ -288,8 +323,17 @@ try {
   }
 
   $ensure = Join-Path $dest 'wsl-ensure.ps1'
+  $upgradeChecked = $false
   if (Test-Path -LiteralPath $ensure) {
     . $ensure
+    # 升级确认只在这里问一次，且必须在 Ensure-Wsl / Set-MirroredNetworking 之前：
+    # 取消时不能改 .wslconfig、不能重启 WSL、不能注销任何东西。
+    if (Get-Command Confirm-Upgrade -ErrorAction SilentlyContinue) {
+      $decision = Confirm-Upgrade -Distro $Distro -InstallDir $InstallDir -Yes:$Yes -KeepExisting:$KeepExisting -LogPath $LogPath
+      if ($decision -eq 'cancel') { return }
+      if ($decision -eq 'keep') { $KeepExisting = $true }
+      $upgradeChecked = $true
+    }
     $r = Ensure-Wsl
     if ($r -eq 'reboot-required') {
       Write-Host 'WSL 已安装，但需要重启 Windows。请重启后重新运行本脚本。'
@@ -297,7 +341,7 @@ try {
       return
     }
     if (-not (Test-WslInstalled)) { throw 'WSL 仍不可用；安装未能完成。' }
-    Set-MirroredNetworking -Yes
+    Set-MirroredNetworking -Yes | Out-Null
   } else {
     Write-Warning '未能从 main 取回 wsl-ensure.ps1；跳过 WSL / 网络预检查。'
   }
@@ -306,9 +350,17 @@ try {
   if (-not (Test-Path -LiteralPath $installer)) { throw '未能从 main 取回 install-agent-devbox.ps1；无法继续。' }
 
   Write-Host '正在启动 agent-devbox 安装器…'
-  $installerArgs = @{ Variant = $Variant; ReleaseTag = $ReleaseTag }
+  $installerArgs = @{
+    Variant = $Variant; ReleaseTag = $ReleaseTag; InstallDir = $InstallDir
+    Yes = $Yes; KeepExisting = $KeepExisting; Connections = $Connections
+  }
   if ($LogPath) { $installerArgs['LogPath'] = $LogPath }
+  # Only claim "already asked" when the helper really ran above.
+  if ($upgradeChecked) { $installerArgs['UpgradeConfirmed'] = $true }
   & $installer @installerArgs
+  # The installer may still have asked (ensure was unavailable above): a cancel
+  # must not fall through to later success output.
+  if ($LogPath -and (Test-Path -LiteralPath "$LogPath.cancel")) { return }
 } catch {
   # A failure BEFORE the installer runs (download/verify/preflight) never writes
   # the .rc, which would look like success to the parent. Record it here.

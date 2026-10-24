@@ -38,7 +38,7 @@ irm https://raw.githubusercontent.com/sfhgknsdfksdlf/agent-devbox/main/windows/i
 这就是**唯一的安装入口** —— 不用再去 Releases 手动下载 zip，也不用双击 `.bat` 启动器。它会：
 
 - 自动请求一次管理员授权（UAC），自动装好 WSL（可选带上 [wsl-ui](https://github.com/octasoft-ltd/wsl-ui) 图形界面）并建议开启镜像网络；
-- 安装脚本（`install-agent-devbox.ps1`、`wsl-ensure.ps1`、`wsl-ensure-downloads.ps1`）从**所选的代码分支/标签（默认 `main`）**取回，只有 rootfs 镜像分片来自 Release；每个脚本都会按同分支的 `windows/SHA256SUMS` 校验（旧版本没有清单时才需要 `-AllowUnverifiedScripts`）；
+- 安装脚本（`install-agent-devbox.ps1`、`wsl-ensure.ps1`、`wsl-ensure-downloads.ps1`）从**所选的代码分支/标签（默认 `main`）**取回，只有 rootfs 镜像分片来自 Release；每个脚本都会按同分支的 `windows/SHA256SUMS` 校验（旧版本没有清单时才需要 `-AllowUnverifiedScripts`）；rootfs 分片按架构命名（`rootfs-<variant>-<arch>.tar.zst.part-*`，`arch` 为 `amd64` / `arm64`），安装器按宿主**原生**架构自动选择，不需要额外参数；
 - 交互运行时询问装哪个镜像（回车＝完整版多助手 `agents`，输入 `c`＝精简版 `core`）和哪个版本（回车＝`latest`，输入 `b`＝最新 `beta`，也可直接输入版本号），最后询问代码分支（回车＝`main`，输入 `?` 列出全部分支；开发测试用）；
 - 装完自动清理临时文件。
 
@@ -58,39 +58,63 @@ wsl --set-default $Distro
 `wsl -d agent-devbox`（agents）或 `wsl -d agent-devbox-core`（core）。
 
 安装脚本会自动：**下载前先检查目标磁盘空间**（不够就用中文报错中止），再导入系统、创建
-一块 32GB 的动态数据磁盘并初始化、把它接入开机流程，并注册一个登录时自动挂载磁盘的计划
-任务（如需跳过，给脚本加 `-NoTask`）。导入采用**三级回退**：优先把下载的分片**流式**喂给
+一块 32GB 的动态数据磁盘并初始化、写入开机配置，并自己附加这块数据盘（下次启动起由
+`wsl-boot.sh` 在发行版内部自动附加；旧版本留下的 `agent-devbox*-mount-datadisk` 旧任务会被注销）。
+导入采用**三级回退**：
+优先把下载的分片**流式**喂给
 `wsl --import <发行版> <目录> -`（WSL2 自带的 bsdtar 直接解 zstd，**不下载 `zstd.exe`**、
 不合并分片、不产生中间 `.tar`），失败才合并分片后按文件导入，最后才下载 `zstd.exe` 解压为
 `.tar`；因此**正常路径在 Windows 11 和 Windows 10 上都不会下载 `zstd.exe`**。装完会校验
 发行版确实注册成功，失败则注销这次残缺的注册并给出可操作的中文提示；临时文件（分片 /
-合并出的 `.zst` / 解压出的 `.tar`）在**成功和失败后都会清理**。重复运行也没问题。
+合并出的 `.zst` / 解压出的 `.tar`）：**成功导入后清理本次下载的分片**；导入失败时保留分片和 sidecar（内容被证明可疑时除外），重跑会重新校验 SHA256 后续传。重复运行也没问题。
+**ARM64 例外**：Windows 11 ARM64 上只有 **Tier 1 / Tier 2**；Tier 3 依赖的 `zstd.exe` 只有
+x64 版本，因此会跳过 Tier 3。两级都失败时安装器提示先 `wsl --update` 再重装，已下载的分片会
+保留供重试（详见 [docs/installation-wsl.md](docs/installation-wsl.md) 的 ARM64 一节）。
 
 两个变体现在**互不冲突、可以同时安装同时运行**：agents 版注册成 WSL 发行版 `agent-devbox`
 （默认安装目录 `D:\WSL\agent-devbox`），core 版注册成 `agent-devbox-core`
 （默认 `D:\WSL\agent-devbox-core`）；各自在自己安装目录里有**独立**的 `data.vhdx`
 （两份 `/home`、`/root`、`/workspace` 互不共享）。数据盘统一用 ext4 卷标 **`devbox-data`**
 （`DATA_MNTNAME` 也是 `devbox-data`），在 WSL 里固定挂到 **`/mnt/devbox-data`**；安装器
-写 `/etc/agent-devbox.conf`（仍是 5 个键）并注册一个**只做附加**的登录计划任务（agents 为
-`agent-devbox-mount-datadisk`，core 为 `agent-devbox-core-mount-datadisk`）。
+写 `/etc/agent-devbox.conf`（5 个键：`DATA_VHDX`、`DATA_UUID`、`PASEO_PASSWORD`、
+`DATA_MNTNAME`、`DATA_DISTRO`）。安装器只自己附加一次数据盘，**不再注册任何 Windows 任务**；
+如果检测到旧版本留下的 `agent-devbox-mount-datadisk` / `agent-devbox-core-mount-datadisk`
+旧任务，会直接注销它们。
 
-这块计划任务是**隐藏**的：它的动作是一个 `-WindowStyle Hidden -EncodedCommand` 的
-PowerShell，只运行 `wsl --mount --vhd "<vhdx>" --bare`（只附加，**不带** `--type ext4` /
-`--name`），因此不会再闪出那个空白控制台窗口。真正的 `mount -t ext4` 交给**纯 Linux** 的
-开机脚本 —— `scripts/wsl-boot.sh` 现在只在 Linux 侧按 UUID（`blkid -U`）找到已附加的块设备、
-挂到 `/mnt/devbox-data`，**再也不会调用 `wsl.exe` / `schtasks.exe`**（旧版从开机里回调
-Windows 工具会重进 WSL，造成开不机的死循环）。挂载失败则进入维护模式（fail closed，什么都
-不初始化、不启动），并在 `/etc/motd` 里用中英文提示你重跑 Windows 安装器
-（`irm https://raw.githubusercontent.com/sfhgknsdfksdlf/agent-devbox/main/windows/install.ps1 | iex`）。
+真正的挂载由**发行版自己在每次启动时完成**：`scripts/wsl-boot.sh` 先发起一次**硬超时**的
+`wsl.exe --mount --vhd ... --bare`（设备已在则跳过；这是 `[boot]` 里唯一一次 interop 调用），
+再等待设备出现、按 UUID（`blkid -t UUID=`）找到它（找不到再按 `devbox-data` 标签），挂到 `/mnt/devbox-data`，最后 bind
+`/home` `/root` `/workspace`。它**不调用** `schtasks.exe`、`wsl -d` 或 `--unmount`
+（旧版从开机里回调 Windows 工具会重进 WSL，造成开不机的死循环）。挂载失败则进入维护模式
+（fail closed，什么都不初始化、不启动），`/etc/motd` 用中英文给出两条可复制粘贴的修复命令：
+先运行 `<安装目录>\mount-datadisk.cmd`，再 `wsl --terminate <发行版>`，然后重新打开发行版
+（这一次启动里 boot 会自己挂载）。
 
-安装器还会把几个**手动排障脚本**复制进安装目录：`mount-datadisk.cmd` / `mount-datadisk.ps1`
-（不带参数＝附加本目录的 `data.vhdx`；`-Vhdx "D:\其它\x.vhdx"`＝附加指定磁盘；再加
-`-Name mydisk`＝附加并自动挂到 `/mnt/wsl/mydisk`）和 `unmount-datadisk.cmd` /
-`unmount-datadisk.ps1`（`wsl --unmount` 分离）。注意：平时停止发行版只用 `wsl --terminate <发行版>`（磁盘附加不会丢）。`wsl --shutdown` 会关闭
-**所有**发行版并分离已挂载的 VHDX——只有改完镜像网络、安装器明确提示并询问 `y/N`、你输入 y 时
-才会执行。只有重启 Windows 后首次启动才需要重新附加（跑 `mount-datadisk.cmd`、重跑安装器，
-或注销/重新登录触发计划任务）。已装的旧版本建议重跑一次安装器，以采用新的任务
-动作和新的 `DATA_MNTNAME=devbox-data`（旧配置也能用：会继续按它旧的 `DATA_MNTNAME` 挂载）。
+安装器还会把两个**纯批处理**手动排障脚本复制进安装目录（不需要 PowerShell，也不需要管理员 /
+UAC）：`mount-datadisk.cmd`（不带参数＝附加本目录的 `data.vhdx`，位置参数可指定别的 VHDX 路径；
+重试 3 次、写 `datadisk-attach.log`、返回真实的退出码）和 `unmount-datadisk.cmd`
+（`wsl --unmount "\\?\<vhdx>"` 分离）。
+
+附加（attach）什么时候会丢，说清楚：
+
+- `wsl --terminate <发行版>` 只停这一个发行版，**保留**附加；
+- `wsl --shutdown` 会关闭**所有**发行版并**分离所有已挂载的 VHDX**（这是 WSL 的设计），
+  只在改完镜像网络、安装器明确提示并询问 `y/N`、你输入 y 时才执行；
+- **重启 Windows 一定丢失附加**：WSL 的自动重挂状态是 **VOLATILE** 注册表键，重启即清空。
+
+正常使用不用管这些：**发行版每次启动，boot 脚本都会自己重新附加并挂载**。只有 boot attach
+失败（进了维护模式）时才需要手动修复：先跑 `<安装目录>\mount-datadisk.cmd`，再
+`wsl --terminate <发行版>`，然后重新打开发行版。已装的旧版本建议重跑一次安装器：它会注销
+旧版本残留的挂载任务，并写入新的 5 键配置（旧配置也能用：会继续按它旧的 `DATA_MNTNAME`
+挂载）。
+
+两个变体的数据盘可以互换：它们用同一个 ext4 卷标（也是挂载名）`devbox-data`，把一个变体的
+`data.vhdx` 复制到另一个变体的安装目录后，boot 会先按 conf 里的 UUID 找设备，找不到再按
+`devbox-data` 标签找，所以复制盘（保留源 UUID）也能正常挂载，conf 里的 UUID 不会被改写。
+两个变体各自的盘 UUID 不同，同时附加也不会互相误认；但如果 UUID 命中不止一块（复制盘保留了
+源 UUID、原盘又还附加着），或 UUID 完全找不到而标签命中多块，boot 会 fail closed 进入维护
+模式而不是随便挑一块：按提示用安装目录的 `unmount-datadisk.cmd` 分离多余的那块，再重新打开
+发行版。复制出来的两份是彼此独立的文件系统（不会同步），复制前请先分离源盘。
 
 详见 **[docs/installation-wsl.md](docs/installation-wsl.md)** 和
 **[docs/wsl-persistence.md](docs/wsl-persistence.md)**。
@@ -203,6 +227,9 @@ Remove-Item "$env:LOCALAPPDATA\wsl-ui\distro-metadata.json" -Force -ErrorAction 
 - 推送到**任意分支**都会自动构建；定时（每 3 天一次）和手动触发也会构建；
 - 每次构建都同时产出 **amd64 + arm64**，再合并成一个多架构镜像
   （用 GitHub 免费的原生 ARM 机器，不做模拟）；
+- **WSL rootfs 分片现在也同时产出 amd64 + arm64**：两个架构各自在**原生 runner** 上导出
+  （amd64 用 `ubuntu-latest`、arm64 用 `ubuntu-24.04-arm`），上传为临时 artifact，再由发布
+  任务下载两套分片、校验分片编号连续，写一份**覆盖两架构的 `SHA256SUMS`**，最后创建 Release；
 - 定时构建时，如果所有跟踪的上游版本都没变，会自动跳过
   （靠 `versions.json` 做比对）；
 - **只有 定时 / 手动 才会把镜像推为 `latest` 并创建 Release**；推送触发的构建只产出**测试标签**，
@@ -225,31 +252,39 @@ Remove-Item "$env:LOCALAPPDATA\wsl-ui\distro-metadata.json" -Force -ErrorAction 
 > **运行上面那条 `irm` 一行命令，安装脚本会问要装哪个** —— 回车＝正式版（`latest`），输入 `b`／`beta`
 > ＝最新的 `beta-*` 预发布（脚本经 GitHub API 解析），或直接输入某个版本号
 > （`build-YYYYMMDD.HHMM`／`beta-YYYYMMDD.HHMM`，裸日期如 `20261018.0731` 会自动补 `build-` 前缀）。
-> **已装过会直接覆盖升级，不再问 y/N** —— 换系统盘，但数据盘（`/home`、`/root`、`/workspace`）
-> 和 **paseo 密码都保留**（密码存在数据盘 `/mnt/devbox-data/.paseo-password`）。想保留现有安装不动就加
-> `-KeepExisting`；无人值守用 `-ReleaseTag <版本>`（`-Yes` 现在也会升级）。稳定版仍是定时的
-> `latest` / Release。
+> **已装过时，交互式运行会问一行：回车 = 覆盖升级，`n` = 取消** —— 换系统盘，但数据盘
+> （`/home`、`/root`、`/workspace`）和 **paseo 密码都保留**（密码存在数据盘
+> `/mnt/devbox-data/.paseo-password`）。一键命令会在 UAC 提权之后、改动镜像网络之前提问；
+> 取消就什么都不做（不下载、不注销、不改 `.wslconfig`，退出码 0）。想保留现有安装不动就加
+> `-KeepExisting`；`-Yes` 或重定向/无人值守运行不提问，直接升级；无人值守还可用
+> `-ReleaseTag <版本>`。稳定版仍是定时的 `latest` / Release。
 
 ## 产物在哪
 
 | 产物 | 位置 | 给谁用 |
 |---|---|---|
 | 容器镜像（`agent-devbox`、`agent-devbox-core`，多架构） | **ghcr.io** | Docker 用户；WSL 的 wsl-ui 导入 |
-| WSL 镜像包（`rootfs-*.tar.zst.part-*`，分片） | **GitHub Releases** | Windows 一键安装（`irm` 命令读取） |
+| WSL 镜像包（`rootfs-<variant>-<arch>.tar.zst.part-*`，分片；`arch` 为 `amd64` / `arm64`） | **GitHub Releases** | Windows 一键安装（`irm` 命令读取，按宿主架构自动选择） |
 | Windows 安装入口（`irm` 一行命令） | **项目源码 `main`**（`windows/install.ps1`） | 第一次安装的入口 |
 | 1Panel 本地应用包（`agent-devbox-1panel-localapp.zip`） | **GitHub Releases** | 1Panel 应用商店（本地应用） |
 
 > Windows 端**不再**随 Release 分发旧的安装压缩包或独立的引导脚本；安装入口
 > 就是项目源码 `main` 上的 `windows/install.ps1`（`irm ... | iex`）。它按需从 `main` 取回
 > `install-agent-devbox.ps1`、`wsl-ensure.ps1`、`wsl-ensure-downloads.ps1`，并把手动挂载 / 卸载
-> 数据盘的辅助脚本 `mount-datadisk.ps1`、`mount-datadisk.cmd`、`unmount-datadisk.ps1`、
-> `unmount-datadisk.cmd` 复制进安装目录。Release 现在只承载 rootfs 分片和 1Panel 本地应用包。
+> 数据盘的辅助脚本 `mount-datadisk.cmd`、`unmount-datadisk.cmd` 复制进安装目录。Release
+> 现在只承载 rootfs 分片和 1Panel 本地应用包。
 
 > 结论：**容器镜像在 ghcr**；**Windows 一键安装的入口是项目源码里的 `install.ps1`（`irm`）**，
 > **给 WSL 用的 rootfs 分片在 GitHub Releases**。
 > 之所以不把 WSL 包也放进 ghcr：WSL 导入需要"扁平的文件系统 tar"，没法直接当 OCI 镜像用。
 > 正常情况下导入直接用 WSL2 自带的 zstd 解压（Windows 11/10 都不需要额外程序）；只有在最后
 > 兜底的 Tier 3 才会**按固定版本**从 facebook/zstd 官方项目下载 `zstd.exe`，我们不转发第三方程序。
+> Tier 3 只在 x64 上存在：Windows 11 ARM64 使用 Tier 1 / Tier 2。
+>
+> 每个 Release **同时携带 amd64 与 arm64 两套分片**，以及一份覆盖两架构的 `SHA256SUMS`。
+> 旧 Release 只有 amd64 分片：在 ARM64 上安装会在**下载前**以 `没有 ARM64 分片` 明确失败，
+> 并提示改用 `-ReleaseTag latest` / `beta` 或在 x64 上安装。**没有 amd64 回退**：WSL2 不模拟
+> x86-64 Linux ELF，amd64 的 rootfs 在 ARM64 上无法启动。Windows 10 ARM64 不受支持。
 
 > 注意：公开仓库里的定时任务如果 60 天没有任何活动会被 GitHub 自动关掉 ——
 > `keepalive` 工作流会定期提交一次来避免。
@@ -263,7 +298,7 @@ docker-compose.yml      # 只拉取（Docker 模式）
 1panel/                 # 1Panel 商店本地应用包
 scripts/                # 入口、启动、初始化、数据盘初始化
 config/                 # wsl.conf、profile.d
-windows/                # 安装入口 install.ps1（irm | iex）+ 安装脚本 install-agent-devbox.ps1 + 共享辅助 wsl-ensure.ps1 / wsl-ensure-downloads.ps1 + 手动挂载 / 卸载辅助 mount-datadisk.* / unmount-datadisk.*
+windows/                # 安装入口 install.ps1（irm | iex）+ 安装脚本 install-agent-devbox.ps1 + 共享辅助 wsl-ensure.ps1 / wsl-ensure-downloads.ps1 + 手动挂载 / 卸载辅助 mount-datadisk.cmd / unmount-datadisk.cmd
 .github/workflows/      # build.yml、keepalive.yml
 docs/                   # 软件清单、基础镜像、问答、安装、数据持久化、组网访问
 tests/                  # bats 测试（tests/run.sh）+ PowerShell 单元测试（tests/powershell）

@@ -1,13 +1,16 @@
 #!/usr/bin/env bats
 # shellcheck disable=SC2016,SC2030,SC2031
-# wsl-boot.sh: pins the PURE-LINUX data-disk mount chain in ensure_mounted().
+# wsl-boot.sh: pins the attach + PURE-LINUX data-disk mount chain.
 #
-# The target interface is deliberately Windows-tool-free: boot no longer shells
-# out to wsl.exe / schtasks.exe. It derives the data-disk mountpoint from
-# load_conf() (AGENT_DEVBOX_DATADIR > /mnt/$DATA_MNTNAME), resolves the device
-# by UUID via `blkid -U`, and mounts it directly with `mount -t ext4`. Failure
-# is expressed as a bilingual MAINTENANCE MOTD (naming both launchers), never by
-# re-launching the Windows installer.
+# Boot hands the disk over by exactly ONE bounded interop call — a bare attach
+# (`wsl.exe --mount --vhd <path> --bare`), skipped when the device is already
+# present — and everything after it is Linux: the mountpoint derives from
+# load_conf() (AGENT_DEVBOX_DATADIR > /mnt/$DATA_MNTNAME), the device resolves by
+# UUID via `blkid -U`, and `mount -t ext4` does the mount. There is no scheduled
+# task and no re-entrant call into Windows from [boot]; the install-dir batch
+# script is an on-demand repair path only. Failure is expressed as a bilingual
+# MAINTENANCE MOTD whose commands can be pasted into a WSL terminal (plus a
+# PowerShell fallback), never by re-launching the Windows installer.
 #
 # The script is safe to source (BASH_SOURCE guard) and reads its paths from
 # AGENT_DEVBOX_* env vars AT SOURCE TIME, so every case runs in an isolated
@@ -24,7 +27,9 @@ setup() {
   export SCRIPT="${WSL_BOOT_SH:-$BATS_TEST_DIRNAME/../../scripts/wsl-boot.sh}"
   export BINDIR="$TMP/bin"
   export MOUNT_MARKER="$TMP/mounted.marker"
+  export DEVICE_FLAG="$TMP/device.flag"
   export CALL_LOG="$TMP/calls.log"
+  export WSL_LOG="$TMP/wsl.log"
   export VHDX="$TMP/data.vhdx"
   export AGENT_DEVBOX_CONF="$TMP/agent-devbox.conf"
   export AGENT_DEVBOX_LOG="$TMP/boot.log"
@@ -32,6 +37,7 @@ setup() {
   export AGENT_DEVBOX_MOTD="$TMP/motd"
   mkdir -p "$BINDIR" "$AGENT_DEVBOX_DATADIR"
   : > "$CALL_LOG"
+  : > "$WSL_LOG"
   : > "$AGENT_DEVBOX_LOG"
   export PATH="$BINDIR:$PATH"
 }
@@ -68,7 +74,47 @@ SH
 #!/bin/sh
 exit 0
 SH
+  # The single Windows interop call is stubbed here. It must log to $WSL_LOG —
+  # NEVER to $CALL_LOG, because existing cases assert `assert_log_lacks 'mount'`.
+  # WSL_EXIT / WSL_OUT drive its exit code and output; WSL_MAKE_DEVICE makes the
+  # device show up (used to simulate a successful attach).
+  cat > "$BINDIR/wsl.exe" <<'SH'
+#!/bin/sh
+echo "wsl.exe $*" >> "$WSL_LOG"
+if [ -n "${WSL_MAKE_DEVICE:-}" ]; then
+  : > "$WSL_MAKE_DEVICE"
+fi
+if [ -n "${WSL_OUT:-}" ]; then
+  printf '%s\n' "$WSL_OUT"
+fi
+exit "${WSL_EXIT:-0}"
+SH
+  # `timeout` must strip its own options before exec'ing the interop stub;
+  # TIMEOUT_EXIT=124 simulates the hard-timeout verdict.
+  cat > "$BINDIR/timeout" <<'SH'
+#!/bin/sh
+if [ "${TIMEOUT_EXIT:-0}" = "124" ]; then
+  exit 124
+fi
+if [ "${1:-}" = "-k" ]; then
+  shift 2
+fi
+shift
+exec "$@"
+SH
   chmod +x "$BINDIR"/*
+}
+
+# gated_blkid: the device exists only once $DEVICE_FLAG appears, so a case can
+# start with "not attached" and let the interop stub materialise it.
+gated_blkid() {
+  cat > "$BINDIR/blkid" <<'SH'
+#!/bin/sh
+[ -e "$DEVICE_FLAG" ] || exit 1
+echo /dev/fakedev
+exit 0
+SH
+  chmod +x "$BINDIR/blkid"
 }
 
 # fail_blkid: replace the blkid shim with one that never resolves a device.
@@ -76,6 +122,37 @@ fail_blkid() {
   cat > "$BINDIR/blkid" <<'SH'
 #!/bin/sh
 exit 1
+SH
+  chmod +x "$BINDIR/blkid"
+}
+
+# label_blkid: honours the three blkid call shapes boot uses. BLKID_UUID_DEV is
+# the device the UUID lookup finds (empty = UUID unknown, i.e. a disk copied from
+# the other variant); BLKID_LABEL_DEVS is the newline-separated list the shared
+# LABEL lookup finds (two lines = ambiguity).
+label_blkid() {
+  cat > "$BINDIR/blkid" <<'SH'
+#!/bin/sh
+case "$*" in
+  *"UUID="*)
+    if [ -n "${BLKID_UUID_DEVS:-}" ]; then
+      printf '%s\n' "$BLKID_UUID_DEVS"
+      exit 0
+    fi
+    if [ -n "${BLKID_UUID_DEV:-}" ]; then
+      echo "$BLKID_UUID_DEV"
+      exit 0
+    fi
+    exit 1 ;;
+  *"LABEL="*)
+    if [ -n "${BLKID_LABEL_DEVS:-}" ]; then
+      printf '%s\n' "$BLKID_LABEL_DEVS"
+      exit 0
+    fi
+    exit 1 ;;
+esac
+echo /dev/fakedev
+exit 0
 SH
   chmod +x "$BINDIR/blkid"
 }
@@ -238,6 +315,149 @@ SH
   [ "$status" -eq 1 ]
 }
 
+# ---------------------------------------------------------------------------
+# guest-side attach (plan §3.1 / §6): a missing device triggers exactly ONE
+# interop call; the single wait_device() decides, not wsl.exe's exit code.
+# ---------------------------------------------------------------------------
+
+@test "device already present: no interop call and attach_source=preexisting" {
+  base_shims
+  conf_with_vhdx
+  run bash -c '. "$SCRIPT"; load_conf; ensure_mounted'
+  [ "$status" -eq 0 ]
+  boot_out="$output"
+  assert_log_has 'mount -t ext4 /dev/fakedev'
+  [ ! -s "$WSL_LOG" ]
+  printf '%s' "$boot_out" | grep -Fq 'attach_source=preexisting'
+}
+
+@test "boot attach: device appears after the attach -> mount is called" {
+  base_shims
+  gated_blkid
+  conf_with_vhdx
+  export WSL_MAKE_DEVICE="$DEVICE_FLAG"
+  run bash -c '. "$SCRIPT"; load_conf; ensure_mounted'
+  [ "$status" -eq 0 ]
+  boot_out="$output"
+  grep -Fq -- '--mount --vhd' "$WSL_LOG"
+  grep -Fq -- '--bare' "$WSL_LOG"
+  assert_log_has 'mount -t ext4 /dev/fakedev'
+  printf '%s' "$boot_out" | grep -Fq 'attach_source=boot'
+}
+
+@test "boot attach: rc 255 ALREADY_ATTACHED with the device present is a success" {
+  base_shims
+  gated_blkid
+  conf_with_vhdx
+  export WSL_EXIT=255 WSL_OUT='WSL_E_USER_VHD_ALREADY_ATTACHED 0x80040312'
+  export WSL_MAKE_DEVICE="$DEVICE_FLAG"
+  run bash -c '. "$SCRIPT"; load_conf; ensure_mounted'
+  [ "$status" -eq 0 ]
+  boot_out="$output"
+  assert_log_has 'mount -t ext4 /dev/fakedev'
+  printf '%s' "$boot_out" | grep -Fq 'rc=255'
+  printf '%s' "$boot_out" | grep -Fq 'attach_source=preexisting'
+}
+
+@test "boot attach fails and no device appears: rc 1 with boot failed" {
+  base_shims
+  gated_blkid
+  conf_with_vhdx
+  export WSL_EXIT=255 WSL_OUT='some interop error'
+  run bash -c '. "$SCRIPT"; load_conf; ensure_mounted'
+  [ "$status" -eq 1 ]
+  boot_out="$output"
+  assert_log_lacks 'mount'
+  printf '%s' "$boot_out" | grep -Fq 'boot failed: maintenance mode'
+}
+
+@test "boot attach timeout (rc 124) is logged and still fails closed" {
+  base_shims
+  gated_blkid
+  conf_with_vhdx
+  export TIMEOUT_EXIT=124
+  run bash -c '. "$SCRIPT"; load_conf; ensure_mounted'
+  [ "$status" -eq 1 ]
+  printf '%s' "$output" | grep -Fq 'boot attach 超时'
+  printf '%s' "$output" | grep -Fq 'boot failed: maintenance mode'
+}
+
+@test "AGENT_DEVBOX_BOOT_ATTACH=0: the interop stub is never called" {
+  base_shims
+  gated_blkid
+  conf_with_vhdx
+  export AGENT_DEVBOX_BOOT_ATTACH=0 WSL_MAKE_DEVICE="$DEVICE_FLAG"
+  run bash -c '. "$SCRIPT"; load_conf; ensure_mounted'
+  [ "$status" -eq 1 ]
+  [ ! -s "$WSL_LOG" ]
+  printf '%s' "$output" | grep -Fq 'boot attach 已禁用'
+}
+
+# ---------------------------------------------------------------------------
+# shared label (agents <-> core interchange): a data.vhdx copied into the other
+# variant's install dir keeps its source UUID, so the conf UUID never matches.
+# Resolution is UUID first, then LABEL=devbox-data; two matches fail closed.
+# ---------------------------------------------------------------------------
+
+@test "UUID mismatch falls back to the shared label and mounts that device" {
+  base_shims
+  label_blkid
+  conf_with_vhdx
+  export BLKID_LABEL_DEVS='/dev/copieddisk'
+  run bash -c '. "$SCRIPT"; load_conf; ensure_mounted'
+  [ "$status" -eq 0 ]
+  boot_out="$output"
+  assert_log_has 'mount -t ext4 /dev/copieddisk'
+  printf '%s' "$boot_out" | grep -Fq 'source=label'
+  # A present device needs no attach at all.
+  [ ! -s "$WSL_LOG" ]
+}
+
+@test "two devices with the same UUID/label fail closed" {
+  base_shims
+  label_blkid
+  conf_with_vhdx
+  export BLKID_LABEL_DEVS="$(printf '%s\n%s' /dev/orig /dev/copy)"
+  run bash -c '. "$SCRIPT"; load_conf; ensure_mounted'
+  [ "$status" -eq 1 ]
+  printf '%s' "$output" > "$TMP/ambiguity.boot.log"
+  assert_log_lacks 'mount'
+  grep -Fq '多块' "$TMP/ambiguity.boot.log"
+  grep -Fq 'boot failed: maintenance mode' "$TMP/ambiguity.boot.log"
+  run grep -Fq 'boot complete' "$TMP/ambiguity.boot.log"
+  [ "$status" -ne 0 ]
+  # The banner must explain the two-device case (MOTD_HINT).
+  run bash -c '. "$SCRIPT"; load_conf; ensure_mounted; write_maintenance_motd'
+  [ "$status" -eq 0 ]
+  run grep -Fq '多块' "$AGENT_DEVBOX_MOTD"
+  [ "$status" -eq 0 ]
+}
+
+@test "two attached copies sharing the SAME UUID fail closed (no coin flip)" {
+  base_shims
+  label_blkid
+  conf_with_vhdx
+  export BLKID_UUID_DEVS="$(printf '%s\n%s' /dev/orig /dev/copy)"
+  run bash -c '. "$SCRIPT"; load_conf; ensure_mounted'
+  [ "$status" -eq 1 ]
+  printf '%s' "$output" > "$TMP/same-uuid.boot.log"
+  assert_log_lacks 'mount'
+  grep -Fq '多块' "$TMP/same-uuid.boot.log"
+  grep -Fq 'boot failed: maintenance mode' "$TMP/same-uuid.boot.log"
+}
+
+@test "write_maintenance_motd gives both copy-paste repair commands" {
+  printf 'DATA_VHDX="D:\\WSL\\agent-devbox\\data.vhdx"\nDATA_DISTRO="Ubuntu-26.04"\n' > "$AGENT_DEVBOX_CONF"
+  run bash -c '. "$SCRIPT"; load_conf; write_maintenance_motd'
+  [ "$status" -eq 0 ]
+  # 在 WSL 终端里直接粘贴（不需要切到 Windows PowerShell）。
+  grep -Fq 'cmd.exe /c "D:\WSL\agent-devbox\mount-datadisk.cmd"' "$AGENT_DEVBOX_MOTD"
+  grep -Fq 'wsl.exe --terminate Ubuntu-26.04' "$AGENT_DEVBOX_MOTD"
+  # 互操作不可用时的 PowerShell 兜底（带编号，和上面两条区分开）。
+  grep -Fq '1) D:\WSL\agent-devbox\mount-datadisk.cmd' "$AGENT_DEVBOX_MOTD"
+  grep -Fq '2) wsl --terminate Ubuntu-26.04' "$AGENT_DEVBOX_MOTD"
+}
+
 @test "DATADIR derives from DATA_MNTNAME when AGENT_DEVBOX_DATADIR is unset" {
   conf_with_mntname 'devbox-data'
   run env -u AGENT_DEVBOX_DATADIR bash -c '. "$SCRIPT"; load_conf; echo "$DATADIR"'
@@ -284,16 +504,52 @@ SH
   [ "$status" -eq 1 ]
 }
 
-@test "static guard: no Windows-tool or old-installer tokens" {
-  run grep -Eq 'wsl\.exe' "$SCRIPT"
+@test "static guard: one bare-attach interop call, no re-entrant tokens" {
+  # The ONLY Windows binary in the boot LOGIC must be the single bare attach, and
+  # that same line must carry --mount --vhd --bare. Anything else re-enters
+  # Windows from [boot] (the historical boot-loop cause). write_maintenance_motd()
+  # is the ONE place allowed to name `wsl.exe --terminate` (the user pastes it
+  # into this WSL terminal), so its body is stripped out first and checked on its
+  # own.
+  stripped="$TMP/stripped.sh"
+  motd_fn="$TMP/motd-fn.sh"
+  awk -v motdfn="$motd_fn" '
+    /^write_maintenance_motd\(\)/ { infn = 1 }
+    infn { print > motdfn; if ($0 == "}") infn = 0; next }
+    { print }
+  ' "$SCRIPT" > "$stripped"
+  [ -s "$motd_fn" ]
+
+  run grep -c 'wsl\.exe' "$stripped"
+  [ "$output" -eq 1 ]
+  run grep 'wsl\.exe' "$stripped"
+  printf '%s' "$output" | grep -Fq -- '--mount'
+  printf '%s' "$output" | grep -Fq -- '--vhd'
+  printf '%s' "$output" | grep -Fq -- '--bare'
+  run grep -Eq 'schtasks' "$stripped"
   [ "$status" -ne 0 ]
-  run grep -Eq 'schtasks\.exe' "$SCRIPT"
+  run grep -Eq 'wsl -d' "$stripped"
   [ "$status" -ne 0 ]
-  run grep -Eq '/mnt/c/Windows' "$SCRIPT"
+  run grep -Eq -- '--unmount' "$stripped"
   [ "$status" -ne 0 ]
-  run grep -Eq '/mnt/wsl' "$SCRIPT"
+  run grep -Eq -- '--shutdown' "$stripped"
   [ "$status" -ne 0 ]
-  run grep -Fq 'install-agent-devbox' "$SCRIPT"
+  run grep -Fq '/mnt/wsl' "$stripped"
+  [ "$status" -ne 0 ]
+  run grep -Fq 'install-agent-devbox' "$stripped"
+  [ "$status" -ne 0 ]
+
+  # The MOTD body must hand the user commands they can PASTE into WSL (no
+  # PowerShell detour), and must not smuggle a re-entrant call of its own.
+  run grep -Fq 'cmd.exe /c' "$motd_fn"
+  [ "$status" -eq 0 ]
+  run grep -Fq 'wsl.exe --terminate' "$motd_fn"
+  [ "$status" -eq 0 ]
+  run grep -Eq 'schtasks' "$motd_fn"
+  [ "$status" -ne 0 ]
+  run grep -Eq 'wsl -d' "$motd_fn"
+  [ "$status" -ne 0 ]
+  run grep -Eq -- '--unmount' "$motd_fn"
   [ "$status" -ne 0 ]
 }
 

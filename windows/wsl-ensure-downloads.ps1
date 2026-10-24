@@ -25,7 +25,17 @@ function Install-WslUi {
   param()
 
   $ErrorActionPreference = 'Stop'
-  $arch = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { 'arm64' } else { 'x64' }
+  $hostArch = ''
+  if (Get-Command Get-AgentDevboxHostArch -ErrorAction SilentlyContinue) {
+    try { $hostArch = Get-AgentDevboxHostArch } catch { $hostArch = '' }
+  }
+  if (-not $hostArch) {
+    $native = [Environment]::GetEnvironmentVariable('PROCESSOR_ARCHITECTURE', 'Machine')
+    if ($native -eq 'ARM64' -or $env:PROCESSOR_ARCHITEW6432 -eq 'ARM64' -or $env:PROCESSOR_ARCHITECTURE -eq 'ARM64') {
+      $hostArch = 'arm64'
+    } else { $hostArch = 'amd64' }
+  }
+  $arch = if ($hostArch -eq 'arm64') { 'arm64' } else { 'x64' }
 
   Write-Host "正在安装 wsl-ui ($arch)…"
   $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ('wslui-' + [System.IO.Path]::GetRandomFileName())

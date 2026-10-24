@@ -26,7 +26,7 @@ All installer output is Chinese, and it prints a **10-step progress banner**:
 [4/10] 导入镜像…   [5/10] 校验发行版注册…
 [6/10] 创建数据磁盘（32GB 动态）…   [7/10] 初始化数据磁盘…
 [8/10] 修复权限…   [9/10] 写入启动配置 /etc/agent-devbox.conf…
-[10/10] 注册开机自动挂载计划任务…   [完成] 重启发行版…
+[10/10] 附加数据磁盘 / 清理旧版任务…   [完成] 重启发行版…
 ```
 
 ## What the installer does
@@ -41,17 +41,19 @@ All installer output is Chinese, and it prints a **10-step progress banner**:
    the streaming tier `base = C + V` with `C` = compressed parts and
    `V` = uncompressed × 1.05 (the `ext4.vhdx` grows on demand; its 1 TiB size is
    virtual). It is re-run if the installer falls back to a tier with a higher peak;
-3. download the released rootfs and import it as the WSL distro — `agent-devbox`
+3. download the released rootfs for the host's **native** architecture (`amd64`
+   or `arm64`) and import it as the WSL distro — `agent-devbox`
    for the multi-agent build, `agent-devbox-core` for the lean build — with a
    **per-variant default install dir** (`D:\WSL\agent-devbox` for agents,
    `D:\WSL\agent-devbox-core` for core), in
-   **three tiers** (the happy path is Tier 1):
+   **three tiers** (the happy path is Tier 1; ARM64 has only Tier 1 and Tier 2,
+   see "ARM64 (Windows 11)"):
    - **Tier 1** streams the downloaded parts straight into
      `wsl --import <Distro> <InstallDir> -`; WSL2's built-in bsdtar decompresses
      zstd, so there is no `zstd.exe`, no merged `.zst`, and no `.tar`;
    - **Tier 2** merges the parts, then imports the `.tar.zst` by file path;
-   - **Tier 3** (last resort) downloads `zstd.exe`, decompresses to `.tar`, then
-     imports.
+   - **Tier 3** (last resort, x64 only) downloads `zstd.exe`, decompresses to
+     `.tar`, then imports.
    So the happy path never downloads `zstd.exe` on Windows 11 or Windows 10;
 4. verify the distro is really registered (exact name via `wsl -l -q`, plus
    `ext4.vhdx` exists and the distro launches). On failure it unregisters the
@@ -66,31 +68,34 @@ All installer output is Chinese, and it prints a **10-step progress banner**:
    fallback;
 6. fix the VHDX owner/ACLs so a non-elevated user can reopen it;
 7. write `/etc/agent-devbox.conf` (5 keys: `DATA_VHDX`, `DATA_UUID`,
-   `PASEO_PASSWORD`, `DATA_MNTNAME`, `DATA_TASK`);
-8. **always** register the hidden, **attach-only** logon Scheduled Task
-   (`agent-devbox-mount-datadisk` for agents, `agent-devbox-core-mount-datadisk`
-   for core; highest privileges) whose action runs the install dir's
-   **hidden** `mount-datadisk.ps1` (`-WindowStyle Hidden -File`). The helper
-   retries the attach 3×, writes every `wsl --mount` exit code to
-   `datadisk-attach.log`, and exits with the real code, so a failed attach is no
-   longer reported as success. It only ever runs
-   `wsl --mount --vhd "<vhdx>" --bare` (no `--type ext4`, no `--name`), with
-   `MultipleInstances IgnoreNew`; pass `-NoTask` to skip the task. The installer
-   **also attaches the disk itself** (it is already elevated) and, after the
-   restart, polls until `/mnt/devbox-data` is mounted — it now fails loudly
-   instead of leaving the distro in MAINTENANCE MODE. The Linux side does the
-   actual `mount -t ext4` (see step 9). The installer also copies the manual
-   `mount-datadisk.*` / `unmount-datadisk.*` helpers into the install dir;
-9. restart the distro. Boot (`wsl-boot.sh`) is now **pure Linux** and never calls
-   `wsl.exe` / `schtasks.exe` (the old boot-time callback re-entered WSL and caused
-   a boot loop). It finds the already-attached block device by UUID (`blkid -U`)
-   and `mount -t ext4` it at `/mnt/devbox-data`, verifies it, then binds `/home`
-   `/root` `/workspace` and starts paseo; on failure it goes to MAINTENANCE MODE.
-   Stop it with `wsl --terminate <distro>` (`wsl --shutdown` is reserved for the
-   confirmed networking-mode change, because it kills every distro). Only a Windows restart loses the attach;
-   the next start then stays in MAINTENANCE until the disk is re-attached (run
-   `mount-datadisk.cmd` in the install dir, re-run the installer, or log off/on to
-   fire the logon task) — see `wsl-persistence.md`;
+   `PASEO_PASSWORD`, `DATA_MNTNAME`, `DATA_DISTRO`);
+8. **attach the disk itself** (it is already elevated) with
+   `wsl --mount --vhd "<vhdx>" --bare` (attach only: no `--type ext4`, no
+   `--name`), and unregister any legacy `agent-devbox-mount-datadisk` /
+   `agent-devbox-core-mount-datadisk` task left by an older version. **No**
+   scheduled task is registered. After the restart the installer asserts the NEW
+   boot-log lines: `boot complete` passes, while `boot failed` fails immediately
+   with the repair commands — it never leaves the distro in MAINTENANCE MODE
+   silently. The Linux side does the actual `mount -t ext4` (see step 9). The
+   installer also copies the manual pure-batch `mount-datadisk.cmd` /
+   `unmount-datadisk.cmd` helpers into the install dir;
+9. restart the distro. Boot (`wsl-boot.sh`) now attaches the data VHDX itself:
+   unless the device is already present it makes **exactly one** bounded
+   `wsl.exe --mount --vhd <path> --bare` interop call (hard timeout, kill grace),
+   waits once for the device by UUID (`blkid -t UUID=`), falling back to the
+   `devbox-data` label, and `mount -t ext4` it at
+   `/mnt/devbox-data`, verifies it, then binds `/home` `/root` `/workspace` and
+   starts paseo. Other Windows-tool calls stay forbidden: it must never call
+   `schtasks.exe` / `wsl -d` / `--unmount` (the old boot-time callback re-entered
+   WSL and caused a boot loop). On failure it goes to MAINTENANCE MODE, logs
+   `boot failed`, and the banner gives the repair commands for both the WSL
+   terminal and Windows PowerShell. Stop the distro
+   with `wsl --terminate <distro>`, which **keeps** the attach; `wsl --shutdown`
+   detaches **all** mounted disks by design and is reserved for the confirmed
+   networking-mode change. A Windows restart always loses the attach (WSL's
+   automatic re-attach state is a VOLATILE registry key); the next start re-attaches
+   from inside the distro automatically. If that boot attach fails, see
+   `wsl-persistence.md` for the repair path;
 10. delete the downloaded parts, any merged `.zst`, and any `.tar`, after success
     and on failure.
 
@@ -115,7 +120,8 @@ See `wsl-persistence.md` for the data model, safety guarantees and upgrade steps
 
 ## Download integrity and resume
 
-The rootfs parts are multi-GB Release assets downloaded with a managed
+The rootfs parts (`rootfs-<variant>-<arch>.tar.zst.part-*`, multi-GB Release
+assets) are downloaded with a managed
 `System.Net.Http.HttpClient` (it honours the Windows system proxy, including PAC;
 no external download tool is used anywhere in `windows/*.ps1`). Two things make a
 resume safe:
@@ -134,7 +140,8 @@ resume safe:
   whose `Content-Range` does not start exactly at the local size is also discarded.
 
 After the transfer the length is checked with the output handle closed, and then
-the SHA256 is verified against the Release's `SHA256SUMS` asset. A mismatch deletes
+the SHA256 is verified against the Release's single `SHA256SUMS` asset, which
+covers the parts of both architectures. A mismatch deletes
 the file (and its sidecar) and re-downloads once. CI publishes `SHA256SUMS`
 alongside the parts; older Releases without it still install, but the installer
 warns once that only the length can be checked. A manifest that **exists but does
@@ -152,8 +159,77 @@ If an import tier fails, the installer now prints the native `wsl.exe` / `zstd.e
 output instead of discarding it, removes a stale `<InstallDir>\ext4.vhdx` left by
 the failed import (only when `wsl -l -q` succeeded and the distro is absent — an
 unknown listing counts as registered, so a live disk is never touched), and
-deletes this run's parts, so simply re-running the installer starts from a clean
-download.
+cleans up the merged files. A failed import keeps this run's parts and sidecars
+(unless the content was proven bad), so re-running the installer re-verifies
+their SHA256 and resumes; a successful import removes this run's parts.
+
+## ARM64 (Windows 11)
+
+Support scope: **Windows 11 ARM64 only, build 22000 or later**. Windows 10 ARM64
+is **not** supported: the installer rejects it early with a Chinese error, before
+downloading anything. Distro names do not change (`agent-devbox` /
+`agent-devbox-core`); only the asset names carry the architecture.
+
+CI publishes both architectures as
+`rootfs-<variant>-<arch>.tar.zst.part-*`, where `<arch>` is `amd64` or `arm64`,
+plus **one** `SHA256SUMS` that covers every part of both. The installer detects
+the native host architecture and picks the matching parts automatically, with no
+extra flag; x64 installs are unchanged.
+
+Inside the distro `uname -m` prints `aarch64` on ARM64 (`x86_64` on x64). After
+the import, and **before** `datadisk-init.sh` runs (so before any `mkfs`), the
+installer executes `uname -m` and requires the matching value: `wsl --import`
+itself does **not** validate the architecture, so without this probe a wrong-arch
+rootfs would only fail much later. On a mismatch, or when the rootfs cannot
+execute at all (`Exec format error`), the installer unregisters the just-imported
+distro, removes only its `ext4.vhdx`, keeps `data.vhdx`, leaves any already-cleaned
+parts to the normal success cleanup, and throws a readable error. A re-run
+re-verifies/re-downloads the parts.
+
+Tier 3 does not exist on ARM64: the pinned `zstd.exe` is a win64 binary. ARM64
+therefore has **Tier 1 (streaming) and Tier 2 (file import) only**. Skipping
+Tier 3 does not mark the download as suspect (`ContentSuspect` is never set), so
+the parts stay in the install dir and a retry re-verifies their SHA256 before
+resuming. If both tiers fail, run `wsl --update` and re-run the installer.
+
+An older Release that predates ARM64 support carries only
+`rootfs-*-amd64` parts. On ARM64 the install fails **before any download** with
+`没有 ARM64 分片` and tells you to use `-ReleaseTag latest` / `beta`, or to
+install on x64. There is no amd64 fallback: WSL2 does not emulate x86-64 Linux
+ELF binaries, so an amd64 rootfs cannot boot on ARM64.
+
+Architecture detection is fail-closed, in this order:
+
+1. `PROCESSOR_ARCHITEW6432`;
+2. the **machine-scope** `PROCESSOR_ARCHITECTURE` value from the registry;
+3. the process `PROCESSOR_ARCHITECTURE` environment variable;
+4. CIM `Win32_Processor.Architecture` (`12` = ARM64, `9` = x64).
+
+The machine-scope value wins deliberately: an x64-emulated PowerShell on ARM64
+reports `AMD64` in its process environment, and a 32-bit (WOW64) shell reports
+`x86`, while the machine value still says `ARM64`. If no source is recognisable,
+the installer throws instead of assuming amd64.
+
+QA on a real ARM64 device (replace `<distro>` with `agent-devbox` or
+`agent-devbox-core`):
+
+```powershell
+wsl -d <distro> -u root -e uname -m
+# => aarch64
+
+wsl -d <distro> -u root -e 'wget -q -T 5 -O /dev/null http://127.0.0.1:6767/api/health'
+# => exit code 0
+
+wsl -d <distro> -u root -e "ps -o user= -C node | sort -u"
+# => paseo
+
+wsl -d <distro> -u root -e 'script -qec "echo pty-ok" /dev/null'
+# => pty-ok
+```
+
+Also confirm that the boot log ends with `boot complete` and the data disk is
+mounted, then re-run the installer: the data disk and the password must survive
+and `uname -m` must still be `aarch64`.
 
 ## Creating the data disk: `New-VHD` probe and `diskpart` fallback
 
@@ -169,6 +245,15 @@ first probes `Get-Command New-VHD`:
   get mistaken for success.
 
 Either path ends with the same initialized ext4 disk (label `devbox-data`).
+
+Because both variants use that same label, their `data.vhdx` files are
+interchangeable: copy one into the other variant's install dir and boot resolves
+the device by UUID first (every device carrying it), then — only when no device
+carries that UUID — by the `devbox-data` label, so the copied disk (which keeps
+the source UUID) still mounts. The two variants' own disks have different UUIDs,
+so both may stay attached. If more than one device shares the resolved identity,
+boot fails closed to maintenance mode instead of picking one — detach the extra
+with the install dir's `unmount-datadisk.cmd`, then reopen the distro.
 
 ## Install log
 
@@ -207,13 +292,13 @@ cat /etc/agent-devbox.conf
 
 ## Antivirus prompt and the elevated window
 
-After registering the Scheduled Task the installer prints a warning: if
-**Huorong (火绒) / 360 / Windows Defender** pops up a prompt, click **允许
-(Allow)**. Once the task is registered the installer reads it **back** with
-`Get-ScheduledTask` (verifying its `mount-datadisk.ps1` action) and checks
-`Get-ScheduledTaskInfo`, so a silently dropped registration is caught instead of
-reported as success. The task's own result is meaningful too: the helper exits
-with `wsl --mount`'s code and logs each attempt to `datadisk-attach.log`.
+During the run the installer may trigger an antivirus prompt: if
+**Huorong (火绒) / 360 / Windows Defender** pops up, click **允许
+(Allow)**. There is no task to read back or verify: the installer attaches the
+disk in the same elevated session, and every later start attaches it from inside
+the distro. The manual repair entry is the pure-batch `mount-datadisk.cmd`, which
+logs each attempt to `datadisk-attach.log` and returns `wsl --mount`'s real exit
+code.
 
 Because `irm | iex` fetches the script in memory, there is no Mark-of-the-Web, so
 the elevated child runs with `-ExecutionPolicy RemoteSigned` rather than the
@@ -269,40 +354,52 @@ Remove-Item "$env:LOCALAPPDATA\wsl-ui\distro-metadata.json" -Force -ErrorAction 
 
 ## Maintenance mode (fail closed)
 
-`wsl-boot.sh` is pure Linux and never calls `wsl.exe` / `schtasks.exe` (the old
-boot-time callback re-entered WSL and caused a boot loop). It locates the
-already-attached block device by UUID (`blkid -U`), mounts it at
-`/mnt/devbox-data`, verifies it and binds `/home` `/root` `/workspace`. If the
-disk is not attached, the UUID does not match, or a bind does not land on the
-data disk, boot enters **MAINTENANCE MODE**: it seeds nothing, starts nothing, and
-writes a bilingual reminder to `/etc/motd` telling you to re-run the Windows
-installer:
+Every distro start runs `wsl-boot.sh`, which first attaches the data VHDX from
+inside the distro with **one** bounded `wsl.exe --mount --vhd <path> --bare` call
+(no-op when the device is already attached), then mounts it in Linux. Other Windows
+tools stay forbidden: `schtasks.exe`, `wsl -d` and `--unmount` must never be called
+from `[boot]` (the old boot-time callback re-entered WSL and caused a boot loop).
+The script finds the device by UUID (`blkid -t UUID=`, every device carrying it),
+falling back to the label `devbox-data` only when no device carries that UUID,
+and refuses to pick one if more than one device matches; it
+mounts it at `/mnt/devbox-data`, verifies it and binds `/home` `/root` `/workspace`.
+If the attach fails, the disk is not attached, no device matches the UUID or the
+label (or several do), or a bind does not land on the data disk,
+boot enters **MAINTENANCE MODE**: it seeds nothing, starts nothing, and writes a
+bilingual banner to `/etc/motd` (plus `boot failed` to the boot log) with both
+copy-pasteable forms:
 
 ```powershell
-irm https://raw.githubusercontent.com/sfhgknsdfksdlf/agent-devbox/main/windows/install.ps1 | iex
+# in the WSL terminal (copy & paste):
+cmd.exe /c "<InstallDir>\mount-datadisk.cmd"   # attach the data VHDX
+wsl.exe --terminate <distro>                   # stop it so the next start re-runs boot
+
+# or, in Windows PowerShell:
+<InstallDir>\mount-datadisk.cmd
+wsl --terminate <distro>
 ```
 
-Only a Windows restart detaches the mounted VHDX (`wsl --shutdown` is only used
-right after a confirmed networking-mode change); the next start then goes to
-MAINTENANCE until the disk is re-attached.
+Then reopen the distro; that start mounts the disk.
+
+`wsl --terminate <distro>` keeps the attach. `wsl --shutdown` detaches **all**
+mounted disks by design (it closes every distro). A Windows restart always loses the
+attach, because WSL keeps its automatic re-attach state in a **VOLATILE** registry
+key that a restart clears.
 
 ## Manual data-disk helpers
 
-The installer copies four helpers into the install dir (it fetches them from the
-project source, `main`):
+The installer copies two pure-batch helpers into the install dir (it fetches them
+from the project source, `main`). Neither needs PowerShell or administrator/UAC:
 
-```powershell
-# attach <InstallDir>\data.vhdx (bare); self-elevates once
-.\mount-datadisk.cmd
-# attach another VHDX (bare)
-.\mount-datadisk.cmd -Vhdx "D:\other\x.vhdx"
-# attach + auto-mount at /mnt/wsl/mydisk (--type ext4 --name mydisk)
-.\mount-datadisk.cmd -Vhdx "D:\other\x.vhdx" -Name mydisk
-# detach (\?\<vhdx>); self-elevates once
-.\unmount-datadisk.cmd
+```bat
+# attach <InstallDir>\data.vhdx (bare); retries 3x, logs datadisk-attach.log,
+# exits with wsl's real code
+mount-datadisk.cmd
+# attach another VHDX (bare) via the positional path argument
+mount-datadisk.cmd "D:\other\x.vhdx"
+# detach (\?\<vhdx>)
+unmount-datadisk.cmd
 ```
-
-`.cmd` and `.ps1` variants exist for each.
 
 ## Alternative — wsl-ui GUI import
 
@@ -369,14 +466,22 @@ irm https://raw.githubusercontent.com/sfhgknsdfksdlf/agent-devbox/build-20261020
 Use a `build-*` tag for stable installs, or a commit SHA; branch testing keeps
 using `-Ref`.
 
-If the distro is already installed it is **upgraded in place with no prompt**
-(no `y`/Enter question). The data disk (`/home`, `/root`, `/workspace`) is kept,
+If the distro is already installed, an interactive console asks once:
+**Enter = upgrade**, `n` = cancel (exit 0, nothing downloaded or unregistered).
+Any other answer is re-asked once, then treated as cancel. The prompt is
+skipped (the upgrade proceeds) when stdin/stdout is redirected, with `-Yes`, or
+with `-KeepExisting` (keep the current install). The data disk (`/home`,
+`/root`, `/workspace`) is kept,
 and the **paseo password is preserved**: it is stored on the data disk at
 `/mnt/devbox-data/.paseo-password` (mode 600), read back during `[7/10]`, and
 rewritten after the first install. (Installs that predate this get the password
-migrated once from the old `/etc/agent-devbox.conf`.) Use `-KeepExisting` to leave the current install untouched;
-`-Reinstall` is still accepted for compatibility (an upgrade is the default), and
-`-Yes` stays unattended (it now upgrades too).
+migrated once from the old `/etc/agent-devbox.conf`.) `-Reinstall` is still
+accepted for compatibility (an upgrade is the default), and `-Yes` stays
+unattended (it now upgrades too).
+
+> **Where the prompt shows up:** the one-liner asks in the **elevated window
+> after UAC**, before `Ensure-Wsl` and before any mirrored-networking change. So
+> cancelling cannot touch `.wslconfig` or shut WSL down.
 
 The Windows Terminal profile now has a **fixed GUID**: the image disables WSL's own profile
 generator (`/etc/wsl-distribution.conf` -> `[windowsterminal] enabled=false`, which would
@@ -414,7 +519,8 @@ or enable mirrored networking (`%UserProfile%\.wslconfig` → `[wsl2] networking
 
 ## Requirements
 
-- Windows 11 (or a WSL build that supports `wsl --mount --vhd`).
+- Windows 11 (or a WSL build that supports `wsl --mount --vhd`). Windows 11
+  ARM64 build 22000+ is supported; Windows 10 ARM64 is not.
 - PowerShell (built in). The `irm` entry fetches the installer scripts from the
   project source (`main`) with `Invoke-WebRequest`. The rootfs parts are fetched
   with the managed .NET HTTP client: it resolves the Windows system proxy
@@ -425,10 +531,12 @@ or enable mirrored networking (`%UserProfile%\.wslconfig` → `[wsl2] networking
 - `New-VHD` (Hyper-V module) if available, otherwise the built-in `diskpart`
   fallback creates the dynamic VHDX.
 - No extra program for the import itself on the happy path: WSL2's built-in bsdtar
-  decompresses the zstd stream. `zstd.exe` is only fetched as the last-resort tier.
+  decompresses the zstd stream. `zstd.exe` is only fetched as the last-resort tier
+  on x64; ARM64 skips Tier 3 entirely.
 - Manual disk helpers are fetched from the project source and copied into the
-  install dir: `mount-datadisk.cmd` / `mount-datadisk.ps1` and
-  `unmount-datadisk.cmd` / `unmount-datadisk.ps1` (each self-elevates once).
+  install dir: `mount-datadisk.cmd` and `unmount-datadisk.cmd` (pure batch, no
+  elevation/UAC; `mount-datadisk.cmd` logs `datadisk-attach.log` and returns the
+  real exit code).
 
 The `irm` one-liner and the fetched installer use the Release **only** for the
 rootfs parts; every installer script comes from the project source (`main`). The

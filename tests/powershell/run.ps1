@@ -41,6 +41,98 @@ Assert-True (-not (Resolve-YesNoDefault -Answer 'No' -DefaultYes $true)) 'YesNo:
 Assert-True (-not (Resolve-YesNoDefault -Answer '' -DefaultYes $false)) 'YesNo: Enter defaults to no'
 Assert-True (Resolve-YesNoDefault -Answer 'zzz' -DefaultYes $true) 'YesNo: unknown -> default'
 
+# --- Resolve-UpgradeAnswer (Workstream A) ---------------------------------
+# Deliberately NOT a y/N prompt: Enter (or blank) is the only affirmative;
+# anything unrecognised is re-asked once by Confirm-Upgrade, then treated as cancel.
+Assert-Equal 'upgrade' (Resolve-UpgradeAnswer '') 'upgrade-answer: Enter -> upgrade'
+Assert-Equal 'upgrade' (Resolve-UpgradeAnswer '   ') 'upgrade-answer: blank -> upgrade'
+Assert-Equal 'cancel' (Resolve-UpgradeAnswer 'n') 'upgrade-answer: n -> cancel'
+Assert-Equal 'cancel' (Resolve-UpgradeAnswer 'N') 'upgrade-answer: N -> cancel'
+Assert-Equal 'cancel' (Resolve-UpgradeAnswer 'no') 'upgrade-answer: no -> cancel'
+Assert-Equal 'cancel' (Resolve-UpgradeAnswer ' NO ') 'upgrade-answer: trimmed/case-insensitive no -> cancel'
+Assert-Equal 'again' (Resolve-UpgradeAnswer 'yes') 'upgrade-answer: yes is not affirmative -> again'
+Assert-Equal 'again' (Resolve-UpgradeAnswer 'y') 'upgrade-answer: y is not affirmative -> again'
+Assert-Equal 'again' (Resolve-UpgradeAnswer 'x') 'upgrade-answer: unknown -> again'
+
+# --- Write-CancelRelay (Workstream A) -------------------------------------
+$relayBase = Join-Path ([System.IO.Path]::GetTempPath()) ('adbox-cancel-' + [guid]::NewGuid().ToString('N'))
+$relayLog  = Join-Path (Join-Path $relayBase 'sub') 'install.log'
+try {
+  Write-CancelRelay -LogPath $relayLog -Message '已取消升级：未下载、未注销、未做任何更改。'
+  Assert-True (Test-Path -LiteralPath $relayLog) 'cancel: the relay log (and its parent dir) is created'
+  Assert-Equal '已取消升级：未下载、未注销、未做任何更改。' ((Get-Content -LiteralPath $relayLog -Raw).Trim()) 'cancel: the message is appended to the relay log'
+  Assert-Equal '0' (Get-Content -LiteralPath "$relayLog.rc" -Raw) 'cancel: the rc marker is 0 (nothing failed)'
+  Assert-Equal '1' (Get-Content -LiteralPath "$relayLog.cancel" -Raw) 'cancel: the cancel marker is 1'
+  $relayBytes = [System.IO.File]::ReadAllBytes($relayLog)
+  Assert-True (-not ($relayBytes.Length -ge 3 -and $relayBytes[0] -eq 0xEF -and $relayBytes[1] -eq 0xBB -and $relayBytes[2] -eq 0xBF)) 'cancel: the relay log has no BOM'
+  Write-CancelRelay -LogPath $relayLog -Message '第二次取消'
+  Assert-Equal 2 (@(Get-Content -LiteralPath $relayLog).Count) 'cancel: a later cancel appends instead of overwriting'
+  Write-CancelRelay -LogPath '' -Message 'no-op'
+  Assert-True $true 'cancel: an empty LogPath is a no-op (no throw)'
+} finally {
+  Remove-Item -LiteralPath $relayBase -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+# --- UI 宽度 / 换行（Workstream B，S11）-------------------------------------
+# 显示宽度必须按「单元格」算：全角中文 2 格、ASCII 1 格。String.Length 是字符数，
+# 拿它当宽度会让中文行溢出。
+Assert-Equal 7 (Get-UiTextWidth '中文abc') 'ui: CJK = 2 cells, ASCII = 1 cell'
+Assert-Equal 3 (Get-UiTextWidth 'abc') 'ui: ASCII width == character count'
+Assert-Equal 4 (Get-UiTextWidth '中文') 'ui: each CJK character is 2 cells'
+Assert-Equal 0 (Get-UiTextWidth '') 'ui: empty text has zero width'
+$uiLineW = Get-UiLineWidth
+Assert-True ($uiLineW -ge 60 -and $uiLineW -le 100) "ui: Get-UiLineWidth is clamped to [60,100] (got $uiLineW)"
+
+$cjkText = '这是一段很长的中文句子，用来测试自动换行是否遵守宽度限制，并且避免行首出现标点符号。'
+$cjkLines = @(Split-UiText -Text $cjkText -Width 12)
+$cjkWide = @($cjkLines | Where-Object { (Get-UiTextWidth $_) -gt 12 })
+Assert-Equal 0 $cjkWide.Count "ui: every wrapped line fits 12 cells (found: $($cjkWide -join ' | '))"
+$cjkBadStart = @($cjkLines | Where-Object { $_ -match '^[。，、；：！？）》」』】〕〉…,.;:!?\)\]\}]' })
+Assert-Equal 0 $cjkBadStart.Count "ui: no line starts with closing punctuation (found: $($cjkBadStart -join ' | '))"
+Assert-True (@($cjkLines).Count -gt 1) 'ui: a long Chinese sentence actually wraps'
+
+# 保护词永不被拆开（即使宽于目标宽度）。
+$keepDisk = @(Split-UiText -Text '磁盘空间不足，请清理后重试' -Width 6)
+Assert-Equal 1 (@($keepDisk | Where-Object { $_.Contains('磁盘空间不足') }).Count) 'ui: 磁盘空间不足 stays whole'
+$keepStep = @(Split-UiText -Text '请运行 [1/10] 步骤' -Width 4)
+Assert-Equal 1 (@($keepStep | Where-Object { $_.Contains('[1/10]') }).Count) 'ui: [n/10] stays whole'
+
+# 未受保护的长路径允许按单元格硬切，但每行仍不得超过宽度。
+$longPath = 'D:\WSL\agent-devbox\data\rootfs-amd64.tar.zst'
+$pathLines = @(Split-UiText -Text "安装目录：$longPath" -Width 12)
+$pathWide = @($pathLines | Where-Object { (Get-UiTextWidth $_) -gt 12 })
+Assert-Equal 0 $pathWide.Count "ui: a long path is hard-split within the width (found: $($pathWide -join ' | '))"
+Assert-Equal 1 (@($pathLines | Where-Object { $_.Contains('rootfs') }).Count) 'ui: the hard split still yields the path fragments'
+
+# 已有的换行符原样保留为独立输出行。
+Assert-Equal 2 (@(Split-UiText -Text "a`nb" -Width 80).Count) 'ui: embedded newlines become separate lines'
+
+# --- Workstream C：导入清理计划（S10）--------------------------------------
+# 纯决策：网络/导入失败必须保留分片+sidecar 让下一次续传；只有「已导入」或
+# 「内容可疑」才删除本次下载的分片；预置分片永不由清理删除。
+$plan = Get-ImportCleanupPlan -Attempted $true -Imported $true -PartsWerePreexisting $false -ContentSuspect $false
+Assert-True ($plan.RemoveMerged -and $plan.RemoveParts -and -not $plan.KeepParts) 'cleanup: success removes this run''s parts'
+$plan = Get-ImportCleanupPlan -Attempted $true -Imported $false -PartsWerePreexisting $false -ContentSuspect $false
+Assert-True ($plan.RemoveMerged -and -not $plan.RemoveParts -and $plan.KeepParts) 'cleanup: import failure keeps parts for identity-checked resume'
+$plan = Get-ImportCleanupPlan -Attempted $true -Imported $true -PartsWerePreexisting $true -ContentSuspect $false
+Assert-True ($plan.RemoveMerged -and -not $plan.RemoveParts -and -not $plan.KeepParts) 'cleanup: pre-existing parts are never removed'
+$plan = Get-ImportCleanupPlan -Attempted $true -Imported $false -PartsWerePreexisting $false -ContentSuspect $true
+Assert-True ($plan.RemoveMerged -and $plan.RemoveParts -and -not $plan.KeepParts) 'cleanup: content-suspect parts are removed'
+
+# --- Workstream C：下载诊断（代理身份不落地）-------------------------------
+$diagText = Format-DownloadDiagnostics -Attempt 3 -Retries 12 -Offset 12582912 -Total 104857600 `
+  -AverageBytesPerSec 1572864 -ProxyMode 'http://user:pass@127.0.0.1:7890' -CredentialPresent 'yes' `
+  -StatusCode 200 -Connections 4
+Assert-True ($diagText -match 'MiB/s') 'diag: includes the average speed in MiB/s'
+Assert-True ($diagText -match 'HTTP 200') 'diag: includes the last HTTP status'
+Assert-True ($diagText -match '127\.0\.0\.1:7890') 'diag: proxy is reduced to host:port'
+Assert-True ($diagText -notmatch 'user:pass') 'diag: proxy userinfo is never printed'
+Assert-True ($diagText -notmatch 'user\b' -and $diagText -notmatch 'pass\b') 'diag: neither credential component leaks'
+Assert-True ($diagText -match '凭据 yes') 'diag: credential presence is yes/no only'
+Assert-True ($diagText -match '连接 4') 'diag: includes the configured connection count'
+$diagNoProxy = Format-DownloadDiagnostics -Attempt 1 -Retries 12 -Offset 0 -Total 0 -AverageBytesPerSec 0 -ProxyMode '' -StatusCode '' -Connections 1
+Assert-True ($diagNoProxy -match '代理 none' -and $diagNoProxy -match 'HTTP n/a') 'diag: missing proxy/status render explicitly'
+
 # --- Test-ZstdBanner (issue #4) -------------------------------------------
 Assert-True (Test-ZstdBanner 'bsdtar 3.6.2 - libarchive 3.6.2 zlib/1.2.5 liblzma/5.2.5 bz2lib/1.0.8 libzstd/1.5.4') 'zstd: libzstd present -> true'
 Assert-True (-not (Test-ZstdBanner 'bsdtar 3.3.2 - libarchive 3.3.2 zlib/1.2.5.f-ipp')) 'zstd: libzstd absent -> false'
@@ -65,11 +157,54 @@ $u = [long]10193266176  # ~9.49 GiB
 $stream = Get-RequiredDiskBytes -CompressedBytes $c -UncompressedBytes $u -Tier Stream
 $merge  = Get-RequiredDiskBytes -CompressedBytes $c -UncompressedBytes $u -Tier Merge
 $legacy = Get-RequiredDiskBytes -CompressedBytes $c -UncompressedBytes $u -Tier Legacy
+$segmented = Get-RequiredDiskBytes -CompressedBytes $c -UncompressedBytes $u -Tier Segmented
 Assert-True ($stream -lt $merge) 'disk: Stream < Merge'
 Assert-True ($merge -lt $legacy) 'disk: Merge < Legacy'
 Assert-Equal $legacy ($stream + $c + $u) 'disk: Legacy - Stream = C + U'
+Assert-Equal ([long]((2 * $c) + 2147483648 + 3221225472)) $segmented 'disk: Segmented = 2C + reserve + margin'
 Assert-True (Test-DiskSpace -RequiredBytes 100 -AvailableBytes 100) 'disk: equal available passes'
 Assert-True (-not (Test-DiskSpace -RequiredBytes 100 -AvailableBytes 99)) 'disk: short available fails'
+
+# --- Workstream D：纯分段计划（S5-S9 的基础） ------------------------------
+$plan10 = @(Get-SegmentPlan -TotalBytes 10 -Connections 4)
+Assert-Equal 4 $plan10.Count 'segplan: 10/4 -> four ranges'
+Assert-Equal ([long]3) $plan10[0].Length 'segplan: 10/4 first length'
+Assert-Equal ([long]1) $plan10[3].Length 'segplan: 10/4 last short range'
+Assert-Equal ([long]9) $plan10[3].Start 'segplan: 10/4 last start'
+Assert-Equal ([long]9) $plan10[3].End 'segplan: 10/4 last end'
+$plan12 = @(Get-SegmentPlan -TotalBytes 12 -Connections 4)
+Assert-Equal 4 $plan12.Count 'segplan: 12/4 -> four equal ranges'
+Assert-Equal ([long]3) $plan12[1].Length 'segplan: 12/4 all lengths are 3'
+Assert-Equal ([long]3) $plan12[1].Start 'segplan: 12/4 second start'
+$plan1 = @(Get-SegmentPlan -TotalBytes 1 -Connections 4)
+Assert-Equal 1 $plan1.Count 'segplan: total smaller than connections yields one range'
+Assert-Equal ([long]1) $plan1[0].SegmentSize 'segplan: one byte -> one-byte segments'
+$plan5 = @(Get-SegmentPlan -TotalBytes 5 -Connections 4)
+Assert-Equal 3 $plan5.Count 'segplan: 5/4 -> 2+2+1 ranges'
+Assert-Equal ([long]4) $plan5[2].Start 'segplan: 5/4 last start'
+Assert-Equal ([long]4) $plan5[2].End 'segplan: 5/4 last end'
+Assert-Equal 0 @(Get-SegmentPlan -TotalBytes 0 -Connections 4).Count 'segplan: zero total -> no ranges'
+
+# --- 分段顺序：不依赖排序的文化相关比较（回归门）---------------------------
+# 合并分片必须按 Index 升序；直接 Sort-Object 的数字/文化比较在极端情况下
+# 会把顺序弄反，所以顺序由纯函数决定。数组和 List[object] 都必须成立。
+# 输入刻意打乱为 1,3,0,2：PS 5.1 上 Sort-Object -Property Index 对 Hashtable
+# 的不稳定排序是固定置换（0,1,2,3 -> 2,3,0,1），若输入也用 2,3,0,1 会被置换
+# 还原成 0,1,2,3 而假绿；恒等实现或 Hashtable 的 -Property 置换在这里必须失败。
+$segOrderInput = @(
+  @{ Index = 1; File = 'seg-1' }
+  @{ Index = 3; File = 'seg-3' }
+  @{ Index = 0; File = 'seg-0' }
+  @{ Index = 2; File = 'seg-2' }
+)
+if (Get-Command Get-SegmentFileOrder -ErrorAction SilentlyContinue) {
+  Assert-Equal 'seg-0,seg-1,seg-2,seg-3' (@(Get-SegmentFileOrder -Segments $segOrderInput) -join ',') 'seg-order: array input is ordered by Index'
+  $segOrderList = [System.Collections.Generic.List[object]]::new()
+  foreach ($segOrderItem in $segOrderInput) { $segOrderList.Add($segOrderItem) }
+  Assert-Equal 'seg-0,seg-1,seg-2,seg-3' (@(Get-SegmentFileOrder -Segments $segOrderList) -join ',') 'seg-order: List[object] input is ordered by Index'
+} else {
+  Assert-True $false 'seg-order: Get-SegmentFileOrder is not defined (array + List[object] order unverified)'
+}
 
 $tmp = [System.IO.Path]::GetTempPath()
 Assert-True ((Get-FreeDiskSpaceBytes -Path $tmp) -gt 0) 'disk: free space of temp > 0'
@@ -121,7 +256,7 @@ $ciText = Get-Content -Raw (Join-Path $here '..' '..' '.github' 'workflows' 'bui
 Assert-True ($ciText -notmatch 'agent-devbox-windows\.zip') 'converge: build.yml no longer packages the Windows zip'
 Assert-True ($ciText -notmatch '(?m)^\s*windows/install\.cmd\s*$') 'converge: build.yml no longer ships install.cmd'
 Assert-True ($ciText -notmatch 'windows/import-distro\.ps1') 'converge: build.yml has no import-distro'
-Assert-True ($ciText -match 'rootfs-\*-amd64\.tar\.zst\.part-\*') 'converge: build.yml keeps the rootfs parts'
+Assert-True ($ciText -match 'rootfs-\*-\*\.tar\.zst\.part-\*') 'converge: build.yml keeps the rootfs parts'
 Assert-True ($ciText -match 'agent-devbox-1panel-localapp\.zip') 'converge: build.yml keeps the 1panel zip'
 
 # Converge: the removed installer entry points stay gone.
@@ -194,7 +329,7 @@ for ($i = 0; $i -lt $dlLines.Count; $i++) {
   if ($pdIdx -lt 0 -and $dlLines[$i] -match 'script:PartsDownloaded \+= \$dest') { $pdIdx = $i }
   if ($dlCallIdx -lt 0 -and $dlLines[$i] -match 'Save-Download -Url') { $dlCallIdx = $i }
 }
-Assert-True ($pdIdx -ge 0 -and $dlCallIdx -ge 0 -and $pdIdx -lt $dlCallIdx) 'dl: the part is registered before the download so the trap can clean it'
+Assert-True ($pdIdx -ge 0 -and $dlCallIdx -ge 0 -and $pdIdx -lt $dlCallIdx) 'dl: the part is registered before the download so cleanup can find it'
 
 # --- 下载身份 / 条件续传 / 完整性 ------------------------------------------
 # 真机事故：上一个 release tag 留下的 9 MiB 残片被新 tag 的字节续上，长度正确但内容混合，
@@ -226,22 +361,225 @@ $badImportLines = @($dlLines | Where-Object { ($_ -match '--import' -or $_ -matc
 Assert-Equal 0 $badImportLines.Count "diag: no import/zstd output piped to Out-Null (found: $($badImportLines -join ' | '))"
 $diskCallLines = @($dlLines | Where-Object { $_ -match '^\s*Assert-DiskSpace\s' -and $_ -notmatch '\| Out-Null' })
 Assert-Equal 0 $diskCallLines.Count "diag: Assert-DiskSpace never leaks True (found: $($diskCallLines -join ' | '))"
-Assert-True ($ciText -match 'sha256sum rootfs-\*-amd64\.tar\.zst\.part-\*') 'ci: publishes SHA256SUMS'
+Assert-True ($ciText -match 'sha256sum rootfs-\*-\*\.tar\.zst\.part-\*') 'ci: publishes one merged SHA256SUMS'
 Assert-True ($ciText -match '(?m)^\s*SHA256SUMS\s*$') 'ci: uploads SHA256SUMS as a Release asset'
+
+# --- Workstream C structural pins (retention / slow abort / diagnostics / local parts) ---
+$trapBody = [regex]::Match($mainText, '(?m)^trap \{[\s\S]*?\r?\n\}').Value
+Assert-True ($trapBody -ne '') 'retain: the installer still has a script-scope trap'
+Assert-True ($trapBody -notmatch 'Remove-DownloadArtifacts') 'retain: the trap never deletes downloaded parts'
+Assert-True ($trapBody -match '分片' -and $trapBody -match '续传') 'retain: the trap prints the part directory + resume hint'
+Assert-True ($mainText -match '\$script:ContentSuspect\s*=\s*\$false') 'retain: ContentSuspect is initialized'
+Assert-True ($ensureText -match '\$script:ContentSuspect\s*=\s*\$true') 'retain: a terminal hash failure marks the content suspect'
+Assert-True ($mainText -match 'Get-ImportCleanupPlan') 'retain: the import finally uses the cleanup plan'
+Assert-True ($ensureText -match '\$SlowSpeedBytesPerSec') 'slow: Save-Download accepts a speed threshold'
+Assert-True ($ensureText -match '\$SlowWindowSeconds') 'slow: Save-Download accepts a window length'
+Assert-True ($ensureText -match '\$SegmentMinBytes') 'slow: Save-Download accepts the segment threshold (plumbed for D)'
+Assert-True ($ensureText -match '传输过慢') 'slow: a low-speed attempt aborts with 传输过慢'
+Assert-True ($ensureText -match 'Format-DownloadDiagnostics') 'diag: diagnostics helper exists and is used'
+Assert-True ($ensureText -match '仍在等待数据') 'diag: a heartbeat is printed while waiting for data'
+Assert-True ($ensureText -match '\.Wait\(1000\)') 'diag: ReadAsync is polled in 1 s slices'
+Assert-True ($mainText -match '\$InstallDir -Filter') 'local: seeded parts are looked up in the install dir'
+Assert-True ($mainText -notmatch '\$PSScriptRoot -Filter') 'local: the $PSScriptRoot part-glob bug is gone'
+Assert-True ($mainText -match 'Get-FileSha256') 'local: seeded parts are verified by SHA256'
+Assert-True ($mainText -match 'Get-MissingSha256Parts') 'local: a partial manifest is detected'
+Assert-True ($mainText -notmatch '分片已保留在安装目录，重跑安装器不会重新下载') 'wording: the stale unconditional claim is gone'
+Assert-True ($mainText -match '分片已保留') 'wording: the conditional retention notice is printed'
+Assert-True ($mainText -match '分片会保留') 'wording: the post-unregister warning is conditional, not a promise'
+
+# --- Workstream D 结构钉（S5-S9） ------------------------------------------
+Assert-True ($ensureText -match 'function Get-SegmentPlan') 'seg: Get-SegmentPlan exists'
+Assert-True ($ensureText -match 'function Get-DownloadSegmentDir') 'seg: segment dir helper exists'
+Assert-True ($ensureText -match 'function Get-DownloadSegmentPath') 'seg: segment path helper exists'
+Assert-True ($ensureText -match 'function Test-SegmentStateCompatible') 'seg: layout compatibility helper exists'
+Assert-True ($ensureText -match 'function Join-Segments') 'seg: streaming join helper exists'
+Assert-True ($ensureText -match 'function Save-DownloadSegmented') 'seg: segmented downloader exists'
+Assert-True ($ensureText -match 'ValidateRange\(1,\s*8\)') 'seg: -Connections is constrained to 1..8'
+Assert-True ($ensureText -match 'DefaultConnectionLimit') 'seg: raises the .NET connection limit before clients'
+Assert-True ($ensureText -match '\$SegmentMinBytes\s*=\s*16777216') 'seg: has the 16 MiB segment threshold'
+Assert-True ($ensureText -match '\$Connections\s*=\s*4') 'seg: defaults to four connections'
+Assert-True ($ensureText -match '-eq 206') 'seg: only 206 is accepted as a partial body'
+Assert-True ($ensureText -match 'SEGMENT_UNSUPPORTED') 'seg: HTTP 200 is a fallback marker'
+Assert-True ($ensureText -match '服务器不支持分段下载') 'seg: the 200 fallback is explained to the user'
+Assert-True ($ensureText -match 'Connections 1') 'seg: the 200 fallback restarts the single-stream path'
+Assert-True ($ensureText -match '\b429\b' -and $ensureText -match '\b403\b' -and $ensureText -match '\b407\b') 'seg: rate-limit statuses are handled'
+Assert-True ($ensureText -match 'SEGMENT_IDENTITY_CHANGED') 'seg: HTTP 412 has a restart path'
+Assert-True ($ensureText -match 'SEGMENT_CONTENT_BAD') 'seg: final length/SHA failures are retryable but bounded'
+Assert-True ($ensureText -match 'segmentState') 'seg: sidecar v2 carries segmentState'
+Assert-True ($ensureText -match 'connections\s*=\s*\$connections') 'seg: sidecar v2 carries connections'
+Assert-True ($ensureText -match 'segmentSize\s*=\s*\[long\]\$o\.segmentSize') 'seg: sidecar v2 carries segmentSize'
+Assert-True ($ensureText -match 'segmentCount\s*=\s*\[int\]\$o\.segmentCount') 'seg: sidecar v2 carries segmentCount'
+Assert-True ($ensureText -match 'AgentDevboxConnectionLimitSet') 'seg: the connection limit is set once per process'
+Assert-True ($mainText -match "-Tier 'Segmented'") 'disk: installer computes the segmented peak'
+Assert-True ($mainText -match '\[Math\]::Max\(\[long\]\$needStream, \[long\]\$needSegmented\)') 'disk: installer asserts max(Segmented, Stream)'
+Assert-True ($mainText -match 'Save-Download[^\r\n]*-Connections \$Connections') 'seg: installer forwards -Connections to Save-Download'
+
+# --- Workstream D 回归：分段顺序、统计回传（红门）---------------------------
+# 旧的合并路径直接 Sort-Object -Property Index，且分段执行器的进度/状态只留在
+# 局部变量里，Save-Download 无法在每轮重试后判断该走哪条路径。修复 = 纯函数定序
+# + 调用方传入的 [hashtable] $Stats，由分段执行器写回统计。
+Assert-True ($ensureText -match 'function Get-SegmentFileOrder') 'seg-order: Get-SegmentFileOrder exists'
+Assert-True ($ensureText -notmatch 'Sort-Object\s+-Property\s+Index') 'seg-order: no culture-sensitive Sort-Object -Property Index'
+Assert-True ($ensureText.Contains('Get-SegmentFileOrder -Segments $segments')) 'seg-order: the join list is ordered via Get-SegmentFileOrder -Segments $segments'
+$segFnText = [regex]::Match($ensureText, '(?s)function Save-DownloadSegmented\b[\s\S]*?\r?\n\}').Value
+Assert-True ($segFnText -match '\[hashtable\]\s+\$Stats\b') 'seg-stats: Save-DownloadSegmented takes a [hashtable] $Stats'
+Assert-True ($ensureText -match 'Save-DownloadSegmented[\s\S]{0,500}?-Stats\s+\$stats\b') 'seg-stats: the caller passes -Stats $stats to Save-DownloadSegmented'
+$saveDlText = [regex]::Match($ensureText, '(?s)function Save-Download\b[\s\S]*?\r?\n\}').Value
+Assert-True ($saveDlText -match '\$Stats\.Segmented\b') 'seg-stats: Save-Download reads $Stats.Segmented'
+Assert-True ($saveDlText -match '\$Stats\.(Offset|Bytes|LastStatus|Connections)\b') 'seg-stats: Save-Download reads $Stats.Offset/Bytes/LastStatus/Connections'
+foreach ($statProp in @('Segmented', 'Offset', 'Bytes', 'LastStatus', 'Connections')) {
+  Assert-True ($segFnText -match ('\$Stats\.{0}\s*=' -f $statProp)) "seg-stats: Save-DownloadSegmented assigns `$Stats.$statProp"
+}
+Assert-True ($segFnText -notmatch '\$Stats\s*=') 'seg-stats: Save-DownloadSegmented never reassigns $Stats (only its properties)'
+$segOrderFnIdx   = $ensureText.IndexOf('function Get-SegmentFileOrder')
+$segOrderCallIdx = $ensureText.IndexOf('Get-SegmentFileOrder -Segments $segments')
+Assert-True ($segOrderFnIdx -ge 0 -and $segOrderCallIdx -ge 0 -and $segOrderFnIdx -lt $segOrderCallIdx) 'seg-order: the ordering helper is defined before it is called'
 
 # --- 升级是幂等的：不重设密码、不需要按 y ----------------------------------
 # 密码唯一来源是数据盘（跨升级保留）。旧系统盘的 conf 读取已删除：它会为了 cat 一个文件
 # 把旧发行版整机拉起（[boot] 顺带 mount 数据盘 + 起 paseo），升级时多一次无谓的启停。
 Assert-True ($mainText -notmatch 'existingPw') 'upgrade: the installer no longer reads the old system-disk conf'
 Assert-True ($mainText -match "'--unregister'") 'upgrade: the old distro is unregistered for the upgrade'
-Assert-True ($mainText -notmatch '\[Y/n\]|\[y/N\]') 'upgrade: no y/N reinstall prompt'
+Assert-True ($mainText -notmatch 'Read-Host[^\r\n]*\[Y/n\]') 'upgrade: no interactive [Y/n] reinstall prompt'
 Assert-True ($mainText -match 'KeepExisting') 'upgrade: overwrite is the default (-KeepExisting opts out)'
+# 交互式升级确认：单一实现（Confirm-Upgrade）在共享 helper 里，入口只调用它。
+# 决策必须发生在注销/下载之前，否则「取消」会先破坏已有的安装。
+Assert-True ($ensureText -match 'function Test-InteractiveConsole') 'upgrade: interactive-console detection lives in the shared helper'
+Assert-True ($ensureText -match 'function Resolve-UpgradeAnswer') 'upgrade: answer parsing is a pure helper'
+Assert-True ($ensureText -match 'function Confirm-Upgrade') 'upgrade: a single shared confirmation helper'
+# 提示文案必须是纯函数（同一份文本被两处复用），且升级确认要拿到安装目录 +
+# 数据盘是否存在，才能区分「保留数据盘」和「新建空数据盘、不会迁移」。
+$confirmFnText = [regex]::Match($ensureText, '(?s)function Confirm-Upgrade\b[\s\S]*?\r?\n\}').Value
+Assert-True ($confirmFnText -match '\[string\]\s+\$InstallDir') 'upgrade-prompt: Confirm-Upgrade accepts [string] $InstallDir'
+Assert-True ($confirmFnText -match 'Format-UpgradePrompt') 'upgrade-prompt: Confirm-Upgrade calls Format-UpgradePrompt'
+Assert-True ($confirmFnText -match '-DataDiskPresent') 'upgrade-prompt: Confirm-Upgrade passes -DataDiskPresent'
+Assert-True ($ensureText -match '已取消升级') 'upgrade: cancel writes an explicit message'
+Assert-True ($ensureText -match 'Test-WslDistroExists') 'upgrade: distro existence is probed by the shared helper'
+Assert-True ($mainText -match 'Test-WslDistroExists') 'upgrade: the installer uses the shared existence probe'
+Assert-True ($mainText -match 'if \(\$decision -eq ''cancel''\) \{ return \}') 'upgrade: the installer returns on cancel'
+Assert-True ($mainText -match '\$import = \$decision -ne ''keep''') 'upgrade: keep/upgrade decides the import'
+Assert-True ($mainText -match '\$reinstall = \$distroExists -and \$import') 'upgrade: -KeepExisting still skips the reinstall'
+Assert-True ($mainText -match 'UpgradeConfirmed') 'upgrade: the installer accepts the entry''s prior confirmation'
+$confirmIdx = $mainText.IndexOf('Confirm-Upgrade')
+$unregIdx   = $mainText.IndexOf("'--unregister'")
+$dlIdx      = $mainText.IndexOf('Save-Download -Url')
+Assert-True ($confirmIdx -ge 0 -and $unregIdx -ge 0 -and $dlIdx -ge 0) 'upgrade: unregister and download calls are present'
+Assert-True ($confirmIdx -ge 0 -and $confirmIdx -lt $unregIdx) 'upgrade: the decision is taken BEFORE unregister'
+Assert-True ($confirmIdx -ge 0 -and $confirmIdx -lt $dlIdx) 'upgrade: the decision is taken BEFORE download'
+$wtIdx      = $mainText.IndexOf('Write-AgentDevboxTerminalProfile')
+$instDirIdx = $mainText.IndexOf('New-Item -ItemType Directory -Force -Path $InstallDir')
+$ensureIdx  = $mainText.IndexOf('$__r = Ensure-Wsl')
+$mirrorIdx  = $mainText.IndexOf('Set-MirroredNetworking -Yes:$Yes')
+Assert-True ($wtIdx -ge 0 -and $instDirIdx -ge 0 -and $ensureIdx -ge 0 -and $mirrorIdx -ge 0) 'upgrade: the installer still writes the WT profile and runs the preflight'
+Assert-True ($confirmIdx -lt $wtIdx -and $confirmIdx -lt $instDirIdx) 'upgrade: cancel precedes the WT profile and the InstallDir creation'
+Assert-True ($confirmIdx -lt $ensureIdx -and $confirmIdx -lt $mirrorIdx) 'upgrade: cancel precedes every WSL-config change'
+Assert-True ($mainText -notmatch '(?m)^\s*\$distroExists = Test-DistroExists\s*$') 'upgrade: the old silent decision block is gone'
 Assert-True ($mainText -match '\.paseo-password') 'upgrade: the password is stored on the data disk'
 Assert-True ($mainText -match 'blkid -U') 'upgrade: the data disk is mounted by UUID to read/write the password'
 Assert-True ($mainText -match 'mountpoint -q') 'upgrade: mounting is idempotent (mountpoint -q)'
 
+# --- 升级提示文案（纯函数，红门）-------------------------------------------
+# 空 -InstallDir 必须与旧文案逐字一致（老入口/无人值守路径不能变）；
+# 非空且数据盘存在 -> 明确「数据盘/密码保留」；非空且数据盘缺失 -> 明确
+# 「新建空数据盘」「不会迁移」「data.vhdx」，不能让用户误以为旧数据会跟过来。
+if (Get-Command Format-UpgradePrompt -ErrorAction SilentlyContinue) {
+  Assert-Equal '发行版 ''agent-devbox'' 已存在。回车 = 覆盖升级（数据盘/密码保留），n = 取消' `
+    (Format-UpgradePrompt -Distro 'agent-devbox' -InstallDir '' -DataDiskPresent $false) `
+    'upgrade-prompt: empty -InstallDir keeps the legacy text verbatim'
+  $promptPresent = Format-UpgradePrompt -Distro 'agent-devbox' -InstallDir 'D:\WSL\agent-devbox' -DataDiskPresent $true
+  Assert-True ($promptPresent -match '数据盘/密码保留') 'upgrade-prompt: existing data disk -> 数据盘/密码保留'
+  Assert-True ($promptPresent -notmatch '不会迁移') 'upgrade-prompt: existing data disk -> no 不会迁移 warning'
+  $promptMissing = Format-UpgradePrompt -Distro 'agent-devbox' -InstallDir 'D:\WSL\agent-devbox' -DataDiskPresent $false
+  Assert-True ($promptMissing -match '新建空数据盘') 'upgrade-prompt: missing data disk -> 新建空数据盘'
+  Assert-True ($promptMissing -match '不会迁移') 'upgrade-prompt: missing data disk -> 不会迁移'
+  Assert-True ($promptMissing -match 'data\.vhdx') 'upgrade-prompt: missing data disk -> names data.vhdx'
+} else {
+  Assert-True $false 'upgrade-prompt: Format-UpgradePrompt is not defined (legacy/present/missing text unverified)'
+}
+
 # --- 安装器不变量（原先重复写在 build.yml 的 tripwire 里，已合并到这里）-----
 Assert-True ($mainText -notmatch 'Read-Host[^\r\n]*重装') 'inv: no interactive reinstall prompt'
+# 入口只调用共享的 Confirm-Upgrade；升级提问不能写在 install.ps1 里，
+# 且必须在 Ensure-Wsl / Set-MirroredNetworking 之前（取消不得改 .wslconfig）。
+Assert-True ($webText -match 'Confirm-Upgrade') 'inv: install.ps1 calls the shared confirmation'
+Assert-True ($webText -notmatch 'Read-Host[^\r\n]*覆盖升级') 'inv: install.ps1 never prompts for the upgrade itself'
+Assert-True ($webText -notmatch 'Read-Host[^\r\n]*取消') 'inv: install.ps1 never asks to cancel directly'
+$webConfirmIdx = $webText.IndexOf('$decision = Confirm-Upgrade')
+$webEnsureIdx  = $webText.IndexOf('$r = Ensure-Wsl')
+$webMirrorIdx  = $webText.IndexOf('Set-MirroredNetworking -Yes')
+Assert-True ($webConfirmIdx -ge 0 -and $webEnsureIdx -ge 0 -and $webMirrorIdx -ge 0) 'inv: the entry still runs the preflight'
+Assert-True ($webConfirmIdx -ge 0 -and $webConfirmIdx -lt $webEnsureIdx -and $webEnsureIdx -lt $webMirrorIdx) 'inv: the entry confirms BEFORE Ensure-Wsl / Set-MirroredNetworking'
+
+# --- 安装目录：提问顺序 / 传参（红门）--------------------------------------
+# 旧实现先 UAC 提权、在提权窗口里才问安装目录（core 变体甚至在升级确认之后），
+# 于是「取消升级」之前就已经创建了目录；入口也无法把目录传给子进程。现在两个
+# 脚本都在提权/确认之前问一次，并把 -InstallDir 一路传下去；install.ps1 还要在
+# UAC argv 与安装器参数里都带上它。
+$webInstallDirIdx = $webText.IndexOf('安装目录 [')
+$webStartProcIdx  = $webText.IndexOf("Start-Process -FilePath 'powershell.exe'")
+Assert-True ($webInstallDirIdx -ge 0) 'order: install.ps1 asks for 安装目录'
+Assert-True ($webInstallDirIdx -ge 0 -and $webStartProcIdx -ge 0 -and $webInstallDirIdx -lt $webStartProcIdx) 'order: install.ps1 asks for 安装目录 BEFORE the UAC hand-off'
+Assert-True ($webInstallDirIdx -ge 0 -and $webConfirmIdx -ge 0 -and $webInstallDirIdx -lt $webConfirmIdx) 'order: install.ps1 asks for 安装目录 BEFORE the upgrade confirmation'
+
+$mainInstallDirIdx = $mainText.IndexOf('安装目录 [')
+$mainStartProcIdx  = $mainText.IndexOf("Start-Process -FilePath 'powershell.exe' -Verb RunAs")
+Assert-True ($mainInstallDirIdx -ge 0) 'order: install-agent-devbox.ps1 asks for 安装目录'
+Assert-True ($mainInstallDirIdx -ge 0 -and $mainStartProcIdx -ge 0 -and $mainInstallDirIdx -lt $mainStartProcIdx) 'order: install-agent-devbox.ps1 asks for 安装目录 BEFORE the UAC hand-off'
+Assert-True ($mainInstallDirIdx -ge 0 -and $confirmIdx -ge 0 -and $mainInstallDirIdx -lt $confirmIdx) 'order: install-agent-devbox.ps1 asks for 安装目录 BEFORE the upgrade confirmation'
+
+Assert-Equal 1 ([regex]::Matches($webText, 'Read-Host\s+"安装目录').Count) 'order: install.ps1 asks for 安装目录 exactly once'
+Assert-Equal 1 ([regex]::Matches($mainText, 'Read-Host\s+"安装目录').Count) 'order: install-agent-devbox.ps1 asks for 安装目录 exactly once'
+
+Assert-True ($webText -match 'InstallDir\s*=\s*\$InstallDir') 'dir: install.ps1 puts InstallDir into the installer args'
+Assert-True ($webText -match '\$argList[\s\S]{0,600}?-InstallDir') 'dir: install.ps1 forwards -InstallDir in the UAC argv'
+$webInstallDirMentions = ([regex]::Matches($webText, '-InstallDir')).Count
+Assert-True ($webInstallDirMentions -ge 2) "dir: install.ps1 mentions -InstallDir at least twice (got $webInstallDirMentions)"
+
+Assert-True ($webText -match 'Confirm-Upgrade[\s\S]{0,200}?-InstallDir\s+\$InstallDir') 'dir: install.ps1 passes -InstallDir to Confirm-Upgrade'
+Assert-True ($mainText -match 'Confirm-Upgrade[\s\S]{0,200}?-InstallDir\s+\$InstallDir') 'dir: install-agent-devbox.ps1 passes -InstallDir to Confirm-Upgrade'
+Assert-True ($mainText -match "'-InstallDir'") 'dir: install-agent-devbox.ps1 forwards -InstallDir in its UAC argv'
+
+$mainInstallDirCreateIdx = $mainText.IndexOf('New-Item -ItemType Directory -Force -Path $InstallDir')
+Assert-True ($mainInstallDirCreateIdx -ge 0 -and $confirmIdx -ge 0 -and $mainInstallDirCreateIdx -gt $confirmIdx) 'order: InstallDir is created only AFTER the upgrade decision'
+
+# --- 数据盘：只有真正导入且没有现存 VHDX 时才创建（红门）-------------------
+# 升级 = 换系统盘但保留数据盘；导入失败/保留现有时若还无条件建盘，会留下空盘
+# 或者覆盖已有盘。提示也必须先说明「不会迁移」，再创建。
+$distroVhdxIdx = $mainText.IndexOf('$distroExists -and -not (Test-Path -LiteralPath $VhdxPath)')
+$step6Idx      = $mainText.IndexOf("Step '[6/10]")
+$createDiskIdx = $mainText.IndexOf('正在创建数据磁盘')
+$diskBlock = if ($step6Idx -ge 0 -and $createDiskIdx -gt $step6Idx) { $mainText.Substring($step6Idx, $createDiskIdx - $step6Idx) } else { '' }
+Assert-True ($distroVhdxIdx -ge 0) 'disk: creation is gated on an existing distro with no existing VHDX'
+Assert-True ($diskBlock -match '不会迁移') 'disk: 不会迁移 is announced in [6/10] BEFORE creating the disk'
+
+# --- 镜像网络：调用结果不得泄漏到输出（红门）-------------------------------
+# Set-MirroredNetworking 返回 bool/字符串；裸调用会把 True 混进安装输出，
+# 也会让 redirect 的日志出现伪错误行。每次调用必须在同一行接 | Out-Null。
+$mirrorCalls = @()
+$mirrorBad   = @()
+foreach ($mirrorFile in @('install.ps1', 'install-agent-devbox.ps1')) {
+  $mirrorText = if ($mirrorFile -eq 'install.ps1') { $webText } else { $mainText }
+  $fileCalls = @($mirrorText -split "`r?`n" | Where-Object { $_ -match '^\s*Set-MirroredNetworking\b' })
+  $mirrorCalls += $fileCalls
+  $mirrorBad += @($fileCalls | Where-Object { $_ -notmatch '\|\s*Out-Null' } | ForEach-Object { "${mirrorFile}: $_" })
+}
+Assert-True ($mirrorCalls.Count -ge 2) "net: both installers call Set-MirroredNetworking (got $($mirrorCalls.Count))"
+Assert-Equal 0 $mirrorBad.Count "net: every Set-MirroredNetworking call pipes to Out-Null (found: $($mirrorBad -join ' | '))"
+
+# --- 取消中继：取消写成 .cancel，父窗口不得把它当成成功 ----------------------
+Assert-True ($ensureText -match 'function Write-CancelRelay') 'cancel: the relay writer lives in the shared helper'
+Assert-True ($ensureText -match '\[System\.IO\.File\]::WriteAllText\("\$LogPath\.rc", ''0''\)') 'cancel: rc is written as 0'
+Assert-True ($ensureText -match '\[System\.IO\.File\]::WriteAllText\("\$LogPath\.cancel", ''1''\)') 'cancel: the cancel marker is written'
+Assert-True ($mainText -match '\$parentLog\.cancel') 'cancel: the installer parent checks the marker'
+Assert-True ($webText -match '\$log\.cancel') 'cancel: the entry checks the marker in the original window'
+Assert-True ($webText -match '\$LogPath\.cancel') 'cancel: the elevated wrapper returns after a cancel'
+$mainCancelIdx = $mainText.IndexOf('$parentLog.cancel')
+$mainDoneIdx   = $mainText.IndexOf('安装完成')
+Assert-True ($mainCancelIdx -ge 0 -and $mainDoneIdx -ge 0 -and $mainCancelIdx -lt $mainDoneIdx) 'cancel: the installer checks the marker BEFORE printing 安装完成'
+Assert-True ($mainText -match 'Remove-Item -LiteralPath "\$parentLog\.cancel"') 'cancel: the installer parent removes the marker'
+Assert-True ($webText -match 'Remove-Item -LiteralPath "\$log\.cancel"') 'cancel: the entry original window removes the marker'
+Assert-True ($webText -notmatch '安装完成') 'cancel: install.ps1 never claims 安装完成'
+Assert-True ($webText -match '已取消升级') 'cancel: install.ps1 prints the cancel result'
 Assert-True ($mainText -match 'Assert-DiskSpace') 'inv: disk space is checked before download'
 Assert-True ($mainText -match 'Invoke-WslImportStream') 'inv: parts are streamed into wsl --import'
 Assert-True ($mainText -match 'Assert-DataDiskMounted') 'inv: the data disk is verified after restart'
@@ -297,6 +635,31 @@ try {
   Assert-True (-not (Test-DownloadSidecarIdentity -Sidecar $s -Url 'http://h/a' -Length 13)) 'id: a different length is rejected'
   Assert-True (-not (Test-DownloadSidecarIdentity -Sidecar $s -Url 'http://h/a' -Length 12 -Sha256 $shaB)) 'id: a different digest is rejected'
   Assert-True (-not (Test-DownloadSidecarIdentity -Sidecar $null -Url 'http://h/a' -Length 12)) 'id: a missing sidecar is rejected'
+  Assert-Equal 1 $s.version 'id: a v1 sidecar still reads with version 1'
+  Assert-Equal 0 $s.connections 'id: a v1 sidecar defaults connections to 0'
+  Assert-Equal '' $s.segmentState 'id: a v1 sidecar defaults segmentState to empty'
+  $segDir = Get-DownloadSegmentDir -Dest $part
+  $segPath = Get-DownloadSegmentPath -Dest $part -Index 0
+  Assert-True ($segDir.EndsWith((Join-Path '.agent-devbox-download' (Join-Path 'segments' 'rootfs-core-amd64.tar.zst.part-00')))) 'id: segment dir is below .agent-devbox-download/segments/<leaf>'
+  Assert-True ($segPath.StartsWith($segDir, [System.StringComparison]::Ordinal)) 'id: segment path is contained in its segment dir'
+  Assert-Equal 'seg-000' (Split-Path -Leaf $segPath) 'id: segment files are named seg-NNN'
+  New-Item -ItemType Directory -Path $segDir -Force | Out-Null
+  [System.IO.File]::WriteAllText($segPath, 'x')
+  $globbed = @(Get-ChildItem -Path $qa -Filter 'rootfs-core-amd64.tar.zst.part-*')
+  Assert-Equal 1 $globbed.Count 'id: nested segment files are invisible to the rootfs part glob'
+  Write-DownloadSidecar -Path $meta -Url 'http://h/a' -ETag '"v2"' -Length 12 -Sha256 $shaA -Complete $false `
+    -Connections 4 -SegmentSize 3 -SegmentCount 4 -SegmentState 'active'
+  $s2 = Read-DownloadSidecar -Path $meta
+  Assert-Equal 2 $s2.version 'id: a segmented sidecar is version 2'
+  Assert-Equal 4 $s2.connections 'id: sidecar v2 round-trips connections'
+  Assert-Equal ([long]3) $s2.segmentSize 'id: sidecar v2 round-trips segmentSize'
+  Assert-Equal 4 $s2.segmentCount 'id: sidecar v2 round-trips segmentCount'
+  Assert-Equal 'active' $s2.segmentState 'id: sidecar v2 round-trips segmentState'
+  Assert-True (Test-SegmentStateCompatible -Sidecar $s2 -Connections 4 -SegmentSize 3) 'segplan: matching layout is compatible'
+  Assert-True (-not (Test-SegmentStateCompatible -Sidecar $s2 -Connections 2 -SegmentSize 3)) 'segplan: changed connections invalidates segments'
+  Assert-True (-not (Test-SegmentStateCompatible -Sidecar $s2 -Connections 4 -SegmentSize 4)) 'segplan: changed segment size invalidates segments'
+  Assert-True (-not (Test-SegmentStateCompatible -Sidecar $null -Connections 4 -SegmentSize 3)) 'segplan: a missing sidecar is incompatible'
+  Assert-True (-not (Test-SegmentStateCompatible -Sidecar $s -Connections 4 -SegmentSize 3)) 'segplan: a v1 sidecar is incompatible with segments'
   # A sidecar that recorded no digest cannot prove identity when the caller
   # knows the expected digest (e.g. the manifest gained sums after the fact).
   $emptyMeta = [pscustomobject]@{ url = 'http://h/a'; length = [long]12; sha256 = '' }
@@ -418,23 +781,31 @@ Assert-True ($mainText -match 'devbox-data') 'name: installer uses devbox-data'
 Assert-True ($mainText -match 'DATA_MNTNAME') 'name: installer writes DATA_MNTNAME'
 Assert-True ($mainText -notmatch 'agent-devbox-data') 'name: installer drops the old agent-devbox-data'
 
-# The logon mount task runs the copied attach helper. The helper retries, logs
-# every attempt and exits with wsl's real code: `-EncodedCommand "& wsl.exe
-# --mount ..."` always exits 0, which made a failed attach look successful
-# (2026-10-21: core booted into MAINTENANCE MODE after an upgrade).
-$argsLines = @([System.IO.File]::ReadAllLines($installer) | Where-Object { $_ -match '^\s*\$actionArgs\s*=' })
-Assert-Equal 1 $argsLines.Count 'name: the task arguments are built exactly once'
-Assert-True ($argsLines[0] -match '-File') 'name: mount task action runs a script file'
-Assert-True ($argsLines[0] -match '\$attachScript') 'name: mount task action points at the attach helper'
-Assert-True ($mainText -match 'attachScript\s*=\s*Join-Path[^\r\n]*mount-datadisk\.ps1') 'name: the attach helper is mount-datadisk.ps1'
-Assert-True ($argsLines[0] -match '-WindowStyle Hidden') 'name: mount task action hides the console'
-Assert-True ($argsLines[0] -notmatch '-EncodedCommand') 'name: mount task never hides wsl failures behind EncodedCommand'
-$mountHelper = Get-Content -Raw (Join-Path $winDir 'mount-datadisk.ps1')
-Assert-True ($mountHelper -match "'--bare'") 'name: attach helper uses --bare'
-Assert-True ($mountHelper -match '\$attempts\s*=\s*3') 'name: attach helper retries the attach'
+# The manual repair helpers are pure batch now: no scheduled task exists, the
+# guest boot script attaches the disk, and a failed boot prints the install-dir
+# mount-datadisk.cmd. Both helpers call wsl.exe directly, log every attempt and
+# exit with wsl's real code. A .ps1 wrapper (and its self-elevation) must not
+# come back.
+$mountHelper = Get-Content -Raw (Join-Path $winDir 'mount-datadisk.cmd')
+Assert-True ($mountHelper -match '--mount') 'name: attach helper uses wsl --mount'
+Assert-True ($mountHelper -match '--vhd') 'name: attach helper passes --vhd'
+Assert-True ($mountHelper -match '--bare') 'name: attach helper uses --bare'
 Assert-True ($mountHelper -match 'datadisk-attach\.log') 'name: attach helper logs every attempt'
-Assert-True ($mountHelper -match 'exit \$result\.ExitCode') 'name: attach helper propagates the real exit code'
+Assert-True ($mountHelper -match '%ERRORLEVEL%') 'name: attach helper reads the real exit code'
+Assert-True ($mountHelper -match 'exit /b') 'name: attach helper propagates the real exit code'
+Assert-True ($mountHelper -notmatch '(?i)powershell') 'name: attach helper has no PowerShell'
+Assert-True ($mountHelper -notmatch 'RunAs') 'name: attach helper never self-elevates'
+$unmountHelper = Get-Content -Raw (Join-Path $winDir 'unmount-datadisk.cmd')
+Assert-True ($unmountHelper -match '--unmount') 'name: detach helper uses wsl --unmount'
+Assert-True ($unmountHelper -match [regex]::Escape('\\?\%VHDX%')) 'name: detach helper uses the \\?\ device path'
+Assert-True ($unmountHelper -notmatch '(?i)powershell') 'name: detach helper has no PowerShell'
+Assert-True ($unmountHelper -notmatch 'RunAs') 'name: detach helper never self-elevates'
+foreach ($goneHelper in @('mount-datadisk.ps1', 'unmount-datadisk.ps1')) {
+  Assert-True (-not (Test-Path -LiteralPath (Join-Path $winDir $goneHelper))) "converge: $goneHelper stays deleted"
+}
 Assert-True ($mainText -match '@\(''--mount'', ''--vhd'', \$VhdxPath, ''--bare''\)') 'name: installer attaches the disk itself before restarting'
+Assert-True ($mainText -match 'for \(\$i = 1; \$i -le 3; \$i\+\+\)') 'name: the installer retries the attach 3 times'
+Assert-True ($mainText -match 'Join-Path \$InstallDir ''mount-datadisk\.cmd''') 'name: the failure message points at mount-datadisk.cmd'
 Assert-True ($mainText -match 'Assert-DataDiskMounted') 'name: installer verifies the mount after the restart'
 Assert-True ([bool](Get-Command Assert-DataDiskMounted -ErrorAction SilentlyContinue)) 'name: Assert-DataDiskMounted helper is defined'
 # wsl --shutdown 只允许出现在「镜像网络改完 -> 用户明确 y/N 确认」这一条路径；
@@ -451,24 +822,29 @@ Assert-True ($ensureText -match 'if \(\$Unattended\)[\s\S]{0,300}return') 'shutd
 Assert-True ($ensureText -match '会关闭所有正在运行的 WSL 发行版') 'shutdown: the warning names the impact'
 Assert-True ($mainText -match 'bootLinesBefore') 'name: installer records the boot-log line count before restarting'
 Assert-True ($mainText -match 'Assert-DataDiskMounted -Distro \$Distro -MountName \$MountName -SinceLine') 'name: the mount assertion trusts only the NEW boot log lines'
-$actionLines = @([System.IO.File]::ReadAllLines($installer) | Where-Object { $_ -match 'New-ScheduledTaskAction' })
-Assert-True ($actionLines.Count -ge 1) 'name: installer has a New-ScheduledTaskAction line'
-foreach ($al in $actionLines) {
-  Assert-True ($al -match '-Argument \$actionArgs') 'name: the action uses the prebuilt argument string'
-}
-Assert-True ($mainText -match '-MultipleInstances IgnoreNew') 'name: mount task ignores new instances'
+Assert-True ($mainText -notmatch 'New-ScheduledTaskAction') 'task: no New-ScheduledTaskAction'
+Assert-True ($mainText -notmatch '(?<!Un)Register-ScheduledTask') 'task: no Register-ScheduledTask call'
+Assert-True ($mainText -notmatch 'Start-ScheduledTask') 'task: no Start-ScheduledTask call'
+Assert-True ($mainText -notmatch 'New-ScheduledTaskTrigger') 'task: no task trigger is created'
+Assert-True ($mainText -notmatch 'New-ScheduledTaskSettingsSet') 'task: no task settings are created'
+Assert-True ($mainText -notmatch '\$NoTask') 'task: the -NoTask switch is gone'
+Assert-True ($mainText -notmatch '\$TaskName') 'task: the per-variant $TaskName variable is gone'
+Assert-True ($mainText -match 'Unregister-ScheduledTask -TaskName \$oldTask\.TaskName') 'task: legacy tasks are still removed'
+Assert-True ($mainText -match 'agent-devbox\.\*-mount-datadisk') 'task: legacy tasks are discovered by name'
 
 # Manual mount/unmount helpers are copied into the install dir and fetched by install.ps1.
-Assert-True ($mainText -match 'mount-datadisk\.ps1') 'name: installer copies the mount helper'
+Assert-True ($mainText -match 'mount-datadisk\.cmd') 'name: installer copies the mount helper'
 Assert-True ($mainText -match 'unmount-datadisk\.cmd') 'name: installer copies the unmount helper'
-foreach ($h in @('mount-datadisk.ps1', 'mount-datadisk.cmd', 'unmount-datadisk.ps1', 'unmount-datadisk.cmd')) {
+foreach ($h in @('mount-datadisk.cmd', 'unmount-datadisk.cmd')) {
   Assert-True ($webText -match [regex]::Escape($h)) "converge: install.ps1 fetches $h"
 }
+Assert-True ($webText -match 'mount-datadisk\.cmd') 'converge: install.ps1 fetches the pure-batch mount helper'
+Assert-True ($webText -notmatch 'mount-datadisk\.ps1') 'converge: install.ps1 no longer fetches mount-datadisk.ps1'
+Assert-True ($webText -notmatch 'unmount-datadisk\.ps1') 'converge: install.ps1 no longer fetches unmount-datadisk.ps1'
 
 # The core variant names are wired through the installer.
 Assert-True ($mainText -match 'agent-devbox-core') 'name: installer knows agent-devbox-core'
 Assert-True ($mainText -match [regex]::Escape('D:\WSL\agent-devbox-core')) 'name: installer knows the core dir'
-Assert-True ($mainText -match [regex]::Escape('agent-devbox-core-mount-datadisk')) 'name: installer knows the core task name'
 
 # install.ps1 derives $Distro from $Variant.
 Assert-True ($webText -match "'agent-devbox-core'") 'name: install.ps1 derives the core distro name'
@@ -476,6 +852,18 @@ Assert-True ($webText -match "'agent-devbox-core'") 'name: install.ps1 derives t
 # datadisk-init takes the ext4 label as its first argument (no hardcoded name).
 Assert-True ($dataInitText -match 'LABEL="\$\{1') 'name: datadisk-init takes the label as $1'
 Assert-True ($dataInitText -notmatch 'LABEL=agent-devbox-data') 'name: datadisk-init has no hardcoded label'
+
+# --- [7/10] 数据盘 UUID 解析：标签优先，旧 conf 只作兜底（两个变体可互换 data.vhdx） ---
+# 复制另一个变体的 data.vhdx 时，复制盘保留源盘 UUID；若先信旧 conf 就会拿到过期 UUID，
+# 永远走不到标签查找。顺序必须是「datadisk-init UUID -> 标签 -> 旧 conf」。
+Assert-True ($mainText -match '数据盘 UUID 已变化') 'disk: a changed data-disk UUID is reported (cross-variant copy)'
+Assert-True ($mainText -match '\$confUuid') 'disk: the old conf UUID is kept separately as a hint'
+$labelIdx = $mainText.IndexOf('blkid -t LABEL=')
+$confIdx  = $mainText.IndexOf("sed -n 's/^DATA_UUID=//p'")
+Assert-True ($labelIdx -ge 0) 'disk: the label lookup is present'
+Assert-True ($confIdx -ge 0) 'disk: the old-conf hint is still read'
+Assert-True ($labelIdx -ge 0 -and $confIdx -ge 0 -and $labelIdx -lt $confIdx) 'disk: the label lookup is tried BEFORE the old-conf hint'
+Assert-True ($mainText -match '匹配到多个不同的 UUID') 'disk: ambiguous label matches fail closed'
 
 # Installer hardening (New-VHD / persistent log / task verification).
 Assert-True ($mainText -match 'Get-Command\s+New-VHD') 'fix: installer probes Get-Command New-VHD'
@@ -487,30 +875,98 @@ Assert-True ($mainText -match 'Start-Transcript -Path \$script:InstallLog') 'log
 Assert-True ($mainText -match 'Copy-Item -LiteralPath \$LogPath -Destination \$script:InstallLog') 'log: relay log copied into the InstallDir'
 Assert-True ($mainText -match 'cat /etc/agent-devbox.conf') 'log: password retrieval command is shown'
 Assert-True ($mainText -notmatch '已生成 paseo 密码：') 'log: password is never printed'
-Assert-True ($mainText -match 'Get-ScheduledTaskInfo') 'task: registration result is checked'
-Assert-True ($mainText -match 'needRegister') 'task: registration is idempotent (needRegister gate)'
-Assert-True ($mainText -match '跳过重复注册') 'task: an identical task is not re-registered'
-Assert-Equal 1 ([regex]::Matches($mainText, 'Register-ScheduledTask -TaskName').Count) 'task: exactly one Register-ScheduledTask call'
-$checkIdx = $mainText.IndexOf('$existingTask = Get-ScheduledTask')
-$regIdx   = $mainText.IndexOf('Register-ScheduledTask -TaskName')
-Assert-True ($checkIdx -ge 0 -and $regIdx -ge 0 -and $checkIdx -lt $regIdx) 'task: the existing task is inspected BEFORE registering'
-$gateIdx  = $mainText.IndexOf('if ($needRegister) {')
-$unregIdx = $mainText.IndexOf('Unregister-ScheduledTask -TaskName')
-Assert-True ($gateIdx -ge 0 -and $unregIdx -ge 0 -and $gateIdx -lt $unregIdx) 'task: unregister only happens on a real change'
 Assert-True ($mainText -match 'Start-Sleep -Seconds 10') 'task: interactive hold is present'
 Assert-True ($mainText -match '火绒') 'task: AV allow prompt is present'
 Assert-True ($mainText -match '-not \$Yes') 'task: hold is gated on -not $Yes'
-# 电池策略：New-ScheduledTaskSettingsSet 默认禁用电池启动（DisallowStartIfOnBatteries=
-# StopIfGoingOnBatteries=$true）。笔记本拔电登录 -> 任务不跑 -> 数据盘没附加 -> 维护模式。
-Assert-True ($mainText -match '-AllowStartIfOnBatteries') 'task: the logon task starts on battery'
-Assert-True ($mainText -match '-DontStopIfGoingOnBatteries') 'task: the logon task is not stopped on battery'
-Assert-True ($mainText -match 'DisallowStartIfOnBatteries') 'task: idempotence compares DisallowStartIfOnBatteries'
-Assert-True ($mainText -match 'StopIfGoingOnBatteries') 'task: idempotence compares StopIfGoingOnBatteries'
-# 残留任务清理：任务名带变体名；只清「发行版已注销」或「VHDX 不存在」的条目。
-Assert-True ($mainText -match "agent-devbox\.\*-mount-datadisk") 'task: stale mount tasks are discovered by name'
-Assert-True ($mainText -match 'Unregister-ScheduledTask -TaskName \$staleTask') 'task: stale mount tasks are unregistered'
-Assert-True ($mainText.Contains('if ($staleTask.TaskName -eq $TaskName) { continue }')) 'task: the task being installed is never cleaned up'
+# 计划任务已彻底移除：安装器只清理旧版本注册的任务，并自己 attach 一次。
+# conf 现在正好 5 个键（DATA_TASK 已随计划任务一起删除）。
+Assert-True ($mainText -match 'DATA_DISTRO=\$\(Quote-Bash \$Distro\)') 'conf: installer writes DATA_DISTRO'
+Assert-True ($mainText -notmatch 'DATA_TASK') 'conf: installer no longer writes DATA_TASK'
 
+# --- boot failed 立即失败 + 可粘贴的修复命令 ------------------------------
+$diskFn = [regex]::Match($ensureText, 'function Assert-DataDiskMounted[\s\S]*?\r?\n\}').Value
+Assert-True ($diskFn -ne '') 'repair: Assert-DataDiskMounted 仍存在'
+Assert-True ($diskFn -match '\[Parameter\(Mandatory\)\]\[string\] \$InstallDir') 'repair: Assert-DataDiskMounted 接收 -InstallDir'
+Assert-True ($diskFn -match "'FATAL\|boot failed'") 'repair: boot failed 立即判定失败（不再空等 45 秒）'
+Assert-True ($diskFn -match 'Join-Path \$InstallDir ''mount-datadisk\.cmd''') 'repair: 失败消息给出 mount-datadisk.cmd 的绝对路径'
+Assert-True ($diskFn -match 'wsl --terminate') 'repair: 失败消息给出 wsl --terminate <发行版>'
+Assert-True ($mainText -match 'Assert-DataDiskMounted[^\r\n]*-InstallDir \$InstallDir') 'repair: 安装器把安装目录传给挂载断言'
+
+# --- PS 5.1 分片顺序脚本（无 BOM / 纯 ASCII，红门）------------------------
+# run.ps1 由 pwsh 跑，但生产主机是 PS 5.1；顺序逻辑必须在 5.1 下单独验证。
+# 这里只钉住该脚本的交付形态：存在、无 BOM、纯 ASCII（非 ASCII 在 5.1 的
+# ANSI 解码下会被破坏）。
+$ps51OrderPath  = Join-Path $here 'ps51-order.ps1'
+$ps51OrderBytes = if (Test-Path -LiteralPath $ps51OrderPath) { [System.IO.File]::ReadAllBytes($ps51OrderPath) } else { $null }
+Assert-True ($null -ne $ps51OrderBytes) 'ps51: tests/powershell/ps51-order.ps1 exists'
+Assert-True ($null -ne $ps51OrderBytes -and -not ($ps51OrderBytes.Length -ge 3 -and $ps51OrderBytes[0] -eq 0xEF -and $ps51OrderBytes[1] -eq 0xBB -and $ps51OrderBytes[2] -eq 0xBF)) 'ps51: the order script has no UTF-8 BOM'
+$ps51NonAscii = @()
+if ($null -ne $ps51OrderBytes) { $ps51NonAscii = @($ps51OrderBytes | Where-Object { $_ -gt 0x7F }) }
+Assert-Equal 0 $ps51NonAscii.Count "ps51: the order script is ASCII only (found $($ps51NonAscii.Count) non-ASCII bytes)"
+
+# --- 架构探测（纯映射，fail closed）--------------------------------------
+Assert-Equal 'amd64' (ConvertTo-AgentDevboxArch -ProcessorArchitecture 'AMD64') 'arch: native x64 -> amd64'
+Assert-Equal 'amd64' (ConvertTo-AgentDevboxArch -ProcessorArchitecture 'x86_64') 'arch: x86_64 alias -> amd64'
+Assert-Equal 'arm64' (ConvertTo-AgentDevboxArch -ProcessorArchitecture 'ARM64') 'arch: native ARM64 -> arm64'
+Assert-Equal 'arm64' (ConvertTo-AgentDevboxArch -ProcessorArchitecture 'aarch64') 'arch: aarch64 alias -> arm64'
+Assert-Equal 'amd64' (ConvertTo-AgentDevboxArch -ProcessorArchitecture 'x86' -ProcessorArchitectureW6432 'AMD64') 'arch: 32-bit PS on x64 -> amd64'
+Assert-Equal 'arm64' (ConvertTo-AgentDevboxArch -ProcessorArchitecture 'x86' -ProcessorArchitectureW6432 'ARM64') 'arch: WOW64 on ARM64 -> arm64'
+Assert-Equal 'arm64' (ConvertTo-AgentDevboxArch -ProcessorArchitecture 'AMD64' -MachineArchitecture 'ARM64') 'arch: x64-emulated PS on ARM64 -> arm64'
+Assert-Equal 'arm64' (ConvertTo-AgentDevboxArch -CimArchitecture 12) 'arch: CIM 12 -> arm64'
+Assert-Equal 'amd64' (ConvertTo-AgentDevboxArch -CimArchitecture 9) 'arch: CIM 9 -> amd64'
+Assert-Equal 'arm64' (Get-AgentDevboxHostArch -ProcessorArchitectureW6432 '' -ProcessorArchitecture 'AMD64' -MachineArchitecture 'ARM64' -CimArchitecture 0) 'arch: host helper honours injected sources'
+$archUnknown = $false
+try { ConvertTo-AgentDevboxArch -ProcessorArchitecture 'x86' -CimArchitecture 0 | Out-Null } catch {
+  $archUnknown = $true
+  Assert-True ($_.Exception.Message -match '无法确定 Windows 处理器架构') 'arch: unknown names all sources'
+}
+Assert-True $archUnknown 'arch: unknown fails closed'
+$hostUnknown = $false
+try { Get-AgentDevboxHostArch -ProcessorArchitectureW6432 'x86' -MachineArchitecture 'x86' -ProcessorArchitecture 'x86' -CimArchitecture 0 | Out-Null } catch { $hostUnknown = $true }
+Assert-True $hostUnknown 'arch: host helper fails closed'
+Assert-True ($helperText -match 'Get-AgentDevboxHostArch') 'arch: wsl-ui uses the shared helper'
+Assert-True ($helperText -notmatch '\$arch = if \(\$env:PROCESSOR_ARCHITECTURE') 'arch: wsl-ui no longer trusts process env alone'
+
+# --- 按架构选择 rootfs（安装器）-----------------------------------------
+Assert-True ($mainText -match '\$Arch\s*=\s*Get-AgentDevboxHostArch') 'arch: installer resolves host architecture'
+Assert-True ($mainText -match 'rootfs-\$Variant-\$Arch\.tar\.zst') 'arch: rootfs stem uses $Arch'
+Assert-True ($mainText -notmatch 'rootfs-\$Variant-amd64') 'arch: no hardcoded amd64 rootfs name'
+Assert-True ($mainText -match '没有 ARM64 分片') 'arch: old amd64-only release is explained'
+Assert-True ($mainText -match 'Windows 10 ARM64') 'arch: Windows 10 ARM64 rejected readably'
+Assert-True ($mainText -match '\$osBuild -lt 22000') 'arch: ARM64 gate requires Windows 11 build 22000'
+Assert-True ($mainText.Contains('在 ''$ReleaseTag'' Release 中未找到')) 'arch: non-ARM64 hosts keep the old missing-parts error'
+$archIdx  = $mainText.IndexOf('$Arch = Get-AgentDevboxHostArch')
+$dlIdx    = $mainText.IndexOf('Save-Download -Url')
+$unregIdx = $mainText.IndexOf('--unregister')
+Assert-True ($archIdx -ge 0 -and $dlIdx -ge 0 -and $archIdx -lt $dlIdx) 'arch: resolves before download'
+Assert-True ($archIdx -ge 0 -and $unregIdx -ge 0 -and $archIdx -lt $unregIdx) 'arch: resolves before any unregister'
+
+# --- ARM64 Tier 3 跳过与导入后架构探针 -----------------------------------
+$skipIdx = $mainText.IndexOf('ARM64 不提供 Tier 3')
+$zstdIdx = $mainText.IndexOf('Get-ZstdExe -InstallDir')
+Assert-True ($skipIdx -ge 0 -and $zstdIdx -ge 0 -and $skipIdx -lt $zstdIdx) 'tier3: ARM64 skips before zstd.exe'
+$skipText = if ($skipIdx -ge 0 -and $zstdIdx -gt $skipIdx) { $mainText.Substring($skipIdx, $zstdIdx - $skipIdx) } else { '' }
+Assert-True ($skipText -notmatch 'ContentSuspect') 'tier3: skip keeps parts (no suspect flag)'
+Assert-True ($mainText -match "\`$Arch -eq 'arm64'") 'tier3: skip is arch-gated'
+$probeIdx = $mainText.IndexOf('uname -m')
+$initIdx  = $mainText.IndexOf('/usr/local/bin/datadisk-init.sh')
+Assert-True ($probeIdx -ge 0 -and $initIdx -ge 0 -and $probeIdx -lt $initIdx) 'arch: uname probe precedes datadisk-init'
+Assert-True ($mainText -match 'aarch64') 'arch: expected ARM64 uname is aarch64'
+Assert-True ($mainText -match 'x86_64') 'arch: expected x64 uname is x86_64'
+Assert-True ($mainText -match 'ARCH_MISMATCH') 'arch: mismatch is reported'
+Assert-True ($mainText -match 'Exec format error') 'arch: unexecutable rootfs is explained'
+Assert-True ($mainText -match '\$expectedMachine = if \(\$Arch -eq ''arm64''\)') 'arch: expected uname is derived from the host arch'
+Assert-True ($mainText -match '\$initExit -ne 0 -and') 'arch: mismatch throw requires a non-zero exit'
+
+# --- CI: 原生双架构导出 + 合并发布 --------------------------------
+Assert-True ($ciText -match 'upload-artifact') 'ci: per-arch rootfs artifact'
+Assert-True ($ciText -match 'download-artifact') 'ci: publish downloads artifacts'
+Assert-True ($ciText -match 'merge-multiple:\s*true') 'ci: artifacts merge into one dir'
+Assert-True ($ciText -match 'usr/bin/dash') 'ci: export checks the rootfs ELF'
+Assert-True ($ciText -match 'zstd -dc \| tar -xOf - usr/bin/dash') 'ci: split parts are arch-checked'
+Assert-True ($ciText -notmatch '--platform linux/amd64') 'ci: no hardcoded amd64 platform'
+Assert-True ($ciText -match 'retention-days:\s*3') 'ci: transient artifacts expire'
+Assert-True ($ciText -match 'needs: \[plan, export\]') 'ci: publish waits for both exports'
 
 Write-Host ''
 if ($script:Failed -gt 0) {

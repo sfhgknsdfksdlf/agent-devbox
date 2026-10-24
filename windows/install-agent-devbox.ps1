@@ -4,15 +4,15 @@
 
 .DESCRIPTION
   - 按变体导入镜像并让两个变体并存：agents 变体导入为 `agent-devbox`，core 变体
-    导入为 `agent-devbox-core`（各自独立的发行版名 / 安装目录 / 计划任务名）。
+    导入为 `agent-devbox-core`（各自独立的发行版名 / 安装目录）。
   - 默认安装目录：agents = D:\WSL\agent-devbox，core = D:\WSL\agent-devbox-core。
   - 创建并挂载一块 32GB 动态 VHDX 数据磁盘并初始化。
   - 数据盘的 ext4 标签与挂载名统一为 `devbox-data`（两个变体共用同一标签，同一块
     数据盘在任一发行版下都能识别）。
   - 把数据磁盘接入发行版，使 /home、/root、/workspace 在镜像升级后依然保留。
-  - 始终注册一个登录时自动挂载数据磁盘的计划任务（attach-only：只以 `--bare` 接入
-    裸磁盘，由发行版启动脚本按 UUID 挂载；命令经 -EncodedCommand 隐藏执行，不弹空白
-    `wsl.exe` 控制台窗口，也避免启动脚本被再次触发而重入；可用 -NoTask 跳过）。
+  - 完全不注册任何计划任务：数据盘由发行版开机时的 guest 侧 wsl-boot.sh 自己 attach。
+    boot 失败时维护横幅会打印安装目录里的 `mount-datadisk.cmd`；安装器只负责删除旧版本
+    注册过的计划任务（不接管、不再注册）。
 
   幂等：可重复运行；只创建缺失的部分（发行版 / 数据磁盘），并刷新启动配置；
   已存在的数据磁盘永远不会被重新格式化。
@@ -34,7 +34,8 @@ param(
   [switch] $Yes,
   [switch] $Reinstall,
   [switch] $KeepExisting,
-  [switch] $NoTask,
+  [switch] $UpgradeConfirmed,
+  [ValidateRange(1, 8)] [int] $Connections = 4,
   [string] $LogPath = ''
 )
 
@@ -46,9 +47,12 @@ $env:WSL_UTF8 = '1'
 $ErrorActionPreference = 'Stop'
 $script:RunStamp    = Get-Date -Format 'yyyyMMdd-HHmmss'
 $script:InstallLog  = ''
-# 本次运行下载的分片：失败路径（trap / 导入失败）要把它们连同 sidecar 一起删掉，
-# 否则下一次运行会把一个坏分片当成「已下载」继续用。
+# 本次运行下载的分片：网络/导入失败时保留（连同 sidecar），下一次运行会重新校验
+# 身份并续传；只有确认内容可疑或导入成功时才由清理计划删除。
 $script:PartsDownloaded = @()
+# 分片内容被证明可疑（Tier 3 zstd 解压失败 / SHA256 连续失败）时为 $true：
+# 清理计划此时才允许删除本次下载的分片。
+$script:ContentSuspect  = $false
 $ProgressPreference    = 'SilentlyContinue'
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 
@@ -59,26 +63,41 @@ $VhdxName  = 'data.vhdx'
 $Repo      = 'sfhgknsdfksdlf/agent-devbox'
 $ConfPath  = '/etc/agent-devbox.conf'
 
-# 变体映射：只有发行版名 / 安装目录 / 计划任务名按变体区分，数据盘标签与挂载名统一。
-# $Variant 选定后（见下方变体选择块）再据此展开为 $Distro / $TaskName。
+# 变体映射：只有发行版名 / 安装目录按变体区分，数据盘标签与挂载名统一。
+# $Variant 选定后（见下方变体选择块）再据此展开为 $Distro。
 $VariantMap = @{
   agents = [pscustomobject]@{
-    Distro = 'agent-devbox'; InstallDir = 'D:\WSL\agent-devbox'; TaskName = 'agent-devbox-mount-datadisk'
+    Distro = 'agent-devbox'; InstallDir = 'D:\WSL\agent-devbox'
     TerminalGuid = '{6f4a1c2e-8b3d-4a97-9c51-0e7d2b8f3a64}'
     HideGuid     = '{04014822-8112-5520-a687-27d5f19a9da6}'
   }
   core = [pscustomobject]@{
-    Distro = 'agent-devbox-core'; InstallDir = 'D:\WSL\agent-devbox-core'; TaskName = 'agent-devbox-core-mount-datadisk'
+    Distro = 'agent-devbox-core'; InstallDir = 'D:\WSL\agent-devbox-core'
     TerminalGuid = '{c2d7e9a4-3f61-4b08-8e52-7a1d9c4b6f30}'
     HideGuid     = '{82ea5eb7-e460-5790-9192-d6a59b44f009}'
   }
 }
 
 # --- 输出辅助：统一的进度 / 提示样式 ----------------------------------------
-function Step([string]$m) { Write-Host $m -ForegroundColor Cyan }
-function Ok([string]$m)   { Write-Host $m -ForegroundColor Green }
-function Warn([string]$m) { Write-Host $m -ForegroundColor Yellow }
-function Err([string]$m)  { Write-Host $m -ForegroundColor Red }
+# 折行 / 宽度感知由 wsl-ensure.ps1 的共享 UI 辅助提供；拿不到时退回普通 Write-Host
+# （安装器可能在只取回部分脚本的旧环境里运行）。
+function Step([string]$m) {
+  if (Get-Command Write-UiSection -ErrorAction SilentlyContinue) { Write-UiSection -Text $m; return }
+  Write-Host ''
+  Write-Host "==> $m" -ForegroundColor Cyan
+}
+function Ok([string]$m) {
+  if (Get-Command Write-UiLine -ErrorAction SilentlyContinue) { Write-UiLine -Text "  - $m" -Color Green; return }
+  Write-Host "  - $m" -ForegroundColor Green
+}
+function Warn([string]$m) {
+  if (Get-Command Write-UiLine -ErrorAction SilentlyContinue) { Write-UiLine -Text "  ! $m" -Color Yellow; return }
+  Write-Host "  ! $m" -ForegroundColor Yellow
+}
+function Err([string]$m) {
+  if (Get-Command Write-UiLine -ErrorAction SilentlyContinue) { Write-UiLine -Text "  x $m" -Color Red; return }
+  Write-Host "  x $m" -ForegroundColor Red
+}
 
 # Shared helpers live in wsl-ensure.ps1 (Invoke-Native, Quote-NativeArg, disk
 # math, streaming import, distro verification). Dot-source early so EVERY code
@@ -96,7 +115,11 @@ function Test-Admin {
 }
 
 function Get-WslDistros { Invoke-Native 'wsl.exe' @('-l', '-q') | ForEach-Object { "$_".Trim() } | Where-Object { $_ } }
-function Test-DistroExists { (Get-WslDistros) -contains $Distro }
+# Thin wrapper: the authoritative probe is shared with the entry (never throws).
+function Test-DistroExists {
+  if (Get-Command Test-WslDistroExists -ErrorAction SilentlyContinue) { return (Test-WslDistroExists -Distro $Distro) }
+  return ((Get-WslDistros) -contains $Distro)
+}
 
 # 解析版本选择：beta -> 最近的 beta-* 预发布；裸 YYYYMMDD.HHMM -> build-*；其余原样。
 function Resolve-ReleaseTag {
@@ -132,10 +155,31 @@ if (-not $PSBoundParameters.ContainsKey('Variant') -and -not $Yes -and [Environm
   else { $Variant = 'agents' }
 }
 
-# 应用变体映射：按选定变体展开发行版名 / 计划任务名（安装目录在决定安装目录处展开）。
+# 应用变体映射：按选定变体展开发行版名。
 $v        = $VariantMap[$Variant]
 $Distro   = $v.Distro
-$TaskName = $v.TaskName
+
+# --- 决定安装目录（必须早于 UAC 提权与升级确认）------------------------------
+# 提权子进程只能靠 -InstallDir 收到用户的选择，升级提示也要显示同一个目录。
+# 默认值随变体变化；-Yes / 重定向 / 非交互一律用默认值，绝不阻塞。
+# 这里只确定路径，目录本身仍然等到 [1/10] 之后才真正创建（取消升级不留痕迹）。
+if (-not $InstallDir) {
+  $default = $VariantMap[$Variant].InstallDir
+  $__dirInteractive = if (Get-Command Test-InteractiveConsole -ErrorAction SilentlyContinue) {
+    Test-InteractiveConsole
+  } else {
+    [Environment]::UserInteractive
+  }
+  if ($Yes -or -not $__dirInteractive) {
+    $InstallDir = $default
+  } else {
+    $answer = Read-Host "安装目录 [$default]（直接回车使用默认值）"
+    $InstallDir = if ([string]::IsNullOrWhiteSpace($answer)) { $default } else { $answer }
+  }
+}
+$InstallDir = $InstallDir.Trim()
+if ($InstallDir -notmatch '^[A-Za-z]:\\$') { $InstallDir = $InstallDir.TrimEnd('\') }
+if ([string]::IsNullOrWhiteSpace($InstallDir)) { $InstallDir = $VariantMap[$Variant].InstallDir }
 
 # --- 提权一次（UAC）：提权子进程写日志，原窗口等待后回显整份日志 ------------
 if (-not (Test-Admin)) {
@@ -146,7 +190,9 @@ if (-not (Test-Admin)) {
   if ($ReleaseTag) { $argv += @('-ReleaseTag', $ReleaseTag) }
   if ($Yes)        { $argv += '-Yes' }
   if ($Reinstall)  { $argv += '-Reinstall' }
-  if ($NoTask)     { $argv += '-NoTask' }
+  if ($KeepExisting) { $argv += '-KeepExisting' }
+  if ($UpgradeConfirmed) { $argv += '-UpgradeConfirmed' }
+  $argv += @('-Connections', "$Connections")
 
   $parentLog = if ($LogPath) { $LogPath } else {
     $scratch = Join-Path $env:LOCALAPPDATA 'agent-devbox'
@@ -174,6 +220,12 @@ if (-not (Test-Admin)) {
     $rcPath = "$parentLog.rc"
     if (Test-Path -LiteralPath $rcPath) { $rc = [int](Get-Content -LiteralPath $rcPath) }
     elseif ($p -and $null -ne $p.ExitCode) { $rc = [int]$p.ExitCode }
+    # A cancel exits 0 but changed NOTHING: never let it fall through to the
+    # success message.
+    if (Test-Path -LiteralPath "$parentLog.cancel") {
+      Warn '已取消升级（未做任何更改）。'
+      exit 0
+    }
     if ($rc -eq 3010) { Warn 'WSL 已安装完成；请重启 Windows 后再次运行本安装脚本。'; exit 0 }
     if ($rc -ne 0) { Err "安装失败（退出码 $rc）。"; exit $rc }
     # 从“当前（非提权）用户”角度确认发行版可见——WSL 发行版按用户注册。
@@ -188,8 +240,28 @@ if (-not (Test-Admin)) {
   } finally {
     Remove-Item -LiteralPath $parentLog -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath "$parentLog.rc" -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath "$parentLog.cancel" -Force -ErrorAction SilentlyContinue
   }
 }
+
+# --- 升级确认：只在交互式控制台问一次（回车 = 覆盖升级，n = 取消）-----------
+# 决策必须发生在任何改动之前：此刻还没有 WT profile、没有 Ensure-Wsl、没有下载、
+# 也没有注销。Test-WslDistroExists 在 WSL 缺失时安全返回 $false（-> 按全新安装）。
+# 入口（install.ps1）已经问过时带 -UpgradeConfirmed，这里不再重复提问。
+# 没有 wsl-ensure.ps1 时（降级路径）跳过确认，保持旧的「静默升级」行为。
+$distroExists = $false
+$decision = 'upgrade'
+if ($__haveEnsure) {
+  $distroExists = Test-WslDistroExists -Distro $Distro
+  $decision = if ($UpgradeConfirmed) {
+    if ($KeepExisting -and $distroExists) { 'keep' } else { 'upgrade' }
+  } else {
+    Confirm-Upgrade -Distro $Distro -Yes:$Yes -KeepExisting:$KeepExisting -LogPath $LogPath -InstallDir $InstallDir
+  }
+}
+if ($decision -eq 'cancel') { return }
+$import = $decision -ne 'keep'
+$reinstall = $distroExists -and $import
 
 # --- Windows Terminal profile：固定 GUID（跨重装不变）------------------------
 # WSL 每次 `wsl --import` 都会按注册表 GUID 生成一条 WT profile；重装换 GUID 后用户
@@ -225,11 +297,13 @@ function Save-InstallTranscript {
 trap {
   try { Write-Host "安装失败：$($_.Exception.Message)" -ForegroundColor Red } catch {}
   try { Write-Host ($_ | Out-String) } catch {}
-  # 失败时删掉本次下载的分片与 sidecar：绝不能让一个坏分片在下一次运行里被当成
-  # 「已下载/可续传」继续用（那正是「长度对、内容错、三级全败」的成因）。
+  # 失败时绝不删除已下载的分片与 sidecar：下一次运行会用 sidecar 里的身份
+  # （URL / ETag / 长度 / SHA256）重新校验，再从这里续传。
   try {
-    foreach ($p in @($script:PartsDownloaded)) {
-      if (Get-Command Remove-DownloadArtifacts -ErrorAction SilentlyContinue) { Remove-DownloadArtifacts -Dest $p }
+    if (@($script:PartsDownloaded).Count -gt 0) {
+      $partDir = if ($InstallDir) { $InstallDir } else { $PSScriptRoot }
+      Write-Host ("已下载的分片保留在：{0}" -f $partDir)
+      Write-Host '重跑安装器会校验分片身份并续传（无需重新下载）。'
     }
   } catch {}
   if ($script:Logging -and $script:RcPath) {
@@ -240,6 +314,12 @@ trap {
 }
 if ($script:Logging) {
   Start-Transcript -Path $LogPath -Force | Out-Null
+}
+
+# 无人值守/提前确认：在下载和注销之前就把“空数据盘”说清楚，不能只等到 [6/10]。
+# 必须在 Start-Transcript 之后，否则提权窗口回显的日志里看不到这条告警。
+if ($distroExists -and -not (Test-Path -LiteralPath (Join-Path $InstallDir $VhdxName))) {
+  Warn "升级：安装目录 $InstallDir 下没有 data.vhdx；本次会新建空数据盘，旧 /home /root /workspace 不会迁移。"
 }
 
 # --- [1/10] 检查运行环境 ----------------------------------------------------
@@ -254,21 +334,12 @@ if ($__haveEnsure) {
     exit 0
   }
   if (-not (Test-WslInstalled)) { throw 'WSL 仍不可用，环境配置未完成。' }
-  Set-MirroredNetworking -Yes:$Yes
+  Set-MirroredNetworking -Yes:$Yes | Out-Null
 } else {
   Write-Warning '未找到 wsl-ensure.ps1；已跳过 WSL/网络预检查（install.ps1 应把它从 main 取回；请检查网络与源码分支）。'
 }
 
-# --- 决定安装目录 -----------------------------------------------------------
-if (-not $InstallDir) {
-  $default = $VariantMap[$Variant].InstallDir
-  if ($Yes) {
-    $InstallDir = $default
-  } else {
-    $answer = Read-Host "安装目录 [$default]（直接回车使用默认值）"
-    $InstallDir = if ([string]::IsNullOrWhiteSpace($answer)) { $default } else { $answer }
-  }
-}
+# --- 创建安装目录（路径早在提权前就已确定，这里才真正落盘）------------------
 New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
 $script:InstallLog = Join-Path $InstallDir ("agent-devbox-install-{0}.log" -f $script:RunStamp)
 if (-not $script:Logging) {
@@ -281,7 +352,7 @@ if (-not $script:Logging) {
 }
 
 # --- 手动挂载/卸载助手（复制到安装目录，方便排查或挂载其它数据盘）------------
-foreach ($helper in @('mount-datadisk.ps1', 'mount-datadisk.cmd', 'unmount-datadisk.ps1', 'unmount-datadisk.cmd')) {
+foreach ($helper in @('mount-datadisk.cmd', 'unmount-datadisk.cmd')) {
   $helperSrc = Join-Path $PSScriptRoot $helper
   if (Test-Path -LiteralPath $helperSrc) {
     Copy-Item -LiteralPath $helperSrc -Destination (Join-Path $InstallDir $helper) -Force
@@ -303,20 +374,9 @@ if (-not $ReleaseTag) {
 }
 $ReleaseTag = Resolve-ReleaseTag $ReleaseTag
 
-# --- 是否覆盖已存在的发行版？（默认直接覆盖升级，不再要求输入 y）----------
+# 是否覆盖已存在的发行版已在提权后、任何改动之前决定（$import / $reinstall）。
 # 延迟注销：等磁盘预检通过后再注销旧发行版，避免空间不足时先删掉可用的发行版。
 # 升级 = 换系统盘，但数据盘（/home /root /workspace）和 paseo 密码都保留。
-$distroExists = Test-DistroExists
-$import = $true
-if ($distroExists) {
-  if ($KeepExisting) {
-    $import = $false
-    Ok "发行版 '$Distro' 已存在：按 -KeepExisting 保留现有安装（不升级）。"
-  } else {
-    Warn "发行版 '$Distro' 已存在：直接覆盖升级（数据盘保留，paseo 密码沿用）。"
-  }
-}
-$reinstall = $distroExists -and $import
 
 # 升级不再去旧系统盘读密码。密码的权威位置是数据盘上的 `.paseo-password`（[7/10] 按 UUID
 # 挂载后读取，跨升级保留）；2026-10-20 01:13 起的所有安装都有这个文件。
@@ -324,26 +384,108 @@ $reinstall = $distroExists -and $import
 # 启动 paseo），也就不会出现「升级刚开始 paseo 被拉起来、1 分钟后又被 terminate」。
 
 # --- 导入相关路径与 Release 元数据（供磁盘预检与下载复用）------------------
-$stz        = "rootfs-$Variant-amd64.tar.zst"
+$Arch = Get-AgentDevboxHostArch   # 'amd64' | 'arm64'; unknown throws
+$osBuild = [Environment]::OSVersion.Version.Build
+if ($Arch -eq 'arm64' -and $osBuild -lt 22000) {
+  throw ("Windows 10 ARM64 不受支持：ARM64 路径需要 Windows 11（build 22000+），当前 build {0}。" +
+    "请改用 x64 Windows，或升级到 Windows 11 ARM64。" -f $osBuild)
+}
+$stz        = "rootfs-$Variant-$Arch.tar.zst"
 $stzPath    = Join-Path $InstallDir $stz
-$tarPath    = Join-Path $InstallDir "rootfs-$Variant-amd64.tar"
-$localParts = @(Get-ChildItem -Path $PSScriptRoot -Filter "$stz.part-*" -ErrorAction SilentlyContinue)
+$tarPath    = Join-Path $InstallDir "rootfs-$Variant-$Arch.tar"
+# 预置分片只在安装目录里找。$PSScriptRoot 是 install.ps1 取回的脚本副本所在目录
+# （提权后的暂存目录），永远看不到用户放在 InstallDir 里的分片。
+$localParts = @(Get-ChildItem -Path $InstallDir -Filter "$stz.part-*" -ErrorAction SilentlyContinue)
+$partsWerePreexisting = ($localParts.Count -gt 0)
+$useLocalParts = $false
 $local      = @()
 $parts      = @()
 $firstUrl   = $null
 $compressed = 0L
 $uncomp     = 0L
+$rel        = $null
 
-if ($import) {
-  if ($localParts.Count -gt 0) {
-    $parts = @($localParts | Sort-Object Name)
+if ($import -and $localParts.Count -gt 0) {
+  # 预置分片只有在「有清单 + 每个分片都被覆盖且 SHA256 匹配」时才可信。
+  # 清单优先取安装目录里的 SHA256SUMS，其次取 Release 资产；缺失 / 不完整 /
+  # 不匹配都只警告，然后回退到正常 Release 下载路径（由下载器重新校验）。
+  $seedMap = @{}
+  $sumsPath = Join-Path $InstallDir 'SHA256SUMS'
+  if (Test-Path -LiteralPath $sumsPath) {
+    try {
+      $seedMap = ConvertFrom-Sha256Sums -Text ([System.IO.File]::ReadAllText($sumsPath))
+    } catch { $seedMap = @{} }
+    if ($seedMap.Count -eq 0) { Warn '本地 SHA256SUMS 为空或无法解析，不信任预置分片。' }
+  }
+  if ($seedMap.Count -eq 0) {
+    try {
+      $relApi = if ($ReleaseTag -eq 'latest') { "https://api.github.com/repos/$Repo/releases/latest" } else { "https://api.github.com/repos/$Repo/releases/tags/$ReleaseTag" }
+      $rel = Invoke-RestMethod $relApi -Headers @{ 'User-Agent' = 'agent-devbox-installer' }
+      $sumsAsset = @($rel.assets | Where-Object { $_.name -ceq 'SHA256SUMS' }) | Select-Object -First 1
+      if ($sumsAsset) {
+        $tmpSums = Join-Path $InstallDir '.agent-devbox-seed-SHA256SUMS'
+        try {
+          Invoke-WebRequest -Uri $sumsAsset.browser_download_url -OutFile $tmpSums -UseBasicParsing -ErrorAction Stop
+          $seedMap = ConvertFrom-Sha256Sums -Text ([System.IO.File]::ReadAllText($tmpSums))
+        } finally {
+          Remove-Item -LiteralPath $tmpSums -Force -ErrorAction SilentlyContinue
+        }
+      } else {
+        Warn '该 Release 未提供 SHA256SUMS，无法校验预置分片。'
+      }
+    } catch {
+      Warn "获取 SHA256SUMS 失败（无法校验预置分片）：$($_.Exception.Message)"
+    }
+  }
+  if ($seedMap.Count -gt 0) {
+    $seedNames = @($localParts | ForEach-Object { $_.Name })
+    $seedMissing = @(Get-MissingSha256Parts -ShaMap $seedMap -Names $seedNames)
+    if ($seedMissing.Count -gt 0) {
+      Warn ("SHA256SUMS 未覆盖预置分片：{0}；改从 Release 重新校验并下载。" -f ($seedMissing -join ', '))
+    } else {
+      $seedBad = @()
+      foreach ($lp in $localParts) {
+        $want = "$($seedMap[$lp.Name])".Trim().ToLowerInvariant()
+        $got = Get-FileSha256 -Path $lp.FullName
+        if ($got -ne $want) { $seedBad += $lp.Name }
+      }
+      if ($seedBad.Count -gt 0) {
+        Warn ("预置分片 SHA256 不符：{0}；改从 Release 重新校验并下载。" -f ($seedBad -join ', '))
+      } else {
+        # 清单覆盖的每个分片都必须已经在安装目录里。只下载了一部分就失败的
+        # 上一次运行留下的「有效子集」不能直接导入（会缺分片），必须回退到
+        # Release 路径：下载器复用已校验的部分、只续传缺少的部分。
+        $manifestParts = @($seedMap.Keys | Where-Object { $_ -like "$stz.part-*" })
+        $presentParts = @($localParts | ForEach-Object { $_.Name })
+        $seedAbsent = @($manifestParts | Where-Object { $presentParts -notcontains $_ })
+        if ($seedAbsent.Count -gt 0) {
+          Warn ("预置分片不完整（缺少：{0}）；改从 Release 续传缺少的分片。" -f ($seedAbsent -join ', '))
+        } else {
+          $parts = @($localParts | Sort-Object Name)
+          $useLocalParts = $true
+          Ok ("已校验预置 rootfs 分片（{0} 个，SHA256 全部匹配）。" -f $parts.Count)
+        }
+      }
+    }
   } else {
+    Warn '没有可用的 SHA256SUMS，预置分片不受信任；改从 Release 重新校验并下载。'
+  }
+}
+
+if ($import -and -not $useLocalParts) {
+  if ($null -eq $rel) {
     $relApi = if ($ReleaseTag -eq 'latest') { "https://api.github.com/repos/$Repo/releases/latest" } else { "https://api.github.com/repos/$Repo/releases/tags/$ReleaseTag" }
     $rel = Invoke-RestMethod $relApi -Headers @{ 'User-Agent' = 'agent-devbox-installer' }
-    $parts = @($rel.assets | Where-Object { $_.name -like "$stz.part-*" } | Sort-Object name)
-    if ($parts.Count -eq 0) { throw "在 '$ReleaseTag' Release 中未找到 '$stz.part-*' 分片。" }
-    $firstUrl = $parts[0].browser_download_url
   }
+  $parts = @($rel.assets | Where-Object { $_.name -like "$stz.part-*" } | Sort-Object name)
+  if ($parts.Count -eq 0) {
+    if ($Arch -eq 'arm64') {
+      throw ("Release '$ReleaseTag' 没有 ARM64 分片（$stz.part-*）：该版本早于 ARM64 支持，只发布了 amd64。" +
+        "请改用最新版本（-ReleaseTag latest / beta），或在 x64 Windows 上安装。未下载任何文件，现有安装未改动。")
+    }
+    throw "在 '$ReleaseTag' Release 中未找到 '$stz.part-*' 分片。"
+  }
+  $firstUrl = $parts[0].browser_download_url
 }
 
 # --- [2/10] 检查磁盘空间（下载前，避免装到一半爆盘）----------------------
@@ -352,7 +494,7 @@ if ($import) {
   if (-not (Get-Command Assert-DiskSpace -ErrorAction SilentlyContinue)) {
     throw '缺少 wsl-ensure.ps1 中的磁盘检查辅助函数；请确认 install.ps1 已从 main 取回全部脚本后重试。'
   }
-  if ($localParts.Count -gt 0) {
+  if ($useLocalParts) {
     $compressed = [long](($localParts | Measure-Object Length -Sum).Sum)
     $uncomp     = [long](Get-ZstdUncompressedSize ($parts[0].FullName))
   } else {
@@ -360,7 +502,12 @@ if ($import) {
     $uncomp     = [long](Get-ZstdUncompressedSizeFromUrl $firstUrl)
   }
   if ($uncomp -le 0) { $uncomp = 0 }   # Get-RequiredDiskBytes 会按压缩量保守估算
-  $needBytes = Get-RequiredDiskBytes -CompressedBytes $compressed -UncompressedBytes $uncomp -Tier 'Stream'
+  # Segmented mode peaks at 2C (segment files + destination); the streaming peak
+  # is normally larger, but assert the max so a future small-image layout cannot
+  # pass the check and then run out of space during a segmented download.
+  $needStream = Get-RequiredDiskBytes -CompressedBytes $compressed -UncompressedBytes $uncomp -Tier 'Stream'
+  $needSegmented = Get-RequiredDiskBytes -CompressedBytes $compressed -UncompressedBytes $uncomp -Tier 'Segmented'
+  $needBytes = [Math]::Max([long]$needStream, [long]$needSegmented)
   Assert-DiskSpace -Path $InstallDir -RequiredBytes $needBytes | Out-Null
   Ok ("磁盘空间充足（需要约 {0:N1} GiB）。" -f ($needBytes / 1073741824.0))
 } else {
@@ -370,15 +517,16 @@ if ($import) {
 # --- [3/10] 下载镜像 -------------------------------------------------------
 Step "[3/10] 下载镜像（$ReleaseTag）…"
 if ($import) {
-  if ($localParts.Count -gt 0) {
-    Ok '发现本地 rootfs 分片，跳过下载。'
+  if ($useLocalParts) {
+    Ok '发现已校验的本地 rootfs 分片，跳过下载。'
   } else {
     # 从 Release 取 SHA256SUMS（新版 Release 才有）。拿不到就只做长度校验并明确警告：
     # 长度对、内容错的分片（例如上一次安装留下的残片）长度校验是发现不了的。
     $shaMap = @{}
     $shaAsset = @($rel.assets | Where-Object { $_.name -ceq 'SHA256SUMS' }) | Select-Object -First 1
     if ($shaAsset) {
-      $shaPath = Join-Path $InstallDir 'SHA256SUMS'
+      # 临时文件名（不是 SHA256SUMS）：不能覆盖/删除用户放在 InstallDir 里的清单。
+      $shaPath = Join-Path $InstallDir '.agent-devbox-SHA256SUMS'
       $shaText = $null
       try {
         Invoke-WebRequest -Uri $shaAsset.browser_download_url -OutFile $shaPath -UseBasicParsing -ErrorAction Stop
@@ -416,10 +564,10 @@ if ($import) {
       Write-Host "  $($p.name)"
       # No installer-side "length matches -> skip" shortcut: only Save-Download
       # may decide that a file is usable, and it needs the URL + digest identity.
-      # Register the destination BEFORE the download so a throw inside
-      # Save-Download still gets cleaned up by the trap.
+      # Register the destination BEFORE the download so cleanup can find it
+      # even when the download throws.
       $script:PartsDownloaded += $dest
-      Save-Download -Url $p.browser_download_url -Dest $dest -ExpectedBytes ([long]$p.size) -Sha256 $shaMap[$p.name]
+      Save-Download -Url $p.browser_download_url -Dest $dest -ExpectedBytes ([long]$p.size) -Sha256 $shaMap[$p.name] -Connections $Connections
       $local += $dest
     }
   }
@@ -433,12 +581,12 @@ if ($import) {
 if ($reinstall) {
   Write-Host "正在注销 '$Distro'（数据盘保留）…"
   Invoke-Native 'wsl.exe' @('--unregister', $Distro) | Out-Null
-  Warn '旧发行版已注销；若随后导入失败，分片已保留在安装目录，重跑安装器不会重新下载。'
+  Warn '旧发行版已注销；若导入失败，已下载分片会保留，重跑安装器校验身份后续传。'
 }
 
 Step '[4/10] 导入镜像…'
 if ($import) {
-  $importParts = if ($localParts.Count -gt 0) { @($parts | ForEach-Object { $_.FullName }) } else { @($local) }
+  $importParts = if ($useLocalParts) { @($parts | ForEach-Object { $_.FullName }) } else { @($local) }
   $imported = $false
   try {
     # Tier 1：分片直接流式喂给 `wsl --import -`（无 zstd.exe / 合并 / 中间 tar）。
@@ -482,6 +630,22 @@ if ($import) {
 
     # Tier 3：用 zstd.exe 解压为 .tar 再导入（仅此路径才可能需要下载 zstd.exe）。
     if (-not $imported) {
+      if ($Arch -eq 'arm64') {
+        # zstd.exe 只有 win64；不依赖 x64 模拟，也不下载。
+        # 内容未被证明损坏：不设 ContentSuspect，保留分片/sidecar 供重试续传。
+        try {
+          if ((Get-Command Test-WslDistroExists -ErrorAction SilentlyContinue) -and
+              (Test-WslDistroExists -Distro $Distro)) {
+            Invoke-Native 'wsl.exe' @('--unregister', $Distro) | Out-Null
+          }
+        } catch {}
+        if (Get-Command Clear-StaleImportArtifacts -ErrorAction SilentlyContinue) {
+          Clear-StaleImportArtifacts -Distro $Distro -InstallDir $InstallDir | Out-Null
+        }
+        throw ("ARM64 不提供 Tier 3：zstd.exe 只有 x64 版本，无法在此解压（Tier 1 流式与 Tier 2 文件导入均已失败）。" +
+          "旧系统盘（若有）已按升级流程替换，数据盘 data.vhdx 保留；已下载分片保留在 $InstallDir，" +
+          "重跑安装器会先校验 SHA256 再重试。若仍失败，请先运行 wsl --update 再重装。")
+      }
       Warn '回退 Tier 3：解压为 .tar 再导入。'
       $need3 = Get-RequiredDiskBytes -CompressedBytes $compressed -UncompressedBytes $uncomp -Tier 'Legacy'
       Assert-DiskSpace -Path $InstallDir -RequiredBytes $need3 | Out-Null
@@ -489,7 +653,8 @@ if ($import) {
       Join-Parts -Parts $importParts -Dest $stzPath
       $zout = Invoke-Native $zstdExe @('-d', '-f', '-o', $tarPath, $stzPath)
       if ($script:NativeExit -ne 0) {
-        throw ("zstd 解压失败（{0}）：{1}`n这说明分片内容已损坏（长度可能正确），本次下载的分片已删除，请重新运行安装器。" -f $script:NativeExit, (Format-NativeOutput -Output $zout))
+        $script:ContentSuspect = $true
+        throw ("zstd 解压失败（{0}）：{1}`n这说明分片内容已损坏（长度可能正确），已标记为可疑；重跑安装器会重新校验并下载。" -f $script:NativeExit, (Format-NativeOutput -Output $zout))
       }
       $t3out = Invoke-Native 'wsl.exe' @('--import', $Distro, $InstallDir, $tarPath)
       if ($script:NativeExit -ne 0) {
@@ -502,14 +667,20 @@ if ($import) {
       $imported = $true
     }
   } finally {
-    # 成功或失败都清理：合并的 .zst、中间 .tar、以及本次下载的分片（保留仓库预置分片）。
-    Remove-Item -LiteralPath $stzPath -Force -ErrorAction SilentlyContinue
-    Remove-Item -LiteralPath $tarPath -Force -ErrorAction SilentlyContinue
-    if ($localParts.Count -eq 0) {
+    # 合并出的中间文件总是删除。本次下载的分片只在「导入成功」或「内容可疑」时
+    # 删除；网络/导入失败则保留分片+sidecar，下次运行重新校验身份后续传。
+    $cleanup = Get-ImportCleanupPlan -Attempted $import -Imported $imported -PartsWerePreexisting $partsWerePreexisting -ContentSuspect $script:ContentSuspect
+    if ($cleanup.RemoveMerged) {
+      Remove-Item -LiteralPath $stzPath -Force -ErrorAction SilentlyContinue
+      Remove-Item -LiteralPath $tarPath -Force -ErrorAction SilentlyContinue
+    }
+    if ($cleanup.RemoveParts) {
       foreach ($lp in $local) {
         if (Get-Command Remove-DownloadArtifacts -ErrorAction SilentlyContinue) { Remove-DownloadArtifacts -Dest $lp }
         else { Remove-Item -LiteralPath $lp -Force -ErrorAction SilentlyContinue }
       }
+    } elseif ($cleanup.KeepParts) {
+      Ok ("分片已保留：{0}；重跑安装器会校验身份并续传（无需重新下载）。" -f $InstallDir)
     }
   }
 } else {
@@ -534,6 +705,7 @@ if ($import) {
 # --- [6/10] 创建数据磁盘（32GB 动态）--------------------------------------
 Step '[6/10] 创建数据磁盘（32GB 动态）…'
 if (-not (Test-Path $VhdxPath)) {
+  if ($distroExists -and -not (Test-Path -LiteralPath $VhdxPath)) { Warn "升级：安装目录 $InstallDir 下没有 data.vhdx；将新建空数据盘，旧 /home /root /workspace 不会迁移。" }
   Write-Host "正在创建数据磁盘 $VhdxPath（32GB 动态）…"
   $newVhd = Get-Command New-VHD -ErrorAction SilentlyContinue
   $useDiskpart = $false
@@ -574,26 +746,35 @@ if ($created) { Ok "数据磁盘已创建：$VhdxPath" } else { Ok '数据磁盘
 
 # --- [7/10] 初始化数据磁盘（bare 挂载 → 初始化 → 取 UUID → 卸载）---------
 Step '[7/10] 初始化数据磁盘…'
-Invoke-Native 'wsl.exe' @('--mount', '--vhd', $VhdxPath, '--bare') | Out-Null
+$earlyAttach = Invoke-Native 'wsl.exe' @('--mount', '--vhd', $VhdxPath, '--bare')
+if ($script:NativeExit -ne 0 -and "$earlyAttach" -notmatch 'ALREADY_ATTACHED|already attached|0x80040312|正在使用|已附加') {
+  # 不 throw：紧接着的 datadisk-init 会给出真正的失败原因；这里只把附加结果说清楚。
+  Warn ("直接附加数据磁盘返回 {0}（已附加视为成功）：{1}" -f $script:NativeExit, $earlyAttach)
+}
 Start-Sleep -Seconds 2
 
-$initOut = Invoke-Native 'wsl.exe' @('-d', $Distro, '-u', 'root', '-e', 'bash', '-lc', "/usr/local/bin/datadisk-init.sh $(Quote-Bash $Label)")
+$expectedMachine = if ($Arch -eq 'arm64') { 'aarch64' } else { 'x86_64' }
+$probe = 'm=$(uname -m); [ "$m" = {0} ] || {{ echo "ARCH_MISMATCH:$m" >&2; exit 42; }}; /usr/local/bin/datadisk-init.sh {1}' -f $expectedMachine, (Quote-Bash $Label)
+$initOut = Invoke-Native 'wsl.exe' @('-d', $Distro, '-u', 'root', '-e', 'bash', '-lc', $probe)
+$initExit = $script:NativeExit
+if ($initExit -ne 0 -and ("$initOut" -match 'ARCH_MISMATCH:(\S+)' -or "$initOut" -match '(?i)exec format error')) {
+  $seen = if ("$initOut" -match 'ARCH_MISMATCH:(\S+)') { $Matches[1] } else { '无法执行（Exec format error）' }
+  try { Invoke-Native 'wsl.exe' @('--unregister', $Distro) | Out-Null } catch {}
+  if (Get-Command Clear-StaleImportArtifacts -ErrorAction SilentlyContinue) {
+    Clear-StaleImportArtifacts -Distro $Distro -InstallDir $InstallDir | Out-Null
+  }
+  throw ("导入的 rootfs 架构与主机不匹配：主机 $Arch（期望 $expectedMachine），实际 $seen。" +
+    "本次导入已注销；数据盘 data.vhdx 保留。重跑安装器会重新校验/下载所需分片；若反复出现，" +
+    "说明该 Release 的 $Arch 分片内容有误（wsl --import 本身不校验架构）。")
+}
 Write-Host $initOut
 $uuid = ''
 foreach ($line in ($initOut -split "`n")) {
   if ($line -match 'UUID=([0-9a-fA-F-]{36})') { $uuid = $Matches[1] }
 }
-# 兜底 1（可选）：回读上一次安装写入的 DATA_UUID（重装 / 数据盘已初始化的场景）。
-# 只接受退出码为 0 且形如 UUID 的结果——Invoke-Native 合并了 stderr，不能把原生
-# 进程的报错文本当成 UUID。
-if (-not $uuid) {
-  $confOut = Invoke-Native 'wsl.exe' @('-d', $Distro, '-u', 'root', '-e', 'bash', '-lc', "sed -n 's/^DATA_UUID=//p' $ConfPath 2>/dev/null | tr -d `"'`" | tr -d '\r'")
-  if ($script:NativeExit -eq 0) {
-    $uuid = ($confOut | ForEach-Object { "$_".Trim() } | Where-Object { $_ -match '^[0-9a-fA-F-]{36}$' } | Select-Object -First 1)
-  }
-}
-# 兜底 2：按标签读取 UUID。两个变体（agents / core）的数据盘共用同一标签 `devbox-data`，
-# 因此可能匹配到多个不同 UUID —— 此时必须报错，绝不静默取第一个。
+# 兜底 1：按标签读取 UUID。两个变体（agents / core）的数据盘共用同一标签 `devbox-data`，
+# 所以把另一个变体的 data.vhdx 复制过来也能正确识别（复制盘保留源盘的 UUID，
+# 与本变体旧 conf 里的 UUID 不同）。多个不同 UUID -> 报错，绝不静默取第一个。
 if (-not $uuid) {
   $blkidOut = Invoke-Native 'wsl.exe' @('-d', $Distro, '-u', 'root', '-e', 'bash', '-lc', "blkid -t LABEL=$Label -s UUID -o value")
   if ($script:NativeExit -eq 0) {
@@ -605,7 +786,21 @@ if (-not $uuid) {
     }
   }
 }
+# 旧 conf 里的 DATA_UUID 只是兜底提示，所以无论前面是否解析成功都读取它（用于下面的
+# 变化日志）：两个变体的数据盘可以互换，复制盘保留源盘的 UUID，与本变体旧 conf 不同。
+# 只接受退出码为 0 且形如 UUID 的结果——Invoke-Native 合并了 stderr，不能把原生
+# 进程的报错文本当成 UUID。
+$confUuid = ''
+$confOut = Invoke-Native 'wsl.exe' @('-d', $Distro, '-u', 'root', '-e', 'bash', '-lc', "sed -n 's/^DATA_UUID=//p' $ConfPath 2>/dev/null | tr -d `"'`" | tr -d '\r'")
+if ($script:NativeExit -eq 0) {
+  $confUuid = ($confOut | ForEach-Object { "$_".Trim() } | Where-Object { $_ -match '^[0-9a-fA-F-]{36}$' } | Select-Object -First 1)
+}
+# 兜底 2：标签查询没有结果时，回读上一次安装写入的 DATA_UUID（重装 / 旧版本升级）。
+if (-not $uuid -and $confUuid) { $uuid = $confUuid }
 if (-not $uuid) { throw '无法确定数据盘 UUID：datadisk-init 与 blkid 都没有返回有效 UUID，数据盘可能未初始化。' }
+if ($uuid -and $confUuid -and $uuid -ne $confUuid) {
+  Ok "数据盘 UUID 已变化（$confUuid -> $uuid）：按标签 '$Label' 识别，可能是另一个变体的数据盘。"
+}
 
 # 密码保存在**数据盘**上（/mnt/<DATA_MNTNAME>/.paseo-password）：数据盘跨升级保留，
 # 所以升级镜像不再需要去旧系统盘里翻配置。这里趁磁盘还 attach 着先挂载并读取。
@@ -660,7 +855,7 @@ if ([string]::IsNullOrWhiteSpace($pw)) {
 
 # --- [9/10] 写入启动配置 ---------------------------------------------------
 Step '[9/10] 写入启动配置 /etc/agent-devbox.conf…'
-$conf = "DATA_VHDX=$(Quote-Bash $VhdxPath)`nDATA_UUID=$(Quote-Bash $uuid)`nPASEO_PASSWORD=$(Quote-Bash $pw)`nDATA_MNTNAME=$(Quote-Bash $MountName)`nDATA_TASK=$(Quote-Bash $TaskName)`n"
+$conf = "DATA_VHDX=$(Quote-Bash $VhdxPath)`nDATA_UUID=$(Quote-Bash $uuid)`nPASEO_PASSWORD=$(Quote-Bash $pw)`nDATA_MNTNAME=$(Quote-Bash $MountName)`nDATA_DISTRO=$(Quote-Bash $Distro)`n"
 $b64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($conf))
 Invoke-Native 'wsl.exe' @('-d', $Distro, '-u', 'root', '-e', 'bash', '-lc', "set -o pipefail; umask 077; printf '%s' '$b64' | base64 -d > $ConfPath && chmod 600 $ConfPath") | Out-Null
 if ($script:NativeExit -ne 0) { throw "写入 $ConfPath 失败（退出码 $script:NativeExit）" }
@@ -675,7 +870,7 @@ if ($dataDiskMounted -and $pw) {
     else { Warn '保存密码到数据盘失败（本次密码仍写入 /etc/agent-devbox.conf）。' }
   } catch { Warn "保存密码到数据盘失败：$($_.Exception.Message)" }
 }
-# 数据盘必须在上面的读取/写入之后才卸载；开机由计划任务重新 attach。
+# 数据盘必须在上面的读取/写入之后才卸载；重启发行版时由 wsl-boot.sh 自己重新 attach。
 if ($dataDiskMounted) {
   Write-Host '正在卸载数据磁盘（开机时会重新挂载）…'
   $umOut = Invoke-Native 'wsl.exe' @('--unmount', "\\?\$VhdxPath")
@@ -684,124 +879,45 @@ if ($dataDiskMounted) {
   }
 }
 
-# --- [10/10] 注册开机自动挂载计划任务（默认始终注册；-NoTask 可跳过）------
-Step '[10/10] 注册开机自动挂载计划任务…'
-if ($NoTask) {
-  Ok '已跳过计划任务注册'
-} else {
-  # attach-only：只把 VHDX 作为裸磁盘接入（--bare），不指定文件系统类型 / 挂载名，
-  # 由发行版启动脚本按 UUID 自行挂载。任务调用安装目录里的 mount-datadisk.ps1：
-  # 它会重试 3 次、把每次 `wsl --mount` 的退出码写进 datadisk-attach.log，并用
-  # `exit $result.ExitCode` 把真实结果回给计划任务。直接 -EncodedCommand "& wsl.exe ..."
-  # 时 PowerShell 永远退出 0，安装器会把 attach 失败误判为成功（2026-10-21 维护模式）。
-  $attachScript = Join-Path $InstallDir 'mount-datadisk.ps1'
-  $actionArgs   = "-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$attachScript`""
-  $action     = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $actionArgs
-  $trigger    = New-ScheduledTaskTrigger -AtLogOn
-  $principal  = New-ScheduledTaskPrincipal -UserId $RunAsUser -RunLevel Highest
-  # 电池开关必须显式打开：New-ScheduledTaskSettingsSet 的默认值是
-  # DisallowStartIfOnBatteries=$true / StopIfGoingOnBatteries=$true。笔记本拔电登录时
-  # 任务根本不跑 -> 数据盘没附加 -> wsl-boot 等 30 秒后进维护模式（台式机看不出来）。
-  $settings   = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -StartWhenAvailable `
-                  -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
-                  -ExecutionTimeLimit (New-TimeSpan -Minutes 5)
+# --- [10/10] 附加数据磁盘并清理旧版计划任务 --------------------------------
+# 设计：不再注册任何计划任务。boot 是唯一的自动 attach 路径（发行版每次启动时
+# wsl-boot.sh 自己 `wsl.exe --mount --vhd ... --bare`）；boot 失败时维护横幅打印
+# 安装目录里的 mount-datadisk.cmd。安装器只删除旧版本留下的计划任务，并自己 attach
+# 一次（确定性、退出码可见）。
+Step '[10/10] 附加数据磁盘并清理旧版计划任务…'
 
-  # 幂等：任务已存在且「动作 / 触发 / 身份 / 并发设置」都一致时不再重复注册。
-  # 之前每次安装都先 Unregister 再 Register，等于每次都重写一遍计划任务注册表，毫无必要。
-  $existingTask = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-  $needRegister = $true
-  if ($existingTask) {
-    $same = $false
+# 旧版本注册过 `agent-devbox*-mount-datadisk`：现在已经没有这种任务，全部删掉。
+# 失败只告警，绝不让安装失败（任务注册表可能被策略锁定）。
+try {
+  foreach ($oldTask in @(Get-ScheduledTask -ErrorAction SilentlyContinue |
+      Where-Object { $_.TaskName -match '^agent-devbox.*-mount-datadisk$' })) {
     try {
-      $ea = @($existingTask.Actions) | Select-Object -First 1
-      $et = @($existingTask.Triggers) | Select-Object -First 1
-      $ep = $existingTask.Principal
-      $sameAction    = $ea -and ("$($ea.Execute)" -match 'powershell') -and ("$($ea.Arguments)" -ceq $actionArgs)
-      $sameTrigger   = $et -and ("$($et.CimClass.CimClassName)" -eq 'MSFT_TaskLogonTrigger')
-      $samePrincipal = $ep -and ("$($ep.UserId)" -eq $RunAsUser) -and ("$($ep.RunLevel)" -eq 'Highest')
-      # 设置一致性必须把电池策略也比进来：旧安装器没传两个开关，落到默认的
-      # DisallowStartIfOnBatteries/StopIfGoingOnBatteries=$true；只比 MultipleInstances 的话
-      # 这里会误判“一致”，已装机器永远修不到电池问题。
-      $st = $existingTask.Settings
-      $sameSettings  = ("$($st.MultipleInstances)" -eq 'IgnoreNew') -and
-                       ($st.DisallowStartIfOnBatteries -eq $false) -and
-                       ($st.StopIfGoingOnBatteries -eq $false)
-      $same = [bool]($sameAction -and $sameTrigger -and $samePrincipal -and $sameSettings)
-    } catch { $same = $false }
-    if ($same) {
-      $needRegister = $false
-      Ok "计划任务 '$TaskName' 已存在且配置一致，跳过重复注册。"
-    } else {
-      Warn "计划任务 '$TaskName' 已存在但配置与当前安装不一致，重新注册。"
+      Unregister-ScheduledTask -TaskName $oldTask.TaskName -Confirm:$false -ErrorAction Stop
+      Ok ("已删除旧版计划任务 '{0}'" -f $oldTask.TaskName)
+    } catch {
+      Warn ("删除旧版计划任务 '{0}' 失败（不影响本次安装）：{1}" -f $oldTask.TaskName, $_.Exception.Message)
     }
   }
+} catch { Warn "枚举旧版计划任务失败（不影响本次安装）：$($_.Exception.Message)" }
 
-  if ($needRegister) {
-    if ($existingTask) { Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false }
-    Warn '如果火绒 / 360 / Defender 弹出“允许/阻止”提示，请点击【允许】；本步骤只注册一个隐藏的登录挂载任务。'
-    Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings `
-      -Description "$Distro：登录时自动挂载数据磁盘" | Out-Null
-  }
-  $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction Stop
-  if (-not $task -or $task.State -eq 'Disabled') { throw "计划任务 '$TaskName' 注册后不可用。" }
-  $act = @($task.Actions) | Select-Object -First 1
-  if (-not $act -or $act.Execute -notmatch 'powershell' -or $act.Arguments -notmatch 'mount-datadisk\.ps1') { throw "计划任务 '$TaskName' 的动作不符合预期。" }
-  if ($needRegister) { Ok "已注册并校验计划任务 '$TaskName'。" } else { Ok "已校验计划任务 '$TaskName'（未重复注册）。" }
-  # 变体卸载/切换后旧任务会残留（任务名里带变体名），登录时仍去 attach 一个已经没有发行版的
-  # 数据盘；旧式 `--mount --type ext4 --name` 还会把盘挂到所有发行版都看得见的 /mnt/wsl/<name>
-  # （wsl-boot.sh 注释里警告过的共享挂载点）。这里只清理两类可判定的残留：发行版已不在
-  # `wsl -l` 里，或任务指向的 VHDX 已不存在。当前任务和其它仍存活的变体一律不动。
-  try {
-    $liveDistros = @()
-    $listed = Invoke-Native 'wsl.exe' @('-l', '-q')
-    if ($script:NativeExit -eq 0) {
-      $liveDistros = @($listed | ForEach-Object { ("$_" -replace "`0", '').Trim() } | Where-Object { $_ })
-    }
-    foreach ($staleTask in @(Get-ScheduledTask -ErrorAction SilentlyContinue |
-        Where-Object { $_.TaskName -match '^agent-devbox.*-mount-datadisk$' })) {
-      if ($staleTask.TaskName -eq $TaskName) { continue }
-      $staleDistro = $staleTask.TaskName -replace '-mount-datadisk$', ''
-      $staleVhd = ''
-      $staleAction = @($staleTask.Actions) | Select-Object -First 1
-      if ($staleAction -and ("$($staleAction.Arguments)" -match '--vhd\s+["'']?([^"'']+)')) { $staleVhd = $matches[1] }
-      $distroGone = ($liveDistros.Count -gt 0) -and ($liveDistros -notcontains $staleDistro)
-      $vhdGone = [bool]($staleVhd -and -not (Test-Path -LiteralPath $staleVhd))
-      if ($distroGone -or $vhdGone) {
-        Unregister-ScheduledTask -TaskName $staleTask.TaskName -Confirm:$false -ErrorAction Stop
-        Ok ("已清理残留计划任务 '{0}'（发行版 '{1}' 已不存在）" -f $staleTask.TaskName, $staleDistro)
-        # 注销任务不会 detach 它挂过的盘（旧式 --mount 还会把它挂到 /mnt/wsl/<name>，
-        # 所有发行版都看得见）。这里顺手分离，失败只告警（重启后自然消失）。
-        if ($staleVhd -and -not $vhdGone) {
-          Invoke-Native 'wsl.exe' @('--unmount', "\\?\$staleVhd") | Out-Null
-          if ($script:NativeExit -eq 0) { Ok ("已分离残留数据盘：{0}" -f $staleVhd) }
-          else { Warn ("残留数据盘未能分离（重启 Windows 后自动消失）：{0}" -f $staleVhd) }
-        }
-      }
-    }
-  } catch { Warn "清理残留挂载任务失败（不影响本次安装）：$($_.Exception.Message)" }
+# 立即附加：最多 3 次，间隔 2 秒。attach-only（--bare），由 boot 按 UUID 挂载。
+# 失败不阻塞安装（只告警）：重启发行版时 boot 会再试一次；仍失败则按维护横幅运行
+# 安装目录里的 mount-datadisk.cmd，再 wsl --terminate。
+$attach = ''
+for ($i = 1; $i -le 3; $i++) {
+  $attach = Invoke-Native 'wsl.exe' @('--mount', '--vhd', $VhdxPath, '--bare')
+  if ($script:NativeExit -eq 0 -or "$attach" -match 'already|0x80070020|in use|正在使用|已附加') { break }
+  if ($i -lt 3) { Start-Sleep -Seconds 2 }
 }
-
-# 立即附加：安装器本身就是管理员，先自己挂一次（确定性、退出码可见），失败了才
-# 交给计划任务重试。只靠 Start-ScheduledTask 时，wsl --mount 的失败会被吞掉，
-# 重启后 wsl-boot 找不到设备 -> 维护模式（2026-10-21 core 实测）。
-$attach = Invoke-Native 'wsl.exe' @('--mount', '--vhd', $VhdxPath, '--bare')
 if ($script:NativeExit -eq 0) {
   Ok '数据磁盘已附加（--bare）。'
 } elseif ("$attach" -match 'already|0x80070020|in use|正在使用|已附加') {
   Ok '数据磁盘已处于附加状态。'
 } else {
-  Warn "直接附加数据磁盘返回 $($script:NativeExit)；改由计划任务重试：$attach"
-  try {
-    Warn '若火绒/杀毒软件此刻弹出提示，请点击【允许】。'
-    Start-ScheduledTask -TaskName $TaskName | Out-Null
-    Start-Sleep -Seconds 2
-    $info = Get-ScheduledTaskInfo -TaskName $TaskName -ErrorAction SilentlyContinue
-    if ($info -and [int]$info.LastTaskResult -ne 0) {
-      Warn ("计划任务首次运行返回 0x{0:X}；若火绒/杀毒软件弹窗请点击允许。" -f [int]$info.LastTaskResult)
-    }
-  } catch {
-    Warn "立即触发计划任务失败（下次登录仍会自动挂载）：$($_.Exception.Message)"
-  }
+  Warn ("附加数据磁盘失败（退出码 {0}）：{1}" -f $script:NativeExit, $attach)
+  Warn '重启发行版时 boot 会再试；仍失败请手动修复：'
+  Warn "  1) $(Join-Path $InstallDir 'mount-datadisk.cmd')"
+  Warn "  2) wsl --terminate $Distro"
 }
 
 # --- [完成] 重启发行版并汇总 ----------------------------------------------
@@ -817,7 +933,7 @@ Write-Host $readyOut
 Write-Host ''
 Assert-DistroReady -Distro $Distro -InstallDir $InstallDir | Out-Null
 
-Assert-DataDiskMounted -Distro $Distro -MountName $MountName -SinceLine $bootLinesBefore | Out-Null
+Assert-DataDiskMounted -Distro $Distro -MountName $MountName -SinceLine $bootLinesBefore -InstallDir $InstallDir | Out-Null
 Ok "数据磁盘已挂载到 /mnt/$MountName。"
 Assert-PaseoHealthy -Distro $Distro | Out-Null
 Ok 'paseo 已就绪（/api/health 200）。' 
@@ -832,20 +948,23 @@ try {
   if ($lxKey) { $distroGuid = $lxKey.PSChildName }
 } catch { }
 
-Ok "安装完成。变体=$Variant  Release=$ReleaseTag  安装目录=$InstallDir"
-Write-Host "进入环境：wsl -d $Distro"
-if ($distroGuid) { Write-Host "发行版 GUID：$distroGuid（每次重装都会换新 GUID）" }
-Write-Host '若 wsl-ui 打开终端异常，关掉 Windows Terminal 与 wsl-ui 后重开（WT 会按当前注册的发行版重新生成 profile，无需手工改配置）。'
+Ok '安装完成。'
+Ok "变体：$Variant"
+Ok "Release：$ReleaseTag"
+Ok "安装目录：$InstallDir"
+Ok "进入环境：wsl -d $Distro"
+if ($distroGuid) { Ok "发行版 GUID：$distroGuid（每次重装都会换新 GUID）" }
+Write-UiLine '若 wsl-ui 打开终端异常：关掉 Windows Terminal 与 wsl-ui 后重开（WT 会按当前注册的发行版重新生成 profile，无需手工改配置）。'
 # wsl-ui 的发行版列表是**它自己的 Windows 侧缓存**（%LOCALAPPDATA%\wsl-ui），不在数据盘上。
 # 安装器不替用户删其它程序的缓存，只打印一条可复制的命令。
 try {
   $uiMeta = Join-Path $env:LOCALAPPDATA 'wsl-ui\distro-metadata.json'
   if (Test-Path -LiteralPath $uiMeta) {
-    Write-Host "若 wsl-ui 仍显示旧条目：关掉 wsl-ui，运行  Remove-Item `"$uiMeta`" -Force  再重开（那只是它的展示缓存）。"
+    Write-UiLine "若 wsl-ui 仍显示旧条目：关掉 wsl-ui，运行  Remove-Item `"$uiMeta`" -Force  再重开（那只是它的展示缓存）。"
   }
 } catch { }
-Write-Host 'paseo 网页界面：在打开的 WSL 里启动 paseo 后，浏览器访问 http://localhost:6767（登录密码见 /etc/agent-devbox.conf，下方有查看命令）。'
-Write-Host '若要修改 paseo 密码：编辑 /etc/agent-devbox.conf，或在启动前设置环境变量 PASEO_PASSWORD。'
+Write-UiLine 'paseo 网页界面：在打开的 WSL 里启动 paseo 后，浏览器访问 http://localhost:6767（登录密码见 /etc/agent-devbox.conf，下方有查看命令）。'
+Write-UiLine '若要修改 paseo 密码：编辑 /etc/agent-devbox.conf，或在启动前设置环境变量 PASEO_PASSWORD。'
 Write-Host "安装日志：$script:InstallLog"
 Write-Host "查看安装日志：Get-Content -LiteralPath '$script:InstallLog' -Tail 200"
 Write-Host "查看 paseo 密码（Windows 侧）：wsl -d $Distro -u root -e cat /etc/agent-devbox.conf"

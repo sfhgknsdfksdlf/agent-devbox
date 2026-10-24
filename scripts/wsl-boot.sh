@@ -2,12 +2,19 @@
 # =============================================================================
 # wsl-boot.sh — WSL2 boot script, run as root from /etc/wsl.conf [boot] command.
 #
-# Design (PURE-LINUX mount; NO Windows interop):
-#   Attaching the VHDX is the Windows side's job: a logon Scheduled Task runs a
-#   hidden PowerShell that attaches the VHDX as a BARE block device (`wsl
-#   --mount --vhd <path> --bare`) on the host. By the time this script runs, the
-#   guest already sees the raw disk. This script then does everything in Linux:
-#     1. Find the already-attached block device by UUID (blkid -U).
+# Design (guest-side attach + pure-Linux mount):
+#   The VHDX is attached as a BARE block device by the guest itself, on every
+#   start, through the ONE allowed interop call:
+#     `wsl --mount --vhd <winpath> --bare`   (see attach_vhdx: hard timeout)
+#   This closes the "shutdown mid-session -> permanently in maintenance" hole
+#   that existed while only a Windows logon task could attach the disk.
+#   Everything after the attach stays in Linux:
+#     1. Wait for the attached block device up to DEVICE_WAIT seconds. Only ONE
+#        wait per boot. Identity is resolved by UUID first, then by the shared
+#        ext4 label (`devbox-data`), which is what makes the agents and core
+#        variants' data disks interchangeable: a copied VHDX keeps the source
+#        UUID, so it only resolves by label. Two matches (original + copy both
+#        attached) fail closed — boot never picks one.
 #     2. `mount -t ext4 <dev> /mnt/<mntname>` (mntname from DATA_MNTNAME,
 #        default `devbox-data`, read out of /etc/agent-devbox.conf).
 #     3. VERIFY the mount identity (mountpoint + UUID) — fail closed.
@@ -15,34 +22,40 @@
 #     5. Bind /home, /root and /workspace onto the data disk.
 #     6. Start the paseo daemon as `paseo` (single owner, backgrounded).
 #
-# WHY NO INTEROP HERE (root cause of a confirmed boot loop):
-#   This file runs from `[boot]` on EVERY distro start — a point where WSL interop
-#   is not yet ready. Shelling out to Windows tooling (a bare attach, or triggering
-#   the host task) from inside `[boot]` is re-entrant and unsupported: the Windows
-#   binary is not on PATH yet, and a bare mount also needs an elevated token. Doing
-#   it here made the distro restart after the task trigger, then loop, then shut the
-#   VM down. So this script calls NO Windows binary (no wsl / no schtasks): the host
-#   attaches, the guest mounts, purely in Linux.
+# WHY EXACTLY ONE INTEROP CALL (root cause of a confirmed boot loop):
+#   This file runs from `[boot]` on EVERY distro start, a point where interop is
+#   not reliably ready. Re-entering Windows from here (starting another distro,
+#   detaching the disk, shutting the VM down) is re-entrant and unsupported: it
+#   made the distro restart, then loop, then shut the VM down. So the ONLY Windows
+#   binary this script ever runs is the bare attach above, it always carries
+#   `timeout -k 2` + ATTACH_TIMEOUT (default 8s, plus 2s kill grace), and its
+#   outcome never blocks boot — the single device wait and the mount decide.
+#   AGENT_DEVBOX_BOOT_ATTACH=0 is the rollback switch (logs why and goes straight
+#   to the wait/maintenance path). This script is the only attach path: nothing
+#   outside it (re)attaches the disk.
 #
 # NEVER FORMATS: formatting happens only in datadisk-init.sh, invoked by the Windows
 # installer for a freshly created VHDX. It also NEVER re-launches the Windows
-# installer: if the data disk cannot be mounted it enters MAINTENANCE MODE and tells
-# the user to run the installer themselves.
+# installer: if the data disk cannot be mounted it enters MAINTENANCE MODE and
+# prints repair commands that work *inside this WSL terminal* — paste
+# `cmd.exe /c "<InstallDir>\mount-datadisk.cmd"` then `wsl --terminate <distro>`
+# and reopen the distro — plus a Windows PowerShell fallback. The same commands
+# go to the MOTD and the boot log.
 #
 # MOUNT PATH: the data disk lives at /mnt/<name>, NOT under /mnt/ (the auto-mount
 # tmpfs shared across distros). A shared, distro-independent location would let two
 # distros using the same mount name collide on an identical path. Hence /mnt/<name>.
 #
 # SHELL OPTIONS — deliberately `set -uo pipefail` with NO `-e`:
-#   The device wait is best-effort (the host Scheduled Task may not have attached
-#   the disk yet), and every step must be able to log before we bail out. Under
+#   The device wait is best-effort (the in-guest attach may not have brought the
+#   disk up yet), and every step must be able to log before we bail out. Under
 #   `set -e` a single failed command would abort before we could write the
 #   MAINTENANCE MOTD. So we check every exit status explicitly instead. Errors stay
 #   loud: they are logged and turned into a fail-closed exit 0 (MAINTENANCE MODE).
 #
-# Layout: credentials/identity come from /etc/agent-devbox.conf (written by the
-# Windows installer): DATA_VHDX, DATA_UUID, PASEO_PASSWORD, DATA_MNTNAME (and
-# DATA_TASK, consumed by the Windows side).
+# Layout: credentials/identity come from /etc/agent-devbox.conf (5 keys written
+# by the Windows installer): DATA_VHDX, DATA_UUID, PASEO_PASSWORD, DATA_MNTNAME,
+# DATA_DISTRO.
 #
 # This file is safe to SOURCE — every side effect lives in a function, and the
 # entry point is guarded by the BASH_SOURCE check at the bottom.
@@ -66,13 +79,27 @@ DATADIR="${AGENT_DEVBOX_DATADIR:-}"
 # written by the `>>` redirect in main(), so nothing else can bound it.
 PASEO_LOG="${AGENT_DEVBOX_PASEO_LOG:-/var/log/paseo-boot.log}"
 PASEO_LOG_MAX="${AGENT_DEVBOX_PASEO_LOG_MAX:-5242880}"
+# Boot attach budget: ATTACH_TIMEOUT bounds the interop call (plus 2s kill grace),
+# DEVICE_WAIT bounds the single wait for the block device. Worst case ~30s, which
+# stays inside the installer's 45s assertion.
+ATTACH_TIMEOUT="${AGENT_DEVBOX_ATTACH_TIMEOUT:-8}"
+DEVICE_WAIT="${AGENT_DEVBOX_DEVICE_WAIT:-20}"
+# Data-disk shared identity: both variants use the SAME ext4 label, so a data
+# disk copied from one variant can boot the other. Resolve by UUID first, then
+# by label. A copied VHDX keeps the source UUID, so the original and its copy can
+# be attached together -> multiple matches are an ERROR, never a coin flip.
+DATA_LABEL="${AGENT_DEVBOX_DATA_LABEL:-devbox-data}"
 
 # Installer-populated values (reloaded by load_conf). Pre-declared empty so the
 # functions stay safe under `set -u` even when called directly, or when the file
 # is sourced without main()/load_conf() first.
 DATA_VHDX=""
 DATA_UUID=""
+DATA_DISTRO=""
 PASEO_PASSWORD=""
+# "" normally, so the maintenance MOTD renders a blank line; set by
+# fail_ambiguous_data_disk() to explain the two-device case in the banner.
+MOTD_HINT=""
 # 1 = 配置还没写（`wsl --import` 刚完成、安装器随后才写并重启）。首次启动不是故障，
 # 日志里不能打成 FATAL，否则每次新装都像出错（见 main()）。
 CONF_MISSING=0
@@ -91,10 +118,13 @@ log() {
 
 # load_conf(): reset the installer-written values, source the config if present,
 # then resolve the mount name and the concrete DATADIR, and export
-# PASEO_PASSWORD for the daemon child.
+# PASEO_PASSWORD for the daemon child. The data disk is resolved by UUID first,
+# then by the shared label (DATA_LABEL), so the two variants' VHDX files are
+# interchangeable; more than one match fails closed instead of picking one.
 load_conf() {
   DATA_VHDX=""
   DATA_UUID=""
+  DATA_DISTRO=""
   PASEO_PASSWORD=""
   CONF_MISSING=0
   # shellcheck source=/dev/null
@@ -207,31 +237,143 @@ ensure_opencode_shim() {
   return 0
 }
 
-# dev_by_uuid(): print the device backing $DATA_UUID, or return 1 when it is
-# unset or no such filesystem is attached.
-dev_by_uuid() {
-  [ -n "$DATA_UUID" ] || return 1
-  blkid -U "$DATA_UUID"
-}
-
-# wait_mounted(N): poll is_mounted for up to N seconds (default 30).
-wait_mounted() {
-  local n="${1:-30}"
-  for _ in $(seq 1 "$n"); do
-    if is_mounted; then
+# data_devs(): print the attached device(s) for the data disk. UUID wins whenever
+# it matches anything: the two variants' own disks have different UUIDs, so both
+# can stay attached without being mistaken for each other. Only when the UUID is
+# absent (a disk copied from the other variant) does the shared label apply.
+# `-t UUID=` (not -U) on purpose: a copied VHDX keeps the source UUID, so all
+# devices sharing it must be enumerated for the multi-match guard to see them.
+data_devs() {
+  local devs
+  if [ -n "${DATA_UUID:-}" ]; then
+    devs="$(blkid -o device -t "UUID=$DATA_UUID" 2>/dev/null || true)"
+    if [ -n "$devs" ]; then
+      printf '%s\n' "$devs"
       return 0
     fi
+  fi
+  devs="$(blkid -o device -t "LABEL=$DATA_LABEL" 2>/dev/null || true)"
+  [ -n "$devs" ] || return 1
+  printf '%s\n' "$devs"
+}
+
+# data_dev(): exactly one device, else fail closed.
+#   0 = one device on stdout, 1 = none, 2 = ambiguous (devices echoed to stderr)
+data_dev() {
+  local devs n
+  devs="$(data_devs)" || return 1
+  n="$(printf '%s\n' "$devs" | wc -l)"
+  if [ "$n" -ne 1 ]; then
+    printf '%s\n' "$devs" >&2
+    return 2
+  fi
+  printf '%s\n' "$devs"
+}
+
+# data_source(): uuid | label — which identity resolved the device.
+data_source() {
+  if [ -n "${DATA_UUID:-}" ] && [ -n "$(blkid -o device -t "UUID=$DATA_UUID" 2>/dev/null || true)" ]; then
+    printf 'uuid\n'
+  else
+    printf 'label\n'
+  fi
+}
+
+# fail_ambiguous_data_disk(): two attached devices share UUID/label, usually a
+# copied VHDX whose original is still attached. Never mount either one.
+fail_ambiguous_data_disk() {
+  log "检测到多块 UUID/标签相同的数据盘（常见原因：复制了另一个变体的 data.vhdx，且原盘仍处于附加状态）"
+  log "请先运行安装目录里的 unmount-datadisk.cmd 分离多余的一块，再重新打开发行版"
+  log "boot failed: maintenance mode"
+  MOTD_HINT="注意：检测到多块 UUID/标签相同的数据盘。先运行安装目录里的 unmount-datadisk.cmd 分离多余的一块，再重新打开发行版。"
+}
+
+# wait_device(N): wait up to N seconds (default DEVICE_WAIT) for the data disk
+# device to resolve by UUID or shared label. Counter loop, not a wall-clock
+# deadline: tests shim `sleep` to return instantly, so only a fixed iteration
+# count stays bounded. Returns 2 as soon as the identity is ambiguous.
+wait_device() {
+  local n="${1:-$DEVICE_WAIT}" i=0 rc
+  while [ "$i" -lt "$n" ]; do
+    rc=0
+    data_dev >/dev/null 2>&1 || rc=$?
+    if [ "$rc" -eq 2 ]; then
+      return 2
+    fi
+    if [ "$rc" -eq 0 ]; then
+      return 0
+    fi
+    i=$((i + 1))
     sleep 1
   done
   return 1
 }
 
-# ensure_mounted(): PURE-LINUX mount chain (no interop). The host has already
-# attached the VHDX as a bare block device; here we only wait for the device to
-# appear (found by UUID), mount it by hand, and confirm. Returns 0 the moment
-# $DATADIR is mounted, else 1. Every step is logged; none is fatal by itself.
+# attach_vhdx(): start the ONE allowed interop call (bare attach). It only
+# STARTS the attach — it never waits and never decides success: the single
+# wait_device() in ensure_mounted() is the judge. Returns 1 when disabled or
+# when interop is unavailable, 0 otherwise.
+attach_vhdx() {
+  local raw rc tmp human pre
+  if [ "${AGENT_DEVBOX_BOOT_ATTACH:-1}" != "1" ]; then
+    log "boot attach 已禁用（AGENT_DEVBOX_BOOT_ATTACH=0）"
+    return 1
+  fi
+  pre=0
+  data_dev >/dev/null 2>&1 || pre=$?
+  case "$pre" in
+    0)
+      log "数据盘设备已存在（attach_source=preexisting），跳过 boot attach"
+      return 0 ;;
+    2)
+      log "警告：检测到多块数据盘（UUID/标签重复），跳过 boot attach"
+      return 0 ;;
+  esac
+  [ -n "${DATA_VHDX:-}" ] || return 1
+  # Redirect to a file instead of capturing via $(...): the interop output is
+  # UTF-16LE, and a command substitution would drop its NUL bytes with a bash
+  # warning ("ignored null byte in input") — that noise went straight into the
+  # boot log. A file also lets us decode it for humans below.
+  tmp="${TMPDIR:-/tmp}/agent-devbox-attach.$$"
+  # PATH lookup first; System32 is the fallback because the [boot] environment
+  # has a minimal PATH and interop does not necessarily export it.
+  PATH="${PATH:-/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin}:/mnt/c/Windows/System32" \
+    timeout -k 2 "$ATTACH_TIMEOUT" wsl.exe --mount --vhd "$DATA_VHDX" --bare >"$tmp" 2>&1
+  rc=$?
+  # ASCII-visible form (UTF-16LE drops its NULs) — used for matching only.
+  raw="$(tr -d '\000' < "$tmp" 2>/dev/null)"
+  # Human form: decode UTF-16LE when iconv exists; otherwise keep the raw form.
+  human="$raw"
+  if command -v iconv >/dev/null 2>&1; then
+    if iconv -f UTF-16LE -t UTF-8 "$tmp" >"$tmp.u" 2>/dev/null; then
+      human="$(cat "$tmp.u")"
+    fi
+  fi
+  rm -f "$tmp" "$tmp.u"
+  if [ "$rc" -eq 126 ] || [ "$rc" -eq 127 ]; then
+    log "警告：找不到 WSL 互操作程序（interop 不可用），请用维护模式提示的命令手动附加"
+    return 1
+  fi
+  case "$raw" in
+    *ALREADY_ATTACHED*|*0x80040312*)
+      log "VHDX 已附加（attach_source=preexisting, rc=$rc）" ;;
+    "")
+      log "boot attach 返回 rc=$rc（无输出）" ;;
+    *)
+      log "boot attach 返回 rc=$rc：$human" ;;
+  esac
+  if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
+    log "警告：boot attach 超时（${ATTACH_TIMEOUT}s + 2s kill grace）"
+  fi
+  return 0
+}
+
+# ensure_mounted(): attach (only when the device is missing), wait ONCE for the
+# block device, mount by hand, confirm. Returns 0 the moment $DATADIR is
+# mounted, else 1 after a `boot failed: maintenance mode` line. Every step is
+# logged; none is fatal by itself.
 ensure_mounted() {
-  local dev
+  local dev r w
 
   # 1) already mounted -> nothing to do.
   if is_mounted; then
@@ -239,38 +381,55 @@ ensure_mounted() {
     return 0
   fi
 
-  # 2) no VHDX configured -> cannot mount.
+  # 2) no VHDX configured -> cannot attach and cannot mount.
   if [ -z "$DATA_VHDX" ]; then
     if [ "$CONF_MISSING" -eq 1 ]; then
       log "$CONF 尚未写入（首次导入，等待安装器写入并重启）"
     else
       log "未配置 DATA_VHDX，无法挂载数据盘"
+      log "boot failed: maintenance mode"
     fi
     return 1
   fi
 
-  # 3) wait up to 30s for the host-sided attach to expose the block device.
-  log "正在按 UUID 查找数据盘… (uuid=$DATA_UUID)"
-  dev=""
-  for _ in $(seq 1 30); do
-    if dev="$(dev_by_uuid)"; then
-      if [ -n "$dev" ]; then
-        break
-      fi
-    fi
-    sleep 1
-  done
-
-  # 4) device never appeared -> the host task likely has not attached yet.
-  if [ -z "$dev" ]; then
-    log "未找到 UUID=$DATA_UUID 的数据盘设备（宿主计划任务可能尚未附加）"
+  # 3) resolve by UUID, then by the shared ext4 label (interchangeable disks).
+  #    Two matches are ambiguous -> fail closed, never pick one.
+  log "正在查找数据盘设备… (uuid=${DATA_UUID:-未配置}, label=$DATA_LABEL)"
+  r=0
+  data_dev >/dev/null 2>&1 || r=$?
+  if [ "$r" -eq 2 ]; then
+    fail_ambiguous_data_disk
     return 1
+  fi
+  if [ "$r" -eq 0 ]; then
+    dev="$(data_dev)"
+    log "数据盘设备已存在：$dev（attach_source=preexisting, source=$(data_source)）"
+  else
+    # 4) missing -> attach, then the ONE device wait for this boot.
+    log "数据盘设备不存在，尝试在发行版内附加 VHDX（attach_source=boot）"
+    if ! attach_vhdx; then
+      log "警告：boot attach 未成功，继续等待设备出现"
+    fi
+    w=0
+    wait_device "$DEVICE_WAIT" || w=$?
+    if [ "$w" -eq 2 ]; then
+      fail_ambiguous_data_disk
+      return 1
+    fi
+    if [ "$w" -ne 0 ]; then
+      log "未找到 UUID=${DATA_UUID:-未配置} / 标签=$DATA_LABEL 的数据盘设备"
+      log "boot failed: maintenance mode"
+      return 1
+    fi
+    dev="$(data_dev)"
+    log "数据盘设备已出现：$dev（source=$(data_source)）"
   fi
 
   # 5) mount the raw device at $DATADIR.
   mkdir -p "$DATADIR"
   if ! mount -t ext4 "$dev" "$DATADIR"; then
     log "挂载 $dev 到 $DATADIR 失败"
+    log "boot failed: maintenance mode"
     return 1
   fi
 
@@ -278,19 +437,54 @@ ensure_mounted() {
   if is_mounted; then
     return 0
   fi
+  log "挂载后校验失败：$DATADIR 不是挂载点"
+  log "boot failed: maintenance mode"
   return 1
 }
 
-# write_maintenance_motd(): fail-closed notice shown to the user on login.
+# install_dir(): Windows install directory implied by DATA_VHDX (strip the last
+# backslash-separated component). Empty when the path has no directory part.
+install_dir() {
+  if [ -n "${DATA_VHDX:-}" ]; then
+    case "$DATA_VHDX" in
+      *\\*) printf '%s\n' "${DATA_VHDX%\\*}" ;;
+    esac
+  fi
+}
+
+# write_maintenance_motd(): fail-closed notice shown to the user on login. Its
+# commands are pasteable INTO THIS WSL TERMINAL first (the install-dir batch via
+# cmd.exe, then a terminate + reopen), with a Windows PowerShell fallback and the
+# installer one-liner. The same commands go to the boot log, so
+# `tail /var/log/agent-devbox-boot.log` alone answers "how do I fix this?".
 write_maintenance_motd() {
-  cat > "$MOTD_FILE" <<'EOF'
+  local dir distro
+  dir="$(install_dir)"
+  [ -n "$dir" ] || dir='<安装目录>'
+  distro="${DATA_DISTRO:-<你的发行版>}"
+  cat > "$MOTD_FILE" <<EOF
 *** agent-devbox is in MAINTENANCE MODE / 维护模式 ***
 数据盘未挂载，未初始化也未启动服务。
 The data disk is not mounted, so nothing was seeded or started.
-请重新运行 Windows 安装脚本（PowerShell）来创建/挂载数据盘：
-Re-run the Windows installer (in PowerShell) to create/attach the data disk:
+${MOTD_HINT}
+在 WSL 终端里依次运行（复制粘贴即可）：
+Run these in this WSL terminal (copy & paste):
+  1) cmd.exe /c "$dir\\mount-datadisk.cmd"
+  2) wsl.exe --terminate $distro
+然后重新打开发行版（boot 会重新附加并挂载）。
+Then reopen the distro (boot re-attaches and mounts it).
+
+若互操作不可用，改在 Windows PowerShell 里运行：
+If interop is unavailable, run these in Windows PowerShell instead:
+  1) $dir\\mount-datadisk.cmd
+  2) wsl --terminate $distro
+
+若数据盘还没创建，也可以重跑 Windows 安装脚本：
+If the disk was never created, re-run the Windows installer:
   irm https://raw.githubusercontent.com/sfhgknsdfksdlf/agent-devbox/main/windows/install.ps1 | iex
 EOF
+  log "修复步骤 1)：cmd.exe /c \"$dir\\mount-datadisk.cmd\""
+  log "修复步骤 2)：wsl.exe --terminate $distro"
 }
 
 # clear_motd(): drop any stale maintenance notice on a healthy boot. Best effort;
@@ -323,6 +517,7 @@ main() {
     cur="$(findmnt -rno UUID --mountpoint "$DATADIR" 2>/dev/null)"
     if [ "$cur" != "$DATA_UUID" ]; then
       log "FATAL: data disk UUID mismatch (found='$cur' expected='$DATA_UUID')（数据盘 UUID 不匹配）"
+      log "boot failed: maintenance mode"
       write_maintenance_motd
       exit 0
     fi
@@ -350,6 +545,7 @@ main() {
   bind_and_verify "$DATADIR/workspace" /workspace || bind_ok=0
   if [ "$bind_ok" -ne 1 ]; then
     log "FATAL: /home /root /workspace 未正确绑定到数据盘，拒绝启动服务"
+    log "boot failed: maintenance mode"
     write_maintenance_motd
     exit 0
   fi

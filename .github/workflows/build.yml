@@ -16,8 +16,9 @@ name: build
 # local-app zip (the local app store entry).
 # amd64 and arm64 are BOTH built on every run - natively on ubuntu-latest and
 # ubuntu-24.04-arm (free for public repos), no QEMU emulation - and merged into
-# one multi-arch manifest. WSL rootfs is packaged with zstd (Windows has no zstd;
-# the installer fetches a pinned zstd.exe from the official project).
+# one multi-arch manifest. The WSL rootfs is exported per arch on those same
+# native runners and published as rootfs-<variant>-<arch>.tar.zst.part-* with ONE
+# merged SHA256SUMS covering both arches; Tier 3 (zstd.exe) is x64-only.
 on:
   schedule:
     # ~every 3 days, in a quiet UTC window and off the top of the hour
@@ -223,6 +224,9 @@ jobs:
         # parsing cannot see.
         shell: powershell
         run: powershell -NoProfile -ExecutionPolicy Bypass -File tests/powershell/iex-smoke.ps1
+      - name: Segment order under Windows PowerShell 5.1
+        shell: powershell
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File tests/powershell/ps51-order.ps1
       - name: In-memory entry smoke (PowerShell 7)
         shell: pwsh
         run: pwsh -NoProfile -File tests/powershell/iex-smoke.ps1
@@ -371,7 +375,10 @@ jobs:
   # ---------------------------------------------------------------------------
   smoke:
     needs: [plan, merge]
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.plan.outputs.matrix) }}
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v7
       - uses: docker/login-action@v4
@@ -379,11 +386,26 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Native architecture (${{ matrix.arch }})
+        run: |
+          set -euo pipefail
+          arch="${{ matrix.arch }}"
+          case "$arch:$(uname -m)" in
+            amd64:x86_64|arm64:aarch64) echo "native runner ok: $(uname -m)";;
+            *) echo "ERROR: runner $(uname -m) is not native ${{ matrix.arch }}"; exit 1;;
+          esac
+      - name: Image architecture matches the matrix
+        run: |
+          set -euo pipefail
+          got=$(docker run --rm --platform linux/${{ matrix.arch }} \
+                  --entrypoint /usr/bin/dpkg \
+                  ${{ env.AGENTS_IMAGE }}:${{ needs.plan.outputs.tag }} --print-architecture)
+          echo "dpkg arch=$got"; [ "$got" = "${{ matrix.arch }}" ]
       - name: Password is required (must fail without PASEO_PASSWORD)
         run: |
           set -euo pipefail
           set +e
-          out=$(docker run --rm --platform linux/amd64 -e IS_DOCKER=true \
+          out=$(docker run --rm --platform linux/${{ matrix.arch }} -e IS_DOCKER=true \
                   ${{ env.AGENTS_IMAGE }}:${{ needs.plan.outputs.tag }} true 2>&1)
           rc=$?
           set -e
@@ -396,7 +418,7 @@ jobs:
       - name: Boot and health-check
         run: |
           set -euo pipefail
-          docker run -d --name smoke --platform linux/amd64 \
+          docker run -d --name smoke --platform linux/${{ matrix.arch }} \
             -e IS_DOCKER=true -e PASEO_PASSWORD=smoke-test-pw \
             -p 16767:6767 \
             ${{ env.AGENTS_IMAGE }}:${{ needs.plan.outputs.tag }}
@@ -423,9 +445,79 @@ jobs:
         run: docker rm -f smoke || true
 
   # ---------------------------------------------------------------------------
-  # Export the WSL rootfs (zstd, split <2GiB) and cut a Release carrying the
-  # rootfs parts (the WSL image) + the 1Panel local-app zip (the local app store
-  # entry).
+  # Export the WSL rootfs per architecture on its NATIVE runner (no emulation)
+  # and hand the parts to `publish` as build artifacts. Each job checks that the
+  # exported rootfs really is the matrix arch (ELF header), so a mis-targeted
+  # export fails here instead of shipping an unbootable WSL image.
+  # ---------------------------------------------------------------------------
+  export:
+    needs: [plan, merge, smoke]
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.plan.outputs.matrix) }}
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Install zstd + file
+        run: sudo apt-get update && sudo apt-get install -y zstd file
+      - name: Assert native runner
+        run: |
+          set -euo pipefail
+          arch="${{ matrix.arch }}"
+          case "$arch:$(uname -m)" in
+            amd64:x86_64|arm64:aarch64) echo "native: $(uname -m)";;
+            *) echo "ERROR: runner arch $(uname -m) != ${{ matrix.arch }}"; exit 1;;
+          esac
+      - name: Export WSL rootfs (${{ matrix.arch }}) with zstd, split into <2GiB parts
+        run: |
+          set -euo pipefail
+          TAG="${{ needs.plan.outputs.tag }}"
+          arch="${{ matrix.arch }}"
+          for pair in "core:${CORE_IMAGE}" "agents:${AGENTS_IMAGE}"; do
+            v="${pair%%:*}"; img="${pair#*:}"; plat="linux/$arch"
+            echo "== exporting $v from $img:$TAG ($plat) =="
+            docker pull --platform "$plat" "$img:$TAG"
+            cid=$(docker create --platform "$plat" "$img:$TAG")
+            docker export "$cid" -o "rootfs-$v-${{ matrix.arch }}.tar"
+            docker rm -f "$cid"
+            elf=$(tar -xOf "rootfs-$v-${{ matrix.arch }}.tar" usr/bin/dash | file -)
+            echo "elf: $elf"
+            case "$arch:$elf" in
+              amd64:*x86-64*) ;;
+              arm64:*aarch64*) ;;
+              *) echo "ERROR: rootfs-$v-${{ matrix.arch }}.tar is not ${{ matrix.arch }}: $elf"; exit 1;;
+            esac
+            zstd -T0 -${{ env.ZSTD_LEVEL }} -f "rootfs-$v-${{ matrix.arch }}.tar"
+            rm -f "rootfs-$v-${{ matrix.arch }}.tar"
+            split -b 1900M -d -a 2 "rootfs-$v-${{ matrix.arch }}.tar.zst" "rootfs-$v-${{ matrix.arch }}.tar.zst.part-"
+            rm -f "rootfs-$v-${{ matrix.arch }}.tar.zst"
+            mapfile -t parts < <(printf '%s\n' "rootfs-$v-${{ matrix.arch }}.tar.zst.part-"* | sort)
+            part_elf=$(cat "${parts[@]}" | zstd -dc | tar -xOf - usr/bin/dash | file -)
+            echo "parts elf: $part_elf"
+            case "$arch:$part_elf" in
+              amd64:*x86-64*) ;;
+              arm64:*aarch64*) ;;
+              *) echo "ERROR: rootfs-$v-${{ matrix.arch }} parts are not ${{ matrix.arch }}: $part_elf"; exit 1;;
+            esac
+          done
+          ls -lh rootfs-*-${{ matrix.arch }}.tar.zst.part-*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rootfs-${{ matrix.arch }}
+          path: rootfs-*-${{ matrix.arch }}.tar.zst.part-*
+          retention-days: 3
+          if-no-files-found: error
+          compression-level: 0
+
+  # ---------------------------------------------------------------------------
+  # Download the per-arch WSL rootfs parts exported by the `export` job, verify
+  # that both arches are present and their part numbers are contiguous, write
+  # ONE merged SHA256SUMS, and cut a Release carrying the rootfs parts (the WSL
+  # image) + the 1Panel local-app zip (the local app store entry).
   #   schedule / workflow_dispatch -> stable Release `build-<ts>` on the dated
   #                                    tag, promote `latest`.
   #   push                          -> dated `beta-<ts>` prerelease so the
@@ -438,7 +530,7 @@ jobs:
   # versions.json with a `[skip actions]` commit.
   # ---------------------------------------------------------------------------
   publish:
-    needs: [plan, merge, smoke]
+    needs: [plan, export]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -456,25 +548,32 @@ jobs:
           for img in "${{ env.CORE_IMAGE }}" "${{ env.AGENTS_IMAGE }}"; do
             docker buildx imagetools create -t "${img}:latest" "${img}:$TAG"
           done
-      - name: Install zstd
-        run: sudo apt-get update && sudo apt-get install -y zstd
-      - name: Export WSL rootfs (core + agents) with zstd, split into <2GiB parts
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+          pattern: rootfs-*
+      - name: Verify both arches and contiguous parts
         run: |
           set -euo pipefail
-          TAG="${{ needs.plan.outputs.tag }}"
-          for pair in "core:${CORE_IMAGE}" "agents:${AGENTS_IMAGE}"; do
-            v="${pair%%:*}"; img="${pair#*:}"
-            echo "== exporting $v from $img:$TAG =="
-            docker pull --platform linux/amd64 "$img:$TAG"
-            cid=$(docker create --platform linux/amd64 "$img:$TAG")
-            docker export "$cid" -o "rootfs-$v-amd64.tar"
-            docker rm -f "$cid"
-            zstd -T0 -${{ env.ZSTD_LEVEL }} -f "rootfs-$v-amd64.tar"
-            rm -f "rootfs-$v-amd64.tar"
-            split -b 1900M -d -a 2 "rootfs-$v-amd64.tar.zst" "rootfs-$v-amd64.tar.zst.part-"
-            rm -f "rootfs-$v-amd64.tar.zst"
+          ls -lh artifacts
+          for arch in amd64 arm64; do
+            for v in core agents; do
+              mapfile -t parts < <(printf '%s\n' "artifacts/rootfs-$v-$arch.tar.zst.part-"* | sort)
+              [ -e "${parts[0]}" ] || { echo "ERROR: no $v/$arch parts"; exit 1; }
+              i=0
+              for p in "${parts[@]}"; do
+                want=$(printf 'artifacts/rootfs-%s-%s.tar.zst.part-%02d' "$v" "$arch" "$i")
+                [ "$p" = "$want" ] || { echo "ERROR: gap in $v/$arch: expected $want, got $p"; exit 1; }
+                i=$((i+1))
+              done
+            done
           done
-          ls -lh rootfs-*-amd64.tar.zst.part-*
+      - name: Stage rootfs parts
+        run: |
+          set -euo pipefail
+          cp artifacts/rootfs-*-*.tar.zst.part-* .
+          ls -lh rootfs-*-*.tar.zst.part-*
 
       # The installer verifies each part against this file. A length check alone
       # cannot detect a mixed/truncated part that happens to have the right size -
@@ -482,7 +581,7 @@ jobs:
       - name: Write SHA256SUMS for the rootfs parts
         run: |
           set -euo pipefail
-          sha256sum rootfs-*-amd64.tar.zst.part-* > SHA256SUMS
+          sha256sum rootfs-*-*.tar.zst.part-* > SHA256SUMS
           cat SHA256SUMS
 
       # -------------------------------------------------------------------------
@@ -506,7 +605,7 @@ jobs:
           # The rootfs parts ARE the WSL image; the 1Panel zip is the local app
           # store entry.
           files: |
-            rootfs-*-amd64.tar.zst.part-*
+            rootfs-*-*.tar.zst.part-*
             SHA256SUMS
             agent-devbox-1panel-localapp.zip
           generate_release_notes: true

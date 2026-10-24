@@ -35,12 +35,25 @@ the same `RUN` layer, `--no-install-recommends`, `provenance:false`,
 `sbom:false`, and buildx `type=gha` cache. The 10+ GB figure is the *unpacked*
 size; what users pull is compressed.
 
-For WSL, CI exports a flat rootfs (`docker export`), compresses it with **zstd**
-(fast + small), and splits it into **<2 GiB** parts so it fits GitHub Release's
-per-asset limit. The installer streams those parts straight into `wsl --import -`,
-where WSL2's own bsdtar decompresses zstd, so the happy path needs no `zstd.exe` on
-either Windows 11 or Windows 10. Only the last-resort import tier fetches a pinned
-`zstd.exe` from the official facebook/zstd release.
+For WSL, CI exports the flat rootfs (`docker export`) **per architecture on a
+native runner**: the `export` matrix runs `ubuntu-latest` for amd64 and
+`ubuntu-24.04-arm` for arm64, asserts the real ELF in `usr/bin/dash`
+(`x86-64` / `ARM aarch64`), compresses with **zstd** (fast + small), splits it
+into **<2 GiB** parts, and uploads them as a 3-day artifact. The `publish` job
+downloads both artifacts (`merge-multiple`), checks that every part number is
+contiguous (`part-00..NN`), writes **one `SHA256SUMS`** covering both
+architectures, and creates the Release. This project produces each rootfs on its
+native runner; `docker export` itself does not execute the image, so a cross-arch
+export is technically possible, but the native runner also lets the same arch run
+the Docker smoke test. One shared manifest keeps the installer's verification path
+identical on both architectures.
+
+The installer streams the parts for the host's native architecture straight into
+`wsl --import -`, where WSL2's own bsdtar decompresses zstd, so the happy path
+needs no `zstd.exe` on either Windows 11 or Windows 10. Only the last-resort
+import tier fetches a pinned `zstd.exe` from the official facebook/zstd release,
+and that tier exists on x64 only (ARM64 uses Tier 1 / Tier 2; see the ARM64 Q&A
+below).
 
 ## base / rootfs formats
 
@@ -130,7 +143,8 @@ irm https://raw.githubusercontent.com/sfhgknsdfksdlf/agent-devbox/main/windows/i
   Range 断点续传，实时显示 `MiB/s`，停滞自动换连接；下载结束**强制校验文件长度 = Release
   资产大小**，短读只续传、绝不保留。
 
-安装行为本身没有变：仍然先检查磁盘空间再下载、仍然三级回退导入、仍然注册数据盘开机挂载；
+安装行为本身没有变：仍然先检查磁盘空间再下载、仍然三级回退导入、仍然注册数据盘挂载任务；
+但该任务现在**没有触发器**（只作按需修复入口），发行版每次启动由 boot 脚本自己 attach 数据盘。
 安装脚本从 `main` 取，Release 只用于 rootfs 分片和 1Panel 本地应用包。
 
 ## 为什么 rootfs 分片用托管 .NET 下载器，而不是外部下载工具？
@@ -181,6 +195,61 @@ SHA256）。没有旁车或对不上就**整块丢弃重下**；Release 提供 `
 `Write-Progress`——它画在控制台顶部独立区域，而且不进 transcript。输出被重定向（写日志）时
 则改为每 ~2 秒打印一行，保证日志里仍有进度记录。
 
+## 为什么两个架构只有一份 `SHA256SUMS`？
+
+因为安装器的校验路径应当与架构无关。两份清单会立刻带来「清单里混入另一架构分片」「arm64
+分支忘了换清单」这类只在半边出现的错误；一份清单则让两架构走完全相同的代码：下载前按
+`<arch>` 过滤分片，下载后对同一个 `SHA256SUMS` 查摘要，缺项仍然按「清单存在但未覆盖全部
+分片」直接报错。CI 侧也简单：`publish` 用 `upload-artifact` / `download-artifact`
+（`merge-multiple: true`）把两套分片汇到一个目录，检查 `part-00..NN` 连续后执行一次
+`sha256sum rootfs-*-*.tar.zst.part-* > SHA256SUMS`。这个「多平台产物 + 单份校验和」的做法与
+GitHub 官方 artifact 组合的用法一致，也避免了发布阶段的架构分支。
+
+## 为什么 ARM64 跳过 Tier 3？
+
+Tier 3 的唯一作用是下载 `zstd.exe` 再把分片解成 `.tar`，而 facebook/zstd 官方发布的是
+**win64** 二进制。在 Windows 11 ARM64 上它要么无法执行，要么只能依赖 x64 模拟，等于把
+「最后兜底」变成一个新的失败面。ARM64 因此只保留 Tier 1（流式导入）和 Tier 2（`.tar.zst`
+文件导入）：WSL2 自带的 bsdtar 本来就能解 zstd，前两级已经覆盖真实场景。
+
+跳过 Tier 3 时**不设置** `ContentSuspect`：内容并未被证明损坏，设置它会让安装器把分片当成
+坏文件删掉。分片与旁车保留在安装目录，重跑安装器会先校验 SHA256 再续传。若两级都失败，
+错误信息会提示先执行 `wsl --update` 再重装（旧版 WSL 的解压支持可能不足）。
+
+## 主机架构是如何判断的？
+
+顺序是：`PROCESSOR_ARCHITEW6432` → **Machine 作用域**的 `PROCESSOR_ARCHITECTURE`（注册表）→
+进程 `PROCESSOR_ARCHITECTURE` → CIM `Win32_Processor.Architecture`（`12` = ARM64，
+`9` = x64）。**不能只看进程环境变量**：ARM64 上以 x64 模拟运行的 PowerShell 会报 `AMD64`，
+32 位 WOW64 会报 `x86`，但 Machine 值仍是 `ARM64`。所有来源都无法识别时直接 throw
+（fail closed），绝不默认 amd64；这段逻辑是纯函数，单元测试覆盖了 WOW64、x64 模拟与未知值，
+wsl-ui 的架构判断也复用同一个 helper。
+
+Windows 10 ARM64 在下载前就会因 build < 22000 被拒绝，不承诺支持；支持的组合只有
+**Windows 11 ARM64（build 22000+）**、**Windows 11 x64** 和 **Windows 10 x64**。发行版名
+不变（`agent-devbox` / `agent-devbox-core`），变化只在资产名。
+
+## Windows 11 ARM64 真机验收
+
+把 `<distro>` 换成 `agent-devbox` 或 `agent-devbox-core`：
+
+```powershell
+wsl -d <distro> -u root -e uname -m
+# => aarch64
+
+wsl -d <distro> -u root -e 'wget -q -T 5 -O /dev/null http://127.0.0.1:6767/api/health'
+# => exit code 0
+
+wsl -d <distro> -u root -e "ps -o user= -C node | sort -u"
+# => paseo
+
+wsl -d <distro> -u root -e 'script -qec "echo pty-ok" /dev/null'
+# => pty-ok
+```
+
+再看一眼开机日志以 `boot complete` 结尾、数据盘已挂载；最后重跑一次安装器，确认数据盘与
+paseo 密码都保留，`uname -m` 仍是 `aarch64`。
+
 ## 为什么升级镜像不会重设 paseo 密码？
 
 `/etc/agent-devbox.conf` 在**系统盘**上，而升级 = 注销 + 重新导入系统盘，配置文件会跟着没。
@@ -193,7 +262,10 @@ SHA256）。没有旁车或对不上就**整块丢弃重下**；Release 提供 `
 会顺带挂载数据盘并启动 paseo，于是升级时多一次「刚起来又被 terminate」的无谓启停。
 升级若读不到数据盘密码，安装器会明确警告「本次会按新密码处理」，绝不静默换密码。
 
-同一个思路也去掉了「是否重装 `[Y/n]`」：升级是默认动作，不再让用户按 y。
+同一个思路也去掉了「是否重装 `[Y/n]`」：升级仍是默认动作，但只有在**交互式控制台**里且未指定
+`-Yes` / `-KeepExisting` 时才会问一行——**回车 = 覆盖升级**，`n` = 取消（不下载、不注销、不做
+任何改动，退出码 0）；输入其它内容只再问一次，第二次仍无法识别就取消。重定向/无人值守时不会
+卡在提问上，直接升级。数据盘（`/home`、`/root`、`/workspace`）与 paseo 密码保留。
 
 ## OpenCode 桌面版添加 WSL 服务器提示「未安装 OpenCode」？
 

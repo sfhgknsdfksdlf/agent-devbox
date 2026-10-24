@@ -1,6 +1,6 @@
 # PROJECT KNOWLEDGE BASE
 
-**Updated:** 2026-10-21 · **Branch:** main · Deep Windows contracts: `windows/AGENTS.md`; shell boot: `scripts/AGENTS.md`.
+**Updated:** 2026-10-22 · **Branch:** main · Deep Windows contracts: `windows/AGENTS.md`; shell boot: `scripts/AGENTS.md`.
 
 ## OVERVIEW
 One OCI image = an AI dev/test environment (paseo daemon + web UI, OpenCode V1, omo, toolchains), used two ways: Docker (bind mounts) or WSL2 (imported rootfs + an independent VHDX data disk). There is NO application source — this repo is Dockerfile / Bash / PowerShell / CI config.
@@ -27,9 +27,9 @@ docs/                            # user-facing guides
 | OpenCode / omo | `opencode-ai@^1` only (never `@opencode/cli` — V2 clobbers the bin); omo installs via `bunx` (npx is broken in the image). |
 | Desktop CLI | The desktop app resolves a WSL CLI ONLY at `$HOME/.opencode/bin/opencode` (no PATH lookup), needs `opencode --version` == app version, then runs `serve`. Boot recreates that link per home on the data disk; `scripts/desktop-cli-check.sh` is the read-only self-check. A failed probe is cached for the app's whole session → restart it fully (tray too). |
 | Release channels | schedule/dispatch → dated image tag + stable Release `build-<ts>` + promote `latest`; push to main → image `<ts>` + prerelease `beta-<ts>`; any other branch → `beta-<ts>`. Every push moves `:beta` and prunes older `beta-*` (newest survives). Push NEVER promotes `latest`. |
-| Artifacts | images → ghcr.io; WSL rootfs parts (zstd, <2GiB each) + 1Panel zip → GitHub Releases; the Windows entry is ONLY the raw `main` one-liner (`irm .../windows/install.ps1 \| iex`). |
-| Windows install | `install.ps1` fetches the siblings from the SAME `-Ref` (raw source tree, NOT the Release), verifies `windows/SHA256SUMS` before dot-sourcing (missing manifest → `-AllowUnverifiedScripts`; partial/mismatch → fatal), then runs `install-agent-devbox.ps1`. Rootfs parts go through `Save-Download` (managed `System.Net.Http.HttpClient`: proxy/PAC, Range+`If-Match`, `412` restart, length+SHA256 gate, sidecar identity in `.agent-devbox-download\`). The lazily loaded `wsl-ensure-downloads.ps1` (wsl-ui + Tier-3 zstd) is OPTIONAL in the hash gate. Upgrade also repairs Windows Terminal `--distribution-id` (GUID read from `HKCU\...\Lxss`). |
-| WSL data-disk mount | Per-variant distro/dir/task (`agent-devbox` / `agent-devbox-core`), each with its OWN `data.vhdx` (no shared home/root/workspace), ext4 label `devbox-data` → `/mnt/devbox-data`. Windows only ATTACHES it (`wsl --mount --vhd ... --bare`, hidden logon task); `wsl-boot.sh` is pure Linux (never `wsl.exe`/`schtasks.exe` — that caused a boot loop). 停止发行版默认只用 `wsl --terminate <发行版>`（保留 attach）；`wsl --shutdown` 仅限「改完镜像网络 → 提示会关闭所有发行版 → 用户 y/N 同意」这一条路径。只有重启 Windows 后首次启动才会进 MAINTENANCE 直到重新附加。 |
+| Artifacts | images → ghcr.io; WSL rootfs parts per arch (`rootfs-<variant>-<arch>.tar.zst.part-*`, zstd, <2GiB each, produced by the native `export` matrix → artifacts → `publish`) with ONE merged `SHA256SUMS` covering both arches, + 1Panel zip → GitHub Releases; the Windows entry is ONLY the raw `main` one-liner (`irm .../windows/install.ps1 \| iex`). |
+| Windows install | `install.ps1` fetches the siblings from the SAME `-Ref` (raw source tree, NOT the Release), verifies `windows/SHA256SUMS` before dot-sourcing (missing manifest → `-AllowUnverifiedScripts`; partial/mismatch → fatal), then runs `install-agent-devbox.ps1`. Host arch is resolved fail-closed (`PROCESSOR_ARCHITEW6432` → machine-scope registry `PROCESSOR_ARCHITECTURE` → process env → CIM `12`/`9`) and selects `rootfs-*-<arch>`; ARM64 (Windows 11 build 22000+ only) skips Tier 3, and after import, before `datadisk-init.sh`/mkfs, `uname -m` must equal `aarch64` (`x86_64` on amd64), else unregister the new distro, remove only `ext4.vhdx`, keep `data.vhdx` + parts. Rootfs parts go through `Save-Download` (managed `System.Net.Http.HttpClient`: proxy/PAC, Range+`If-Match`, `412` restart, length+SHA256 gate, sidecar identity in `.agent-devbox-download\`). The lazily loaded `wsl-ensure-downloads.ps1` (wsl-ui + Tier-3 zstd) is OPTIONAL in the hash gate. Upgrade also repairs Windows Terminal `--distribution-id` (GUID read from `HKCU\...\Lxss`). |
+| WSL data-disk mount | Per-variant distro/dir (`agent-devbox` / `agent-devbox-core`), each with its OWN `data.vhdx` (no shared home/root/workspace), ext4 label `devbox-data` → `/mnt/devbox-data`. Every distro start runs `wsl-boot.sh`, which itself makes ONE bounded `wsl.exe --mount --vhd <path> --bare` call (hard timeout; skipped when the device is already attached) and then mounts it in Linux. Both variants share the ext4 label `devbox-data` (and mount name); boot resolves the device by UUID first (all devices carrying it) and falls back to the label only when no device carries that UUID, and more than one candidate fails closed instead of picking one (e.g. a copied `data.vhdx` whose original is still attached); the two variants' own disks have different UUIDs, so both may stay attached. There is NO Windows scheduled task: the installer only attaches once and unregisters legacy `agent-devbox*-mount-datadisk` entries; the pure-batch install-dir `mount-datadisk.cmd` is the manual repair entry (no UAC). `wsl-boot.sh` must never call `schtasks` / `wsl -d` / `--unmount` (that caused a boot loop). `wsl --terminate` keeps the attach; `wsl --shutdown` detaches ALL mounted disks by design; a Windows restart ALWAYS loses the attach (WSL's re-attach state is a VOLATILE registry key). On failure: MAINTENANCE MODE, banner prints `cmd.exe /c "<InstallDir>\mount-datadisk.cmd"` + `wsl.exe --terminate <distro>` (PowerShell fallback: `<InstallDir>\mount-datadisk.cmd` + `wsl --terminate <distro>`), `boot failed` (never `boot complete`). |
 | PS encoding | `install.ps1` UTF-8 **without** BOM (in-memory fetch keeps a BOM as U+FEFF and breaks PS 5.1); other `windows/*.ps1` UTF-8 **with** BOM; `.cmd` ASCII + CRLF. CI ps-lint enforces. |
 
 ## WHERE TO LOOK
@@ -44,6 +44,7 @@ docs/                            # user-facing guides
 ## CONVENTIONS
 - Shell: `set -euo pipefail`; must pass shellcheck 0.9.0 AND actionlint's embedded shellcheck — avoid `A && B || C` (SC2015). Exception: `scripts/wsl-boot.sh` omits `-e` (best-effort boot).
 - PowerShell: `$ErrorActionPreference='Stop'`; never build `cmd` command strings (use native .NET/PowerShell). CI AST-parses every file, enforces the BOM policy, and runs the entry under the real **5.1** host.
+- Host arch: `Get-AgentDevboxHostArch` precedence = `PROCESSOR_ARCHITEW6432` → machine-scope `PROCESSOR_ARCHITECTURE` (registry) → process env → CIM `Win32_Processor.Architecture` (`12`=ARM64, `9`=x64); unknown throws (never assume amd64). **Never trust the process `PROCESSOR_ARCHITECTURE` alone**: x64-emulated PowerShell on ARM64 reports `AMD64`, WOW64 reports `x86`.
 - Dockerfile RUN steps stay section-bannered (L1..L14).
 - `versions.json` is the auto-latest diff-gate; only `PLAYWRIGHT_VERSION` and `GO_VERSION` are pinned (bumped by `bump-pinned.yml`, not the 3-day build).
 - After ANY `windows/*.ps1` or `*.cmd` edit: `git add windows/` **then** `bash .github/scripts/update-windows-sums.sh` (hashes staged blobs).
@@ -65,16 +66,20 @@ docs/                            # user-facing guides
 
 **Failure must be self-explaining**: pre-installer failures write `$LogPath.err` and the original window echoes `===== 失败原因 =====`. Never ship an exit-code-only failure (the elevated console is a separate window).
 
-**Windows 计划任务 / WT profile（实测 2026-10-20）**
-- `New-ScheduledTaskSettingsSet` 默认 `DisallowStartIfOnBatteries`/`StopIfGoingOnBatteries`=true → 笔记本拔电登录不挂数据盘、30s 后进维护模式。必须显式 `-AllowStartIfOnBatteries -DontStopIfGoingOnBatteries`，且幂等比较要覆盖这两项（只比 `MultipleInstances` 会一直判“一致”，老机器永远修不到）。
-- 变体卸载后 `<distro>-mount-datadisk` 任务会残留；旧式 `--mount --type ext4 --name` 还会把旧盘挂到所有发行版可见的 `/mnt/wsl/<name>` → 安装时按「发行版已不在 `wsl -l`」或「VHDX 不存在」清理。
+**WT profile / 数据盘修复入口（实测 2026-10-20）**
+- 旧版本会留下 `<distro>-mount-datadisk` 任务，旧式 `--mount --type ext4 --name` 还会把旧盘挂到所有发行版可见的 `/mnt/wsl/<name>` → 现在不再创建任何任务，安装器只按「发行版已不在 `wsl -l`」或「VHDX 不存在」注销这些旧任务。
 - **WT profile 用固定 GUID 的 fragment**：镜像 `/etc/wsl-distribution.conf` 设 `[windowsterminal] enabled=false`（否则 WSL 每次 import 按注册表 GUID 生成新 profile，重装即换 GUID）；安装器写 `Fragments\AgentDevbox\<发行版>.json`（固定 GUID + `wsl.exe -d <名字>` + `\\wsl$\<发行版>\root`），并删除 `Fragments\Microsoft.WSL` 里属于本发行版的旧条目。fragment 必须在 `[4/10] import` **之前**写（Modern=1 且生成器关闭时没有自动 profile）。
 - 密码只从数据盘 `.paseo-password` 读（`[7/10]`）；不要再为 `cat` 旧 conf 启动旧发行版（`[boot]` 会拉起 paseo，升级白启停一次）。读不到时明确告警，不静默换密码。
 - `daemon.log` 由 paseo 自己按 10MB×3 轮转（`supervisor-log-config.js`）；`/var/log/paseo-boot.log` 是 `wsl-boot.sh` 的 `>>` 重定向，启动前按 5MiB 滚成 `.1`。
-- 升级的 `wsl --unregister` 必须排在「分片下载 + SHA256 校验」之后（放 [2/10] 时下载失败会把旧系统盘一起删掉）；`datadisk-init.sh` 只做 `mkfs`，seed 只在 `wsl-boot.sh`（失败不写 `.initialized`）；清理残留挂载任务后要顺手 `wsl --unmount` 旧 VHDX；CI 不变量只放 `run.ps1`，build.yml 不再重复 grep（重复副本曾把 ps-lint 判红）。
-- **`wsl --mount` 的失败会被 `-EncodedCommand` 吞掉**（PowerShell 退出 0）→ 安装器以为 attach 成功，重启后 wsl-boot 找不到设备、静默进维护模式。任务改调 `mount-datadisk.ps1`（3 次重试 + `datadisk-attach.log` + 真实退出码）；安装器自己也 attach 一次，重启后 `Assert-DataDiskMounted` 只认**本次新增**的 boot 日志（`tail -n +N` 找 `boot complete`），失败即报错。绝不允许「安装成功但进维护模式」。
+- 升级的 `wsl --unregister` 必须排在「分片下载 + SHA256 校验」之后（放 [2/10] 时下载失败会把旧系统盘一起删掉）；`datadisk-init.sh` 只做 `mkfs`，seed 只在 `wsl-boot.sh`（失败不写 `.initialized`）；清理残留的旧挂载后要顺手 `wsl --unmount` 旧 VHDX；CI 不变量只放 `run.ps1`，build.yml 不再重复 grep（重复副本曾把 ps-lint 判红）。
+- **`wsl --mount` 的失败会被 `-EncodedCommand` 吞掉**（PowerShell 退出 0）→ 历史教训：安装器曾以为 attach 成功，重启后 wsl-boot 找不到设备、静默进维护模式。现在 boot 自己发起一次硬超时 attach；手动修复改用纯批处理 `mount-datadisk.cmd`（直接 `wsl.exe --mount --vhd --bare`，3 次重试 + `datadisk-attach.log` + 真实退出码，不再包一层 `-EncodedCommand`），安装器也自己 attach 一次，重启后 `Assert-DataDiskMounted` 只认**本次新增**的 boot 日志（`tail -n +N` 找 `boot complete`，遇 `boot failed` 立即失败），失败即报错并打印修复命令。绝不允许「安装成功但进维护模式」。
 - **`wsl -d` 会话看不到 `[boot]` 会话建立的挂载**（2026-10-21 22:05 实测：boot 已「数据盘挂载成功 / boot complete」并起了 paseo，`wsl -d ... findmnt` 连续 45s 全空）→ 挂载校验只能用 boot 日志这类文件证据，不能只用 findmnt。
 - **绝不在另一个发行版里直接 `mount` WSL 的 `/dev/sdX`**（2026-10-22 实测事故）：`mount -o ro,noload /dev/sdf`（= core 的 ext4.vhdx）会把 ext4 超级块钉成只读，之后 `wsl -d agent-devbox-core` 报 `无法启动分发。错误代码: 16，失败步骤: 2` / `Wsl/Service/CreateInstance/E_FAIL`；dmesg 证据 `sdf: Can't mount, would change RO state` + `UtilMount:1850 ... failed 16`（errno 16 = EBUSY）。**卸载即恢复**。读镜像内日志只用「`cp` vhdx → `qemu-img check -r all` → `qemu-nbd --read-only` 挂副本」。
+
+**ARM64 / WSL 架构**
+- `wsl --import` **不校验架构** → 导入后、`datadisk-init.sh`（mkfs）之前必须跑 `uname -m`；不匹配或 `Exec format error` 就注销新发行版、只删 `ext4.vhdx`，保留 `data.vhdx` 与已下载分片。
+- ARM64 绝不下载 `zstd.exe`（只有 win64）；跳过 Tier 3 时不得设 `ContentSuspect`，分片保留供重试；资产名不得写死 `rootfs-$Variant-amd64`。
+- 架构检测不可识别即 throw（fail closed）；CI 不变量只在 `run.ps1`，build.yml 不放重复 grep。
 
 ## ANTI-PATTERNS
 - NEVER set `HOME` globally in the image (root shell needs `HOME=/root`; the daemon's HOME is set in `paseo-boot` only).
@@ -88,7 +93,7 @@ docs/                            # user-facing guides
 ```bash
 # tests + static (CI-equivalent)
 bash tests/run.sh
-pwsh -NoProfile -File tests/powershell/run.ps1                 # 259 assertions, no deps
+pwsh -NoProfile -File tests/powershell/run.ps1                 # 500+ assertions, no deps
 pwsh -NoProfile -File tests/powershell/iex-smoke.ps1           # also: powershell -File ... (5.1)
 pwsh -NoProfile -Command "Invoke-Pester -Path tests/powershell/install.Tests.ps1 -CI"
 pwsh -NoProfile -Command "Get-ChildItem windows -Filter *.ps1 | %{ [System.Management.Automation.Language.Parser]::ParseFile(\$_.FullName,[ref]\$null,[ref]\$e) }"
@@ -101,5 +106,5 @@ PASEO_PASSWORD=x docker compose config -q
 ## NOTES
 - paseo: `paseo daemon run` + `PASEO_LISTEN` / `PASEO_WEB_UI_ENABLED` / `PASEO_PASSWORD` / `PASEO_HOME`; `/api/health` is unauthenticated.
 - uid 1000 is pre-owned by `node` → `userdel -r node` before `useradd paseo`. aider-chat needs Python <3.13 (`uv tool --python 3.12`; system Python is 3.13).
-- CI builds amd64 + arm64 natively (`ubuntu-latest`, `ubuntu-24.04-arm`) then merges a multi-arch manifest.
+- CI builds amd64 + arm64 images natively (`ubuntu-latest`, `ubuntu-24.04-arm`) then merges a multi-arch manifest; `smoke` is the same 2-arch native matrix, and the `export` matrix exports the WSL rootfs per arch (artifacts → `publish`).
 - Windows/WSL paths cannot run on the Linux host; real coverage is the `ps-lint` job on `windows-latest` (AST, BOM/`.cmd` policy, `run.ps1`, Pester, 5.1 IEX smoke).
