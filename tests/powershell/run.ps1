@@ -477,6 +477,9 @@ Assert-True ($mainText -notmatch '(?m)^\s*\$distroExists = Test-DistroExists\s*$
 Assert-True ($mainText -match '\.paseo-password') 'upgrade: the password is stored on the data disk'
 Assert-True ($mainText -match 'blkid -U') 'upgrade: the data disk is mounted by UUID to read/write the password'
 Assert-True ($mainText -match 'mountpoint -q') 'upgrade: mounting is idempotent (mountpoint -q)'
+Assert-True ($mainText -match 'findmnt -rno UUID --mountpoint') 'upgrade: the password step verifies the mounted data-disk UUID'
+Assert-True ($mainText -match 'DATA_DISK_WRITE_MISMATCH') 'upgrade: the password is read back from the data disk after writing'
+Assert-True ($mainText -notmatch '\$dataDiskMounted -and \$pw') 'upgrade: the password write no longer trusts a stale mount flag'
 
 # --- 升级提示文案（纯函数，红门）-------------------------------------------
 # 空 -InstallDir 必须与旧文案逐字一致（老入口/无人值守路径不能变）；
@@ -605,7 +608,7 @@ Assert-True ($diskPwIdx -ge 0) 'upgrade: the data-disk password is the only upgr
 Assert-True ($mainText -match '升级未能从数据盘读回') 'upgrade: a missing data-disk password is surfaced (never silent)'
 $pwWriteIdx = -1; $unmountIdx = -1
 for ($i = 0; $i -lt $dlLines.Count; $i++) {
-  if ($pwWriteIdx -lt 0 -and $dlLines[$i] -match 'printf %s \{0\} > \{1\}') { $pwWriteIdx = $i }
+  if ($pwWriteIdx -lt 0 -and $dlLines[$i] -match 'printf %s \{2\} > \{3\}') { $pwWriteIdx = $i }
   if ($unmountIdx -lt 0 -and $dlLines[$i] -match "'--unmount'") { $unmountIdx = $i }
 }
 Assert-True ($pwWriteIdx -ge 0 -and $unmountIdx -ge 0 -and $pwWriteIdx -lt $unmountIdx) 'upgrade: the data disk is unmounted only after the password is written'
@@ -1039,7 +1042,7 @@ Assert-True ($mainText -match 'Copy-Item -LiteralPath \$LogPath -Destination \$s
 Assert-True ($mainText -match 'cat /etc/agent-devbox.conf') 'log: password retrieval command is shown'
 Assert-True ($mainText -notmatch '已生成 paseo 密码：') 'log: password is never printed'
 Assert-True ($mainText -match 'Start-Sleep -Seconds 10') 'task: interactive hold is present'
-Assert-True ($mainText -match '火绒') 'task: AV allow prompt is present'
+Assert-True ($mainText -notmatch '火绒') 'task: the stale AV allow prompt is gone (there is no scheduled task)'
 Assert-True ($mainText -match '-not \$Yes') 'task: hold is gated on -not $Yes'
 # 计划任务已彻底移除：安装器只清理旧版本注册的任务，并自己 attach 一次。
 # conf 现在正好 5 个键（DATA_TASK 已随计划任务一起删除）。

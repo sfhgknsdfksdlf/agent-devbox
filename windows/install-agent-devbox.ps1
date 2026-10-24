@@ -850,7 +850,9 @@ $pwFile = "$mountPoint/.paseo-password"
 $dataDiskPw = ''
 $dataDiskMounted = $false
 try {
-  $mountScript = 'set -e; mkdir -p {0}; dev=$(blkid -U {1}); [ -n "$dev" ] || exit 3; mountpoint -q {0} || mount -t ext4 "$dev" {0}; mountpoint -q {0}' -f $mountPoint, $uuid
+  # 挂载后必须校验挂载点的 UUID：/mnt/<name> 可能残留别的磁盘或陈旧挂载，只靠
+  # mountpoint -q 会读到错误的数据盘（升级时把密码读成别人的）。与 boot 的校验一致。
+  $mountScript = 'set -e; mkdir -p {0}; if ! mountpoint -q {0}; then dev=$(blkid -U {1} 2>/dev/null || true); [ -n "$dev" ] || exit 3; mount -t ext4 "$dev" {0}; fi; cur=$(findmnt -rno UUID --mountpoint {0}); [ "$cur" = {1} ]' -f $mountPoint, (Quote-Bash $uuid)
   Invoke-Native 'wsl.exe' @('-d', $Distro, '-u', 'root', '-e', 'bash', '-lc', $mountScript) | Out-Null
   $dataDiskMounted = ($script:NativeExit -eq 0)
   if ($dataDiskMounted) {
@@ -903,12 +905,19 @@ if ($script:NativeExit -ne 0) { throw "写入 $ConfPath 失败（退出码 $scri
 Ok "已写入 $ConfPath（UUID=$uuid）"
 
 # 把密码存到数据盘：升级只会替换系统盘，数据盘上的这个文件会原样保留。
-if ($dataDiskMounted -and $pw) {
+# 必须在这一条命令里重新挂载并校验 UUID：读取步骤之后发行版可能已经重启过
+# （2026-10-24 实测：写 conf 的那次 `wsl -d` 触发了 boot，boot 因 conf 尚未写入而
+# 跳过挂载），此时只凭 $dataDiskMounted 会把文件写进系统盘的 /mnt/<mntname> 普通目录，
+# 退出码仍是 0、日志假成功。写完立即回读，确保真的落在数据盘上。
+if ($pw) {
   try {
-    $writeScript = 'set -e; umask 077; printf %s {0} > {1}; chmod 600 {1}' -f (Quote-Bash $pw), $pwFile
-    Invoke-Native 'wsl.exe' @('-d', $Distro, '-u', 'root', '-e', 'bash', '-lc', $writeScript) | Out-Null
+    $writeScript = 'set -e; umask 077; mkdir -p {0}; if ! mountpoint -q {0}; then dev=$(blkid -U {1} 2>/dev/null || true); if [ -z "$dev" ]; then echo DATA_DISK_MISSING >&2; exit 3; fi; mount -t ext4 "$dev" {0}; fi; cur=$(findmnt -rno UUID --mountpoint {0}); if [ "$cur" != {1} ]; then echo "DATA_DISK_UUID_MISMATCH:$cur" >&2; exit 4; fi; printf %s {2} > {3}; chmod 600 {3}; sync; if [ "$(cat {3})" != {2} ]; then echo DATA_DISK_WRITE_MISMATCH >&2; exit 5; fi' -f $mountPoint, (Quote-Bash $uuid), (Quote-Bash $pw), $pwFile
+    $writeOut = Invoke-Native 'wsl.exe' @('-d', $Distro, '-u', 'root', '-e', 'bash', '-lc', $writeScript)
     if ($script:NativeExit -eq 0) { Ok '已把 paseo 密码保存到数据盘（下次升级沿用）。' }
-    else { Warn '保存密码到数据盘失败（本次密码仍写入 /etc/agent-devbox.conf）。' }
+    else {
+      Warn ("保存密码到数据盘失败（退出码 {0}）：{1}" -f $script:NativeExit, (($writeOut | Out-String).Trim()))
+      Warn '本次密码仍写入 /etc/agent-devbox.conf；下次升级可能需要重新设置密码。'
+    }
   } catch { Warn "保存密码到数据盘失败：$($_.Exception.Message)" }
 }
 # 数据盘必须在上面的读取/写入之后才卸载；重启发行版时由 wsl-boot.sh 自己重新 attach。
@@ -1015,7 +1024,7 @@ Write-Host "查看启动日志：wsl -d $Distro -u root -e tail -n 200 /var/log/
 Write-Host "查看 paseo 日志：wsl -d $Distro -u root -e tail -n 200 /var/log/paseo-boot.log"
 
 if (-not $Yes -and [Environment]::UserInteractive) {
-  Write-Host '若刚才出现火绒/杀毒软件弹窗，请点击【允许】。本窗口将在 10 秒后自动关闭…'
+  Write-Host '本窗口将在 10 秒后自动关闭…'
   Start-Sleep -Seconds 10
 }
 
