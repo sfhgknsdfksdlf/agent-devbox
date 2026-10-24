@@ -56,6 +56,10 @@ PowerShell that imports a released rootfs as a WSL distro and wires a persistent
 - `datadisk-init.sh` 非零退出即 FATAL（保留 `data.vhdx`），否则本 conf 可能记录另一通道的盘。
 - beta 安装拒绝 `/usr/local/bin/wsl-boot.sh` 缺 `DATA_LABEL` 的旧 rootfs（否则会回退到共享的 `devbox-data` 标签）：明确报错并提示改用 `-ReleaseTag beta`，保留 `data.vhdx`；stable 不受影响。
 
+**Windows checkout 默认 CRLF（2026-10-24 CI ps-lint）**
+- windows-latest 的 Git for Windows 默认 `core.autocrlf=true`，`actions/checkout` 不覆盖；根 `.gitattributes` 用 `* text=auto eol=lf` 强制 LF，`.cmd` 用 `-text -eol` 保持 blob/raw 的 CRLF（`text eol=crlf` 会把 blob 变 LF，破坏 raw 下载与 `SHA256SUMS`）。
+- 读文件后的多行断言不要用裸 `$`（.NET 的 `$` 不匹配 `\r\n`），用 `\r?$`；`\s*$` 会吞换行，不可靠。
+
 ## ANTI-PATTERNS
 - NEVER build a `cmd /c copy /b "..."` string (quote/`$()` escaping) — use `Join-Parts`.
 - NEVER add a second install entry (`.cmd`/`.bat`) or a second elevation path.

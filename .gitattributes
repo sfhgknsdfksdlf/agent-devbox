@@ -1,0 +1,10 @@
+# Keep the working tree LF on every platform. Git for Windows (the
+# windows-latest runner) defaults to core.autocrlf=true, and actions/checkout
+# does not override it; CRLF would break line-anchored assertions in
+# tests/powershell/run.ps1 (a bare $ does not match "\r\n").
+* text=auto eol=lf
+
+# Batch files must stay byte-identical CRLF: install.ps1 downloads them from
+# raw.githubusercontent.com and windows/SHA256SUMS hashes the stored blob.
+# -text -eol keeps the CRLF blob (text eol=crlf would renormalize it to LF).
+*.cmd -text -eol

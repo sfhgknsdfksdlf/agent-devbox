@@ -1149,8 +1149,10 @@ Assert-True ($ociDockerfile -notmatch 'docker-cli') 'layers: OCI image never ins
 Assert-True ($ociDockerfile -notmatch '(?i)powershell_') 'layers: OCI image never installs PowerShell'
 Assert-True ($ociDockerfile -notmatch '\bpwsh\b') 'layers: OCI image has no pwsh'
 Assert-True ($ociDockerfile -notmatch '\bdockerd\b') 'layers: OCI image has no dockerd'
-Assert-True ($wslDockerfile -match '(?m)^ARG BASE_IMAGE$') 'wsl: overlay takes BASE_IMAGE'
-Assert-True ($wslDockerfile -match '(?m)^FROM \$\{BASE_IMAGE\}$') 'wsl: overlay derives from the built image'
+# \r?$ keeps these assertions valid on a CRLF checkout (.NET's $ matches
+# before \n but not before \r\n; .gitattributes normally keeps CI LF).
+Assert-True ($wslDockerfile -match '(?m)^ARG BASE_IMAGE\r?$') 'wsl: overlay takes BASE_IMAGE'
+Assert-True ($wslDockerfile -match '(?m)^FROM \$\{BASE_IMAGE\}\r?$') 'wsl: overlay derives from the built image'
 foreach ($pkg in @('docker.io','docker-cli','docker-compose','docker-buildx','fio','osslsigncode','libevtx-utils','python3-evtx')) {
   Assert-True ($wslDockerfile -match "(?m)^\s+[^\r\n]*\b$([regex]::Escape($pkg))\b") "wsl: overlay installs $pkg"
 }
@@ -1166,7 +1168,7 @@ Assert-True ($exportBlock -match 'Dockerfile\.wsl') 'ci: export builds the WSL o
 Assert-True ($exportBlock -match '--build-arg BASE_IMAGE=') 'ci: overlay derives from the built image'
 Assert-True ($exportBlock -match '\$TAG-wsl') 'ci: export uses the overlay tag'
 Assert-True ($exportBlock -match 'docker rmi -f "\$img:\$TAG-wsl"') 'ci: overlay image is removed after export'
-Assert-True ($ciText -match '(?m)^\s+- "Dockerfile\.wsl"$') 'ci: overlay changes trigger a build'
+Assert-True ($ciText -match '(?m)^\s+- "Dockerfile\.wsl"\r?$') 'ci: overlay changes trigger a build'
 $smokeBlock = [regex]::Match($ciText, '(?ms)^  smoke:.*?(?=^  export:)').Value
 Assert-True ($smokeBlock -match 'dockerd') 'ci: smoke proves the OCI image has no dockerd'
 Assert-True ($smokeBlock -match 'pwsh') 'ci: smoke proves the OCI image has no pwsh'
