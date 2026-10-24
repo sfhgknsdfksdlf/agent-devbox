@@ -548,7 +548,7 @@ jobs:
           for img in "${{ env.CORE_IMAGE }}" "${{ env.AGENTS_IMAGE }}"; do
             docker buildx imagetools create -t "${img}:latest" "${img}:$TAG"
           done
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: artifacts
           merge-multiple: true
