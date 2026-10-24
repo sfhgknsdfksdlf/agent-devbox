@@ -82,6 +82,14 @@ DATADIR="${AGENT_DEVBOX_DATADIR:-}"
 # written by the `>>` redirect in main(), so nothing else can bound it.
 PASEO_LOG="${AGENT_DEVBOX_PASEO_LOG:-/var/log/paseo-boot.log}"
 PASEO_LOG_MAX="${AGENT_DEVBOX_PASEO_LOG_MAX:-5242880}"
+# dockerd is only shipped by the WSL rootfs overlay (the OCI image stays lean), so
+# every value here is best-effort. `-` (not `:-`) for the BINARY on purpose: an
+# explicitly empty value means "absent" (the bats suite uses it), while unset
+# means plain `dockerd` from PATH.
+DOCKERD_LOG="${AGENT_DEVBOX_DOCKERD_LOG:-/var/log/dockerd.log}"
+DOCKERD_LOG_MAX="${AGENT_DEVBOX_DOCKERD_LOG_MAX:-5242880}"
+DOCKERD_PID="${AGENT_DEVBOX_DOCKERD_PID:-/run/agent-devbox-dockerd.pid}"
+DOCKERD_BIN="${AGENT_DEVBOX_DOCKERD_BIN-dockerd}"
 # Boot attach budget: ATTACH_TIMEOUT bounds the interop call (plus 2s kill grace),
 # DEVICE_WAIT bounds the single wait for the block device. Worst case ~30s, which
 # stays inside the installer's 45s assertion.
@@ -506,6 +514,58 @@ clear_motd() {
   : > "$MOTD_FILE"
 }
 
+# ensure_cgroup2(): dockerd needs cgroup v2. WSL normally mounts it itself; this
+# is only a best-effort fallback and NEVER fails boot.
+ensure_cgroup2() {
+  if findmnt -rn -t cgroup2 /sys/fs/cgroup >/dev/null 2>&1; then
+    return 0
+  fi
+  mkdir -p /sys/fs/cgroup
+  if mount -t cgroup2 none /sys/fs/cgroup 2>/dev/null; then
+    log "已挂载 cgroup2 到 /sys/fs/cgroup"
+    return 0
+  fi
+  log "警告：cgroup2 未挂载，dockerd 可能启动失败（不影响 boot）"
+  return 1
+}
+
+# start_dockerd(): fire-and-forget start. WSL has systemd disabled, so this is
+# the only place the engine can come up. It must never block or fail boot:
+# stdin is /dev/null so the [boot] pipe cannot be held open, and no readiness
+# wait is performed. Absent binary = no-op (Docker ships only in the rootfs
+# overlay, so the stock image simply skips it).
+start_dockerd() {
+  local bin pid
+  bin="${DOCKERD_BIN-dockerd}"
+  if [ -z "$bin" ]; then
+    log "dockerd 未安装（仅 WSL rootfs 变体带 Docker），跳过"
+    return 0
+  fi
+  # [boot] gets a minimal PATH; Debian ships dockerd in /usr/sbin, so resolve it
+  # explicitly instead of trusting PATH to contain sbin.
+  if ! command -v "$bin" >/dev/null 2>&1; then
+    if [ -x /usr/sbin/dockerd ]; then
+      bin=/usr/sbin/dockerd
+    else
+      log "dockerd 未安装（仅 WSL rootfs 变体带 Docker），跳过"
+      return 0
+    fi
+  fi
+  if [ -f "$DOCKERD_PID" ]; then
+    pid="$(cat "$DOCKERD_PID" 2>/dev/null || true)"
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+      log "dockerd 已在运行（pid=$pid）"
+      return 0
+    fi
+  fi
+  ensure_cgroup2 || true
+  rotate_log "$DOCKERD_LOG" "$DOCKERD_LOG_MAX"
+  log "启动 dockerd（后台，日志 $DOCKERD_LOG）"
+  setsid "$bin" </dev/null >>"$DOCKERD_LOG" 2>&1 &
+  echo $! > "$DOCKERD_PID"
+  return 0
+}
+
 # main(): the full boot sequence.
 main() {
   local cur
@@ -567,6 +627,9 @@ main() {
   # --- desktop-app CLI visibility (must run AFTER the binds: /root and /home/*
   # live on the data disk, so an image-side link alone cannot repair an upgrade) -
   ensure_opencode_shim /root /home/*
+
+  # --- Docker Engine (rootfs overlay only; fire-and-forget, never blocks) ----
+  start_dockerd
 
   # --- start the daemon as paseo (single owner) ------------------------------
   if [ -f /run/agent-devbox-paseo.pid ] && kill -0 "$(cat /run/agent-devbox-paseo.pid)" 2>/dev/null; then

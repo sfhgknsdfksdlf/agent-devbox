@@ -35,6 +35,9 @@ setup() {
   export AGENT_DEVBOX_LOG="$TMP/boot.log"
   export AGENT_DEVBOX_DATADIR="$TMP/data"
   export AGENT_DEVBOX_MOTD="$TMP/motd"
+  export AGENT_DEVBOX_DOCKERD_PID="$TMP/dockerd.pid"
+  export AGENT_DEVBOX_DOCKERD_LOG="$TMP/dockerd.log"
+  export AGENT_DEVBOX_DOCKERD_LOG_MAX=10
   mkdir -p "$BINDIR" "$AGENT_DEVBOX_DATADIR"
   : > "$CALL_LOG"
   : > "$WSL_LOG"
@@ -88,6 +91,13 @@ if [ -n "${WSL_OUT:-}" ]; then
   printf '%s\n' "$WSL_OUT"
 fi
 exit "${WSL_EXIT:-0}"
+SH
+  # dockerd is recorded, never started for real: the boot suite must stay
+  # hermetic even when a future case drives main() end to end.
+  cat > "$BINDIR/dockerd" <<'SH'
+#!/bin/sh
+echo "dockerd $*" >> "$CALL_LOG"
+exit 0
 SH
   # `timeout` must strip its own options before exec'ing the interop stub;
   # TIMEOUT_EXIT=124 simulates the hard-timeout verdict.
@@ -639,6 +649,43 @@ SH
   [ "$status" -ne 0 ]
   run grep -Eq -- '--unmount' "$motd_fn"
   [ "$status" -ne 0 ]
+}
+
+# ---------------------------------------------------------------------------
+# start_dockerd(): fire-and-forget engine start. It must be a no-op when the
+# binary is absent, must not spawn a second engine over a live pidfile, and must
+# sit between the home shim and paseo in main().
+# ---------------------------------------------------------------------------
+
+@test "start_dockerd: absent dockerd is a logged no-op" {
+  base_shims
+  export AGENT_DEVBOX_DOCKERD_BIN=
+  run bash -c '. "$SCRIPT"; start_dockerd'
+  [ "$status" -eq 0 ]
+  printf '%s' "$output" | grep -Fq 'dockerd 未安装'
+  [ ! -e "$AGENT_DEVBOX_DOCKERD_PID" ]
+}
+
+@test "start_dockerd: a live pidfile is not restarted" {
+  base_shims
+  # tail, not sleep: base_shims replaces sleep with an instant-exit shim.
+  tail -f /dev/null >/dev/null 2>&1 &
+  live=$!
+  echo "$live" > "$AGENT_DEVBOX_DOCKERD_PID"
+  run bash -c '. "$SCRIPT"; start_dockerd'
+  status_saved=$status
+  kill "$live" 2>/dev/null || true
+  [ "$status_saved" -eq 0 ]
+  printf '%s' "$output" | grep -Fq "dockerd 已在运行"
+  ! grep -q 'dockerd' "$CALL_LOG"
+}
+
+@test "start_dockerd: is called after the home shim and before paseo" {
+  shim_idx=$(grep -n 'ensure_opencode_shim /root /home/\*' "$SCRIPT" | cut -d: -f1)
+  docker_idx=$(grep -n '^  start_dockerd$' "$SCRIPT" | cut -d: -f1)
+  paseo_idx=$(grep -n 'setsid /usr/local/bin/paseo-boot.sh' "$SCRIPT" | cut -d: -f1)
+  [ -n "$shim_idx" ] && [ -n "$docker_idx" ] && [ -n "$paseo_idx" ]
+  [ "$docker_idx" -gt "$shim_idx" ] && [ "$docker_idx" -lt "$paseo_idx" ]
 }
 
 # ---------------------------------------------------------------------------

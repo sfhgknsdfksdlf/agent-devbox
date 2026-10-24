@@ -31,6 +31,7 @@ on:
     paths:
       - "Dockerfile"
       - "Dockerfile.agents"
+      - "Dockerfile.wsl"
       - ".dockerignore"
       - "scripts/**"
       - "config/**"
@@ -440,6 +441,19 @@ jobs:
           docker exec smoke desktop-cli-check.sh --home /root
       - name: PTY works (node-pty path)
         run: docker exec smoke bash -lc 'script -qec "echo pty-ok" /dev/null | grep -q pty-ok'
+      - name: Published image stays lean (no WSL-only tooling)
+        run: |
+          set -euo pipefail
+          for bin in dockerd docker pwsh fio osslsigncode evtxexport; do
+            if docker exec smoke sh -lc "command -v $bin" >/dev/null 2>&1; then
+              echo "ERROR: $bin must not exist in the published OCI image"; exit 1
+            fi
+          done
+          for bin in bats shellcheck gh marksman; do
+            docker exec smoke sh -lc "command -v $bin" >/dev/null || {
+              echo "ERROR: $bin is missing from the published OCI image"; exit 1; }
+          done
+          docker exec smoke marksman --version
       - name: Tear down
         if: always()
         run: docker rm -f smoke || true
@@ -457,6 +471,7 @@ jobs:
       matrix: ${{ fromJson(needs.plan.outputs.matrix) }}
     runs-on: ${{ matrix.runner }}
     steps:
+      - uses: actions/checkout@v7
       - uses: docker/login-action@v4
         with:
           registry: ghcr.io
@@ -481,9 +496,23 @@ jobs:
             v="${pair%%:*}"; img="${pair#*:}"; plat="linux/$arch"
             echo "== exporting $v from $img:$TAG ($plat) =="
             docker pull --platform "$plat" "$img:$TAG"
-            cid=$(docker create --platform "$plat" "$img:$TAG")
+            # Rootfs-only overlay: Docker Engine + PowerShell never ship in the
+            # published OCI image, so they are layered on here and exported.
+            docker build --platform "$plat" -f Dockerfile.wsl \
+              --build-arg BASE_IMAGE="$img:$TAG" -t "$img:$TAG-wsl" .
+            got="$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$img:$TAG-wsl")"
+            if [ "$got" != "linux/$arch" ]; then
+              echo "ERROR: overlay image is $got, expected linux/$arch"; exit 1
+            fi
+            docker run --rm --platform "$plat" --entrypoint /bin/sh "$img:$TAG-wsl" -c \
+              'test -x /usr/bin/docker && test -x /usr/sbin/dockerd && test -x /usr/bin/pwsh && test -x /usr/bin/fio && test ! -e /var/lib/docker'
+            docker run --rm --platform "$plat" --entrypoint pwsh "$img:$TAG-wsl" \
+              -NoProfile -Command '$PSVersionTable.PSVersion.ToString()'
+            docker run --rm --platform "$plat" --entrypoint docker "$img:$TAG-wsl" compose version
+            cid=$(docker create --platform "$plat" "$img:$TAG-wsl")
             docker export "$cid" -o "rootfs-$v-${{ matrix.arch }}.tar"
             docker rm -f "$cid"
+            docker rmi -f "$img:$TAG-wsl" >/dev/null
             elf=$(tar -xOf "rootfs-$v-${{ matrix.arch }}.tar" usr/bin/dash | file -)
             echo "elf: $elf"
             case "$arch:$elf" in

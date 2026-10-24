@@ -1134,6 +1134,43 @@ Assert-True ($ciText -notmatch '--platform linux/amd64') 'ci: no hardcoded amd64
 Assert-True ($ciText -match 'retention-days:\s*3') 'ci: transient artifacts expire'
 Assert-True ($ciText -match 'needs: \[plan, export\]') 'ci: publish waits for both exports'
 
+# --- 镜像分层：通用开发工具进 OCI，Docker/PowerShell 只进 WSL rootfs -------
+$ociDockerfile = Get-Content -Raw (Join-Path $here '..' '..' 'Dockerfile')
+$wslDockerfile = Get-Content -Raw (Join-Path $here '..' '..' 'Dockerfile.wsl')
+Assert-True ($ociDockerfile -match '(?m)^# L1b\)') 'layers: L1b exists in the OCI Dockerfile'
+foreach ($pkg in @('bats','shellcheck','gh','man-db','manpages','libicu76','bind9-dnsutils','netcat-openbsd','ethtool','sysstat','bridge-utils','iproute2','iptables','nftables','zstd','parallel')) {
+  Assert-True ($ociDockerfile -match "(?m)^\s+[^\r\n]*\b$([regex]::Escape($pkg))\b") "layers: L1b installs $pkg"
+}
+Assert-True ($ociDockerfile -match 'marksman-linux-\$\{marksman_arch\}') 'layers: marksman is arch-mapped'
+Assert-True ($ociDockerfile -match 'dpkg --print-architecture') 'layers: arch comes from dpkg'
+Assert-True ($ociDockerfile -notmatch 'docker\.io') 'layers: OCI image never installs docker.io'
+Assert-True ($ociDockerfile -notmatch 'docker-compose') 'layers: OCI image never installs docker-compose'
+Assert-True ($ociDockerfile -notmatch 'docker-cli') 'layers: OCI image never installs docker-cli'
+Assert-True ($ociDockerfile -notmatch '(?i)powershell_') 'layers: OCI image never installs PowerShell'
+Assert-True ($ociDockerfile -notmatch '\bpwsh\b') 'layers: OCI image has no pwsh'
+Assert-True ($ociDockerfile -notmatch '\bdockerd\b') 'layers: OCI image has no dockerd'
+Assert-True ($wslDockerfile -match '(?m)^ARG BASE_IMAGE$') 'wsl: overlay takes BASE_IMAGE'
+Assert-True ($wslDockerfile -match '(?m)^FROM \$\{BASE_IMAGE\}$') 'wsl: overlay derives from the built image'
+foreach ($pkg in @('docker.io','docker-cli','docker-compose','docker-buildx','fio','osslsigncode','libevtx-utils','python3-evtx')) {
+  Assert-True ($wslDockerfile -match "(?m)^\s+[^\r\n]*\b$([regex]::Escape($pkg))\b") "wsl: overlay installs $pkg"
+}
+Assert-True ($wslDockerfile -match 'policy-rc\.d') 'wsl: overlay blocks postinst service start'
+Assert-True ($wslDockerfile -match 'test ! -e /var/lib/docker') 'wsl: build proves no docker state was baked in'
+Assert-True ($wslDockerfile -match 'docker --version') 'wsl: build proves the docker CLI exists (Debian splits it out of docker.io)'
+Assert-True ($wslDockerfile -match 'ARG POWERSHELL_VERSION=7\.6\.7') 'wsl: PowerShell is pinned'
+Assert-True ($wslDockerfile -match 'powershell_\$\{POWERSHELL_VERSION\}-1\.deb_\$\{arch\}\.deb') 'wsl: PowerShell .deb is arch-mapped'
+Assert-True ($wslDockerfile -match 'pwsh -NoProfile') 'wsl: overlay smoke-runs pwsh'
+$exportBlock = [regex]::Match($ciText, '(?ms)^  export:.*?(?=^  publish:)').Value
+Assert-True ($exportBlock -match 'actions/checkout@v7') 'ci: export checks out the overlay Dockerfile'
+Assert-True ($exportBlock -match 'Dockerfile\.wsl') 'ci: export builds the WSL overlay'
+Assert-True ($exportBlock -match '--build-arg BASE_IMAGE=') 'ci: overlay derives from the built image'
+Assert-True ($exportBlock -match '\$TAG-wsl') 'ci: export uses the overlay tag'
+Assert-True ($exportBlock -match 'docker rmi -f "\$img:\$TAG-wsl"') 'ci: overlay image is removed after export'
+Assert-True ($ciText -match '(?m)^\s+- "Dockerfile\.wsl"$') 'ci: overlay changes trigger a build'
+$smokeBlock = [regex]::Match($ciText, '(?ms)^  smoke:.*?(?=^  export:)').Value
+Assert-True ($smokeBlock -match 'dockerd') 'ci: smoke proves the OCI image has no dockerd'
+Assert-True ($smokeBlock -match 'pwsh') 'ci: smoke proves the OCI image has no pwsh'
+
 Write-Host ''
 if ($script:Failed -gt 0) {
   Write-Host "$script:Failed/$script:Total assertions FAILED" -ForegroundColor Red

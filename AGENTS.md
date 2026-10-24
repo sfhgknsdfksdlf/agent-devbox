@@ -22,6 +22,7 @@ docs/                            # user-facing guides
 | Contract | Rule |
 |---|---|
 | Mode switch | `Dockerfile` sets `ENV IS_DOCKER=true`; `docker export` strips ENV, so the WSL rootfs runs `scripts/wsl-boot.sh` instead. |
+| WSL-only overlay | `Dockerfile.wsl` (`FROM ${BASE_IMAGE}`, built ONLY in the `export` job and never pushed) adds the rootfs-only stack: `docker.io`+`docker-cli`+`docker-compose`+`docker-buildx`, PowerShell (`POWERSHELL_VERSION`), fio, osslsigncode, libevtx-utils/python3-evtx. The published OCI images must stay free of them. `wsl-boot.sh` starts `dockerd` fire-and-forget; `systemd` stays `false`. `/var/lib/docker` lives on the system disk, so images/containers are LOST when an upgrade unregisters + re-imports the distro. |
 | Daemon | interactive user = `root`; daemon = non-root `paseo` (uid/gid 1000); refuses to listen without `PASEO_PASSWORD`. |
 | Data disk | `mkfs` ONLY in `scripts/datadisk-init.sh` (installer-invoked, brand-new disk). Boot never formats; any failure → MAINTENANCE MODE, fail closed. Never `/etc/fstab`. `/home`, `/root`, `/workspace` bind-mounted from the VHDX, verified by `stat %d:%i` (not `findmnt`). |
 | OpenCode / omo | `opencode-ai@^1` only (never `@opencode/cli` — V2 clobbers the bin); omo installs via `bunx` (npx is broken in the image). |
@@ -36,6 +37,7 @@ docs/                            # user-facing guides
 | Task | Location |
 |---|---|
 | Tools / versions | `Dockerfile`, `Dockerfile.agents`, `versions.json` |
+| WSL-only packages (Docker/PowerShell/VHDX QA) | `Dockerfile.wsl` |
 | Boot / daemon | `scripts/paseo-boot.sh`, `scripts/wsl-boot.sh` |
 | Windows install | `windows/install.ps1`, `install-agent-devbox.ps1`, `wsl-ensure*.ps1` |
 | CI build / smoke / publish | `.github/workflows/build.yml` |
@@ -51,6 +53,12 @@ docs/                            # user-facing guides
 - After ANY `windows/*.ps1` or `*.cmd` edit: `git add windows/` **then** `bash .github/scripts/update-windows-sums.sh` (hashes staged blobs).
 
 ## PITFALLS (hard-earned — do NOT repeat)
+**WSL rootfs ≠ OCI 镜像（`docker export` 只丢 ENV，不丢文件）**
+- WSL-only 工具只能放 `Dockerfile.wsl`（export job 里 `FROM` 刚拉的镜像再建一层），写进 `Dockerfile` 会同时污染 ghcr 发布镜像；导出后没有任何删文件步骤。
+- Debian 13 把 `docker` CLI 拆成 `docker-cli`（只是 `docker.io` 的 Recommends）→ `--no-install-recommends` 必须显式安装，否则构建里 `docker --version` 就失败。
+- `marksman` 是 .NET 单文件：缺 `libicu76` 直接 `Couldn't find a valid ICU package`（exit 139）→ L1b 必须带 libicu。
+- `systemd=false`：dockerd 由 `wsl-boot.sh` 的 `start_dockerd` 后台拉起（pidfile + `</dev/null`，不等待就绪）；WSL 自己挂 cgroup2，脚本只在缺失时兜底 mount。
+
 **火绒 `HEUR:TrojanDownloader/PS.NetLoader`**
 - Symptom: `wsl-ensure-downloads.ps1` deleted mid-install → elevated child dies → original window shows only `安装失败（退出码 1）`, no installer log.
 - Cause: PS 5.1 `Invoke-WebRequest -OutFile` + running the fetched `.exe` is the malware downloader fingerprint; adding **`-UseBasicParsing`** pushes it over the line. Huorong scores statically AND behaviourally (AMSI + its PSET script engine) — token shuffling does not help.
