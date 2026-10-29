@@ -10,7 +10,7 @@
     1. re-launches itself once, elevated (one UAC prompt);
     2. fetches its sibling installer scripts (wsl-ensure.ps1,
        wsl-ensure-downloads.ps1, install-agent-devbox.ps1) from the project
-       SOURCE (main), not the Release;
+       SOURCE (the selected ref, default main), not the Release;
     3. runs the WSL preflight (install WSL + mirrored networking);
     4. runs the installer (which pulls the rootfs from the Release), then always
        deletes its scratch directory.
@@ -93,10 +93,18 @@ if ($Ref -notmatch '^[A-Za-z0-9][A-Za-z0-9._/-]*$' -or $Ref -match '\.\.' -or $R
   throw "非法的分支/ref：$Ref"
 }
 
+# 通道：main = stable（正式通道）；任何其它 ref = beta。beta 有独立的发行版、目录、
+# 数据盘标签/挂载名和 WT GUID，因此绝不会注销或挂载正式安装。
+$Channel = if ($Ref -ne 'main') { 'beta' } else { 'stable' }
+$ChannelSuffix = if ($Channel -eq 'beta') { '-beta' } else { '' }
+$BaseDistro = if ($Variant -eq 'core') { 'agent-devbox-core' } else { 'agent-devbox' }
+$Distro = "$BaseDistro$ChannelSuffix"
+
 # 安装目录必须在 UAC 提权与升级确认之前就定下来：提权子进程要收到它，升级提示也要
-# 显示它。默认值随变体变化；-Yes / 重定向 / 非交互一律用默认值，绝不阻塞。
+# 显示它。默认值随「变体 + 通道」变化（beta 带 -beta）；-Yes / 重定向 / 非交互一律
+# 用默认值，绝不阻塞。显式 -InstallDir 原样使用，绝不再加通道后缀。
 # 去掉首尾空白与末尾的反斜杠，避免拼进命令行参数时把引号转义掉（路径里有空格没关系）。
-$DefaultInstallDir = if ($Variant -eq 'core') { 'D:\WSL\agent-devbox-core' } else { 'D:\WSL\agent-devbox' }
+$DefaultInstallDir = "D:\WSL\$Distro"
 if ([string]::IsNullOrWhiteSpace($InstallDir)) {
   if ($Yes -or -not $interactive) {
     $InstallDir = $DefaultInstallDir
@@ -109,9 +117,11 @@ $InstallDir = $InstallDir.Trim()
 if ($InstallDir -notmatch '^[A-Za-z]:\\$') { $InstallDir = $InstallDir.TrimEnd('\') }
 if ([string]::IsNullOrWhiteSpace($InstallDir)) { $InstallDir = $DefaultInstallDir }
 
+if ($Channel -eq 'beta') {
+  Write-Host "beta 通道：独立安装（发行版 $Distro、目录 $InstallDir、数据盘标签 devbox-data-beta），不会注销或挂载正式版安装。" -ForegroundColor Yellow
+}
+
 $SelfUrl = "https://raw.githubusercontent.com/$Repo/$Ref/windows/install.ps1"
-# 发行版名随镜像变体变化（core = agent-devbox-core，agents = agent-devbox）。
-$Distro  = if ($Variant -eq 'core') { 'agent-devbox-core' } else { 'agent-devbox' }
 
 # Beta resolution: `b`/`beta` -> the newest `beta-*` prerelease (same logic in every script).
 $relApi = "https://api.github.com/repos/$Repo/releases"
@@ -351,7 +361,7 @@ try {
 
   Write-Host '正在启动 agent-devbox 安装器…'
   $installerArgs = @{
-    Variant = $Variant; ReleaseTag = $ReleaseTag; InstallDir = $InstallDir
+    Variant = $Variant; Channel = $Channel; ReleaseTag = $ReleaseTag; InstallDir = $InstallDir
     Yes = $Yes; KeepExisting = $KeepExisting; Connections = $Connections
   }
   if ($LogPath) { $installerArgs['LogPath'] = $LogPath }

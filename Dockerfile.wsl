@@ -1,0 +1,45 @@
+# syntax=docker/dockerfile:1.7
+# =============================================================================
+# Dockerfile.wsl — WSL-rootfs-only overlay. NEVER published to ghcr.
+#
+# The WSL rootfs is produced by `docker export` of a published image (see the
+# `export` job in .github/workflows/build.yml), and `docker export` keeps every
+# file. Anything that must exist ONLY in the rootfs therefore cannot live in
+# Dockerfile: the export job builds THIS overlay FROM the image it just pulled
+# and exports that instead. The published OCI image stays lean (no dockerd, no
+# pwsh); the WSL distro gets a working Docker Engine.
+# =============================================================================
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+
+# PowerShell has no Debian package; pin the upstream release so the .deb URL is
+# stable. `dpkg --print-architecture` (amd64|arm64) is also the asset suffix.
+ARG POWERSHELL_VERSION=7.6.7
+
+# policy-rc.d: stop docker.io's postinst from starting dockerd inside the build
+# container (that would bake /var/lib/docker into the exported rootfs).
+RUN set -eux; \
+    printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d; \
+    chmod +x /usr/sbin/policy-rc.d; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+      docker.io docker-cli docker-compose docker-buildx \
+      fio osslsigncode libevtx-utils python3-evtx; \
+    rm -rf /var/lib/apt/lists/*; \
+    rm -f /usr/sbin/policy-rc.d; \
+    test ! -e /var/lib/docker; \
+    test ! -S /var/run/docker.sock; \
+    docker --version; \
+    docker compose version; \
+    dockerd --version
+
+RUN set -eux; \
+    arch="$(dpkg --print-architecture)"; \
+    apt-get update; \
+    curl -fsSL --retry 5 --retry-all-errors --retry-delay 3 \
+      -o /tmp/powershell.deb \
+      "https://github.com/PowerShell/PowerShell/releases/download/v${POWERSHELL_VERSION}/powershell_${POWERSHELL_VERSION}-1.deb_${arch}.deb"; \
+    apt-get install -y --no-install-recommends /tmp/powershell.deb; \
+    rm -f /tmp/powershell.deb; \
+    rm -rf /var/lib/apt/lists/*; \
+    pwsh -NoProfile -Command "\$PSVersionTable.PSVersion.ToString()"
