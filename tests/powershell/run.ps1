@@ -477,6 +477,9 @@ Assert-True ($mainText -notmatch '(?m)^\s*\$distroExists = Test-DistroExists\s*$
 Assert-True ($mainText -match '\.paseo-password') 'upgrade: the password is stored on the data disk'
 Assert-True ($mainText -match 'blkid -U') 'upgrade: the data disk is mounted by UUID to read/write the password'
 Assert-True ($mainText -match 'mountpoint -q') 'upgrade: mounting is idempotent (mountpoint -q)'
+Assert-True ($mainText -match 'findmnt -rno UUID --mountpoint') 'upgrade: the password step verifies the mounted data-disk UUID'
+Assert-True ($mainText -match 'DATA_DISK_WRITE_MISMATCH') 'upgrade: the password is read back from the data disk after writing'
+Assert-True ($mainText -notmatch '\$dataDiskMounted -and \$pw') 'upgrade: the password write no longer trusts a stale mount flag'
 
 # --- 升级提示文案（纯函数，红门）-------------------------------------------
 # 空 -InstallDir 必须与旧文案逐字一致（老入口/无人值守路径不能变）；
@@ -605,7 +608,7 @@ Assert-True ($diskPwIdx -ge 0) 'upgrade: the data-disk password is the only upgr
 Assert-True ($mainText -match '升级未能从数据盘读回') 'upgrade: a missing data-disk password is surfaced (never silent)'
 $pwWriteIdx = -1; $unmountIdx = -1
 for ($i = 0; $i -lt $dlLines.Count; $i++) {
-  if ($pwWriteIdx -lt 0 -and $dlLines[$i] -match 'printf %s \{0\} > \{1\}') { $pwWriteIdx = $i }
+  if ($pwWriteIdx -lt 0 -and $dlLines[$i] -match 'printf %s "\$PASEO_PASSWORD" > \{3\}') { $pwWriteIdx = $i }
   if ($unmountIdx -lt 0 -and $dlLines[$i] -match "'--unmount'") { $unmountIdx = $i }
 }
 Assert-True ($pwWriteIdx -ge 0 -and $unmountIdx -ge 0 -and $pwWriteIdx -lt $unmountIdx) 'upgrade: the data disk is unmounted only after the password is written'
@@ -732,12 +735,170 @@ $repairPath = Join-Path $winDir 'repair-terminal-profiles.ps1'
 Assert-True (-not (Test-Path -LiteralPath $repairPath)) 'wt: the old profile-repair script stays deleted'
 Assert-True ($mainText -match 'Write-AgentDevboxTerminalProfile') 'wt: the installer writes its own fragment'
 Assert-True ($mainText -match 'Remove-StaleWslTerminalFragments') 'wt: the installer removes WSL-generated fragments'
-Assert-True ($mainText -match "'\{6f4a1c2e-8b3d-4a97-9c51-0e7d2b8f3a64\}'") 'wt: the agents profile GUID is fixed'
-Assert-True ($mainText -match "'\{c2d7e9a4-3f61-4b08-8e52-7a1d9c4b6f30\}'") 'wt: the core profile GUID is fixed'
-$writeIdx = $mainText.IndexOf('Write-AgentDevboxTerminalProfile -Distro $Distro -ProfileGuid')
+Assert-True ($ensureText -match "'\{6f4a1c2e-8b3d-4a97-9c51-0e7d2b8f3a64\}'") 'wt: the agents profile GUID is fixed'
+Assert-True ($ensureText -match "'\{c2d7e9a4-3f61-4b08-8e52-7a1d9c4b6f30\}'") 'wt: the core profile GUID is fixed'
+$writeIdx = $mainText.IndexOf('Write-AgentDevboxTerminalProfile -Distro $Distro -ProfileGuid $v.TerminalGuid -HideGuid $v.HideGuid')
 $importIdx = $mainText.IndexOf("Step '[4/10]")
 Assert-True ($writeIdx -ge 0 -and $importIdx -gt $writeIdx) 'wt: the fragment is written BEFORE the import'
+Assert-True ($mainText -match 'Write-AgentDevboxTerminalProfile -Distro \$Distro -ProfileGuid \$v\.TerminalGuid -HideGuid \$v\.HideGuid') 'wt: installer passes the per-channel GUIDs'
 Assert-True ($mainText -match 'PSChildName') 'variant: installer reports the new distro GUID'
+
+Assert-True ($ensureText -match 'function Remove-StaleAgentDevboxTerminalFragments') 'wt: stale AgentDevbox fragments are pruned'
+Assert-True ($ensureText.Contains('Remove-StaleAgentDevboxTerminalFragments -KeepDistro $Distro')) 'wt: the fragment writer prunes stale siblings'
+$staleNames = Get-StaleAgentDevboxFragmentNames -Files @('agent-devbox-core.json','agent-devbox-core-beta.json','gone.json') -Registered @('agent-devbox-core','agent-devbox-core-beta') -KeepDistro 'agent-devbox-core-beta'
+Assert-Equal 'gone.json' ($staleNames -join ',') 'wt: only unregistered, non-current fragments are stale'
+
+$fragRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('adbox-frag-' + [guid]::NewGuid().ToString('N'))
+$fragDir = Join-Path $fragRoot 'Microsoft\Windows Terminal\Fragments\AgentDevbox'
+New-Item -ItemType Directory -Path $fragDir -Force | Out-Null
+foreach ($n in @('agent-devbox-core','agent-devbox-core-beta','ubuntu')) {
+  [System.IO.File]::WriteAllText((Join-Path $fragDir ($n + '.json')), '{"profiles":[]}')
+}
+$savedLocalAppData = $env:LOCALAPPDATA
+$env:LOCALAPPDATA = $fragRoot
+try {
+  & {
+    function Invoke-Native {
+      param([string] $FilePath, [string[]] $Arguments = @(), [string] $InputText = $null)
+      $script:NativeExit = 0
+      return @('agent-devbox-core-beta', 'ubuntu')
+    }
+    $removed = Remove-StaleAgentDevboxTerminalFragments -KeepDistro 'agent-devbox-core-beta'
+    Assert-Equal 1 $removed 'wt-prune: one unregistered fragment removed'
+    Assert-True (-not (Test-Path -LiteralPath (Join-Path $fragDir 'agent-devbox-core.json'))) 'wt-prune: unregistered deleted'
+    Assert-True (Test-Path -LiteralPath (Join-Path $fragDir 'agent-devbox-core-beta.json')) 'wt-prune: the current fragment survives'
+    Assert-True (Test-Path -LiteralPath (Join-Path $fragDir 'ubuntu.json')) 'wt-prune: a registered distro survives'
+    [System.IO.File]::WriteAllText((Join-Path $fragDir 'gone.json'), '{}')
+    function Invoke-Native {
+      param([string] $FilePath, [string[]] $Arguments = @(), [string] $InputText = $null)
+      $script:NativeExit = 1
+      return @()
+    }
+    $removed2 = Remove-StaleAgentDevboxTerminalFragments -KeepDistro 'agent-devbox-core-beta'
+    Assert-Equal 0 $removed2 'wt-prune: a failed listing never prunes'
+    Assert-True (Test-Path -LiteralPath (Join-Path $fragDir 'gone.json')) 'wt-prune: a failed listing keeps fragments'
+    function Invoke-Native {
+      param([string] $FilePath, [string[]] $Arguments = @(), [string] $InputText = $null)
+      $script:NativeExit = 0
+      return @()
+    }
+    $removed3 = Remove-StaleAgentDevboxTerminalFragments -KeepDistro 'agent-devbox-core-beta'
+    Assert-Equal 2 $removed3 'wt-prune: an empty successful listing prunes all non-current fragments'
+    Assert-True (-not (Test-Path -LiteralPath (Join-Path $fragDir 'gone.json'))) 'wt-prune: stale gone after an empty listing'
+    Assert-True (-not (Test-Path -LiteralPath (Join-Path $fragDir 'ubuntu.json'))) 'wt-prune: an unlisted fragment is pruned too'
+    Assert-True (Test-Path -LiteralPath (Join-Path $fragDir 'agent-devbox-core-beta.json')) 'wt-prune: the current fragment still survives'
+  }
+} finally {
+  $env:LOCALAPPDATA = $savedLocalAppData
+  Remove-Item -LiteralPath $fragRoot -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+# --- PS 5.1 native quoting: guest bash scripts travel on stdin ------------
+# PS 5.1 wraps a native argument in quotes without escaping inner ones; wsl.exe
+# then splits the script at the next space (2026-10-28 password write / ready
+# output). Every guest script must use Invoke-WslBashScript (-ls + stdin).
+Assert-True ($ensureText -match 'function Invoke-WslBashScript') 'ps51: the shared stdin bash helper exists'
+Assert-True ($ensureText -match "'bash', '-ls'") 'ps51: the helper uses a login bash reading stdin'
+Assert-True ($ensureText -match '-InputText \(\$Script \+') 'ps51: the helper pipes the script on stdin (with a CR-absorbing comment)'
+Assert-True ($ensureText -match "'--cd', '/'") 'ps51: the helper pins the guest cwd'
+Assert-True ($mainText -notmatch "'bash', '-lc'") 'ps51: installer never passes a bash script in argv'
+Assert-True ($ensureText -notmatch "'bash', '-lc'") 'ps51: ensure helpers never pass a bash script in argv'
+Assert-True ($mainText.Contains('Invoke-WslBashScript -Distro $Distro -Script $writeScript')) 'ps51: the password write goes through stdin'
+Assert-True ($mainText.Contains('Write-Host "$Distro 已就绪"')) 'ps51: the ready line is printed by PowerShell (no native Chinese)'
+$readyIdx = $mainText.IndexOf('Write-Host "$Distro 已就绪"')
+$healthIdx = $mainText.IndexOf("Ok 'paseo 已就绪（/api/health 200）。'")
+Assert-True ($readyIdx -gt $healthIdx) 'ps51: readiness is announced only after the health check'
+Assert-True ($ensureText -match 'function Hide-SecretText') 'ps51: secret redaction helper exists'
+Assert-Equal 'a***b' (Hide-SecretText -Text 'aSb' -Secret 'S') 'secret: the raw value is masked'
+Assert-Equal '***' (Hide-SecretText -Text "a'\''b" -Secret "a'b") 'secret: the quote-escaped form is masked too'
+Assert-Equal '' (Hide-SecretText -Text '' -Secret '') 'secret: an empty secret is a no-op'
+Assert-Equal '密码 pw' (ConvertFrom-Base64Utf8 ([Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes('密码 pw')))) 'secret: base64 UTF-8 round-trip'
+Assert-Equal '' (ConvertFrom-Base64Utf8 '') 'secret: empty base64 decodes to empty'
+Assert-Equal '' (ConvertFrom-Base64Utf8 '***') 'secret: invalid base64 decodes to empty'
+$ss = ConvertTo-SecureString 'p@ss 密码' -AsPlainText -Force
+Assert-Equal 'p@ss 密码' (ConvertFrom-SecureText $ss) 'secret: SecureString conversion is exact'
+Assert-True ($mainText -match 'Read-Host .+ -AsSecureString') 'secret: interactive input does not echo'
+Assert-True ($mainText.Contains('ConvertFrom-SecureText $securePw')) 'secret: the SecureString is converted only in memory'
+Assert-True ($mainText.Contains('base64 -w0 $pwFile')) 'secret: the old password crosses native stdout as base64'
+Assert-True ($mainText.Contains('echo PASEO_PASSWORD_MISSING')) 'ps51: the write script reads the conf instead of embedding the secret'
+Assert-True ($mainText.Contains('printf %s "$PASEO_PASSWORD" > {3}')) 'ps51: the write script uses the conf password'
+Assert-True ($mainText -notmatch '\(Quote-Bash \$pw\), \$pwFile') 'ps51: the password is not a script format argument'
+
+# Every '-f' literal must be a valid composite format string: bash `${VAR}` and
+# `{ ...; }` inside one need doubling. On 2026-10-28 the password-write literal
+# threw FormatException before bash ran, so .paseo-password was never written.
+foreach ($psFile in @(Get-ChildItem (Join-Path $here '..' '..' 'windows') -Filter *.ps1)) {
+  $tk = $null; $pe = $null
+  $psAst = [System.Management.Automation.Language.Parser]::ParseFile($psFile.FullName, [ref]$tk, [ref]$pe)
+  foreach ($fmt in @($psAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.BinaryExpressionAst] -and $n.Operator -eq [System.Management.Automation.Language.TokenKind]::Format }, $true))) {
+    if ($fmt.Left -isnot [System.Management.Automation.Language.StringConstantExpressionAst]) { continue }
+    # Bash scripts are the class this guards; UI format strings are exercised by
+    # their own call sites (and may have >16 placeholders).
+    if ($fmt.Left.Value -notmatch ';') { continue }
+    $fmtErr = $null
+    try { [void]($fmt.Left.Value -f (1..16)) } catch { $fmtErr = $_.Exception.Message }
+    Assert-True ($null -eq $fmtErr) ("fmt: {0}:{1} is a valid -f format ({2})" -f $psFile.Name, $fmt.Extent.StartLineNumber, $fmtErr)
+  }
+}
+
+$writeLit = [regex]::Match($mainText, "(?s)\`$writeScript = '(?<lit>.*?)' -f ").Groups['lit'].Value
+$writeFmtErr = $null
+$writeFormatted = ''
+try { $writeFormatted = $writeLit -f '/mnt/x', "'uuid'", "'/etc/agent-devbox.conf'", '/mnt/x/.paseo-password' } catch { $writeFmtErr = $_.Exception.Message }
+Assert-True ($null -eq $writeFmtErr) 'ps51: the password write literal formats (no FormatException)'
+Assert-True ($writeFormatted.Contains('${PASEO_PASSWORD:-}')) 'ps51: the formatted write script reads the conf password'
+Assert-True ($writeFormatted.Contains('PASEO_PASSWORD_MISSING')) 'ps51: the formatted write script keeps the guard'
+Assert-True ($writeFormatted.Contains(". '/etc/agent-devbox.conf'")) 'ps51: the formatted write script sources the conf'
+Assert-True (-not $writeFormatted.Contains('{{')) 'ps51: no escaped braces leak into the script'
+Assert-True ($ensureText.Contains('$script:OutputEncoding = New-Object System.Text.UTF8Encoding($false)')) 'ps51: stdin uses script-scope UTF-8 (a local assignment is ignored)'
+Assert-True ($mainText.Contains('--mountpoint {0} | sort -u')) 'ps51: the mount/write UUID checks dedupe stacked mounts'
+Assert-True ($mainText.Contains('Hide-SecretText -Text (($writeOut | Out-String).Trim()) -Secret $pw')) 'ps51: failed write output is redacted'
+Assert-True ($mainText.Contains('Hide-SecretText -Text $_.Exception.Message -Secret $pw')) 'ps51: failed write exception is redacted'
+
+# --- download skeleton cleanup ------------------------------------------
+$segBase = Join-Path ([System.IO.Path]::GetTempPath()) ('adbox-seg-' + [guid]::NewGuid().ToString('N'))
+try {
+  $dest = Join-Path $segBase 'rootfs-x.tar.zst.part-00'
+  $leaf = Get-DownloadSegmentDir -Dest $dest
+  New-Item -ItemType Directory -Path $leaf -Force | Out-Null
+  [System.IO.File]::WriteAllText((Join-Path $leaf 'seg-000'), 'x')
+  Remove-DownloadSegmentDir -Dest $dest
+  Assert-True (-not (Test-Path -LiteralPath $leaf)) 'segments: the leaf dir is removed'
+  Assert-True (-not (Test-Path -LiteralPath (Split-Path -Parent $leaf))) 'segments: the empty segments parent is removed'
+  Assert-True (-not (Test-Path -LiteralPath (Split-Path -Parent (Split-Path -Parent $leaf)))) 'segments: the empty hidden parent is removed'
+  $dest2 = Join-Path $segBase 'other.tar.zst.part-00'
+  $leaf2 = Get-DownloadSegmentDir -Dest $dest2
+  New-Item -ItemType Directory -Path $leaf2 -Force | Out-Null
+  $segRoot2 = Split-Path -Parent $leaf2
+  [System.IO.File]::WriteAllText((Join-Path $segRoot2 'keep.txt'), 'x')
+  Remove-DownloadSegmentDir -Dest $dest2
+  Assert-True (Test-Path -LiteralPath $segRoot2) 'segments: a non-empty segments parent survives'
+} finally { Remove-Item -LiteralPath $segBase -Recurse -Force -ErrorAction SilentlyContinue }
+
+# Remove-DownloadArtifacts must delete the sidecar BEFORE pruning the parent
+# dirs: the sidecar lives inside .agent-devbox-download, so the old order left
+# an empty hidden dir after every successful install (2026-10-29 field log).
+$artBase = Join-Path ([System.IO.Path]::GetTempPath()) ('adbox-art-' + [guid]::NewGuid().ToString('N'))
+try {
+  $artDest = Join-Path $artBase 'rootfs-x.tar.zst.part-00'
+  $artLeaf = Get-DownloadSegmentDir -Dest $artDest
+  New-Item -ItemType Directory -Path $artLeaf -Force | Out-Null
+  [System.IO.File]::WriteAllText((Join-Path $artLeaf 'seg-000'), 'x')
+  $artMeta = Get-DownloadMetaPath -Dest $artDest
+  New-Item -ItemType Directory -Path (Split-Path -Parent $artMeta) -Force | Out-Null
+  [System.IO.File]::WriteAllText($artMeta, '{}')
+  [System.IO.File]::WriteAllText($artDest, 'part')
+  Remove-DownloadArtifacts -Dest $artDest
+  Assert-True (-not (Test-Path -LiteralPath $artDest)) 'cleanup: the part is removed'
+  Assert-True (-not (Test-Path -LiteralPath $artMeta)) 'cleanup: the sidecar is removed'
+  Assert-True (-not (Test-Path -LiteralPath (Join-Path $artBase '.agent-devbox-download'))) 'cleanup: the empty hidden dir is removed after the meta'
+} finally { Remove-Item -LiteralPath $artBase -Recurse -Force -ErrorAction SilentlyContinue }
+
+# --- [boot] PATH / dockerd ------------------------------------------------
+$bootText = Get-Content -Raw (Join-Path $here '..' '..' 'scripts' 'wsl-boot.sh')
+Assert-True ($bootText -match '(?m)^export PATH=') 'boot: PATH is exported for child execs'
+Assert-True ($bootText.Contains('bin="$(command -v "$bin" 2>/dev/null)"')) 'boot: dockerd resolves to an absolute path'
+Assert-True ($bootText.Contains('| sort -u')) 'boot: the UUID check dedupes stacked mounts'
 $fragJson = New-TerminalProfileFragment -Distro 'agent-devbox-core' `
   -ProfileGuid '{11111111-2222-3333-4444-555555555555}' `
   -HideGuid '{66666666-7777-8888-9999-000000000000}' `
@@ -768,15 +929,15 @@ foreach ($ps1 in Get-ChildItem -LiteralPath $winDir -Filter '*.ps1') {
 }
 Assert-Equal 0 $badInterp.Count "url: no bare `$var? interpolation in windows/*.ps1 (found: $($badInterp -join ', '))"
 
-# --- Naming-model tripwires (distro / dir / data-disk unification) --------
+# --- Naming-model tripwires (distro / dir / data-disk identity) -----------
 # The WSL/Windows paths cannot execute on Linux, so these structural pins are
 # the tests of record for the final naming model:
 #   agents = distro agent-devbox      dir D:\WSL\agent-devbox
 #   core   = distro agent-devbox-core dir D:\WSL\agent-devbox-core
-#   data   = ext4 label AND mount name both `devbox-data` (unified)
+#   data   = ext4 label AND mount name: `devbox-data` (stable) / `devbox-data-beta` (beta)
 $dataInitText = Get-Content -Raw (Join-Path $here '..' '..' 'scripts' 'datadisk-init.sh')
 
-# Data-disk identity is unified on `devbox-data` (label + mount name).
+# Data-disk identity is channel-scoped (label == mount name within a channel).
 Assert-True ($mainText -match 'devbox-data') 'name: installer uses devbox-data'
 Assert-True ($mainText -match 'DATA_MNTNAME') 'name: installer writes DATA_MNTNAME'
 Assert-True ($mainText -notmatch 'agent-devbox-data') 'name: installer drops the old agent-devbox-data'
@@ -800,6 +961,21 @@ Assert-True ($unmountHelper -match '--unmount') 'name: detach helper uses wsl --
 Assert-True ($unmountHelper -match [regex]::Escape('\\?\%VHDX%')) 'name: detach helper uses the \\?\ device path'
 Assert-True ($unmountHelper -notmatch '(?i)powershell') 'name: detach helper has no PowerShell'
 Assert-True ($unmountHelper -notmatch 'RunAs') 'name: detach helper never self-elevates'
+Assert-True ($unmountHelper -match '%ERRORLEVEL%') 'name: detach helper reads the real exit code'
+Assert-True ($unmountHelper -match 'exit /b') 'name: detach helper propagates the real exit code'
+Assert-True ($unmountHelper -match 'datadisk-attach\.log') 'name: detach helper logs every attempt'
+Assert-True ($unmountHelper -match 'ERROR_FILE_NOT_FOUND') 'name: detach helper recognizes the unattached state'
+Assert-True ($unmountHelper -match '0x80070002') 'name: detach helper recognizes the HRESULT'
+Assert-True ($unmountHelper -match '\[INFO\]') 'name: detach helper prints a friendly no-op'
+Assert-True ($unmountHelper -match 'set "RC=0"') 'name: detach helper exits 0 for the no-op'
+Assert-True ($unmountHelper -notmatch 'set "WSL_UTF8') 'name: detach helper never sets WSL_UTF8 (breaks --unmount)'
+Assert-True ($unmountHelper -match 'E\.R\.R\.O\.R') 'name: detach helper matches the UTF-16LE WSL output'
+Assert-True ($unmountHelper -match '%TEMP%') 'name: detach helper captures into %TEMP%'
+Assert-True ($unmountHelper -match 'del /f /q "%OUT%"') 'name: detach helper removes its temp capture'
+Assert-True ($unmountHelper -notmatch 'findstr[^\r\n]*datadisk-attach') 'name: detach helper never greps the stale log'
+$rcZeroIdx = $unmountHelper.IndexOf('if %RC% EQU 0')
+$fnfIdx = $unmountHelper.IndexOf('ERROR_FILE_NOT_FOUND', [Math]::Max($rcZeroIdx, 0))
+Assert-True ($rcZeroIdx -ge 0 -and $fnfIdx -gt $rcZeroIdx) 'name: detach helper checks a successful unmount before the not-found match'
 foreach ($goneHelper in @('mount-datadisk.ps1', 'unmount-datadisk.ps1')) {
   Assert-True (-not (Test-Path -LiteralPath (Join-Path $winDir $goneHelper))) "converge: $goneHelper stays deleted"
 }
@@ -849,6 +1025,168 @@ Assert-True ($mainText -match [regex]::Escape('D:\WSL\agent-devbox-core')) 'name
 # install.ps1 derives $Distro from $Variant.
 Assert-True ($webText -match "'agent-devbox-core'") 'name: install.ps1 derives the core distro name'
 
+# --- 通道身份（stable / beta）：独立安装，绝不碰正式安装 ------------------
+# channel = beta iff ref != main。stable 必须与今天逐字一致；beta 换发行版、
+# 安装目录、ext4 标签、挂载名和 WT GUID，所以既不会注销也不会挂载正式安装。
+$identAgentsStable = Get-AgentDevboxChannelIdentity -Variant 'agents' -Channel 'stable'
+$identAgentsBeta   = Get-AgentDevboxChannelIdentity -Variant 'agents' -Channel 'beta'
+$identCoreStable   = Get-AgentDevboxChannelIdentity -Variant 'core' -Channel 'stable'
+$identCoreBeta     = Get-AgentDevboxChannelIdentity -Variant 'core' -Channel 'beta'
+
+# 4-row matrix (the stable rows are today's literals, byte for byte).
+Assert-Equal 'agents' $identAgentsStable.Variant 'chan: agents/stable variant'
+Assert-Equal 'stable' $identAgentsStable.Channel 'chan: agents/stable channel'
+Assert-Equal 'agent-devbox' $identAgentsStable.Distro 'chan: agents/stable distro'
+Assert-Equal 'D:\WSL\agent-devbox' $identAgentsStable.InstallDir 'chan: agents/stable install dir'
+Assert-Equal 'devbox-data' $identAgentsStable.Label 'chan: agents/stable label'
+Assert-Equal 'devbox-data' $identAgentsStable.MountName 'chan: agents/stable mount name'
+Assert-Equal '{6f4a1c2e-8b3d-4a97-9c51-0e7d2b8f3a64}' $identAgentsStable.TerminalGuid 'chan: agents/stable terminal GUID'
+Assert-Equal '{04014822-8112-5520-a687-27d5f19a9da6}' $identAgentsStable.HideGuid 'chan: agents/stable hide GUID'
+
+Assert-Equal 'agents' $identAgentsBeta.Variant 'chan: agents/beta variant'
+Assert-Equal 'beta' $identAgentsBeta.Channel 'chan: agents/beta channel'
+Assert-Equal 'agent-devbox-beta' $identAgentsBeta.Distro 'chan: agents/beta distro'
+Assert-Equal 'D:\WSL\agent-devbox-beta' $identAgentsBeta.InstallDir 'chan: agents/beta install dir'
+Assert-Equal 'devbox-data-beta' $identAgentsBeta.Label 'chan: agents/beta label'
+Assert-Equal 'devbox-data-beta' $identAgentsBeta.MountName 'chan: agents/beta mount name'
+Assert-Equal '{2af7958c-5167-48b1-a6bd-acaabdca12d2}' $identAgentsBeta.TerminalGuid 'chan: agents/beta terminal GUID'
+Assert-Equal '{0c3f8933-9ad0-429b-a9b8-43861e7fa812}' $identAgentsBeta.HideGuid 'chan: agents/beta hide GUID'
+
+Assert-Equal 'core' $identCoreStable.Variant 'chan: core/stable variant'
+Assert-Equal 'stable' $identCoreStable.Channel 'chan: core/stable channel'
+Assert-Equal 'agent-devbox-core' $identCoreStable.Distro 'chan: core/stable distro'
+Assert-Equal 'D:\WSL\agent-devbox-core' $identCoreStable.InstallDir 'chan: core/stable install dir'
+Assert-Equal 'devbox-data' $identCoreStable.Label 'chan: core/stable label'
+Assert-Equal 'devbox-data' $identCoreStable.MountName 'chan: core/stable mount name'
+Assert-Equal '{c2d7e9a4-3f61-4b08-8e52-7a1d9c4b6f30}' $identCoreStable.TerminalGuid 'chan: core/stable terminal GUID'
+Assert-Equal '{82ea5eb7-e460-5790-9192-d6a59b44f009}' $identCoreStable.HideGuid 'chan: core/stable hide GUID'
+
+Assert-Equal 'core' $identCoreBeta.Variant 'chan: core/beta variant'
+Assert-Equal 'beta' $identCoreBeta.Channel 'chan: core/beta channel'
+Assert-Equal 'agent-devbox-core-beta' $identCoreBeta.Distro 'chan: core/beta distro'
+Assert-Equal 'D:\WSL\agent-devbox-core-beta' $identCoreBeta.InstallDir 'chan: core/beta install dir'
+Assert-Equal 'devbox-data-beta' $identCoreBeta.Label 'chan: core/beta label'
+Assert-Equal 'devbox-data-beta' $identCoreBeta.MountName 'chan: core/beta mount name'
+Assert-Equal '{9c0a398c-65c5-4a2f-85e5-220af66bac1b}' $identCoreBeta.TerminalGuid 'chan: core/beta terminal GUID'
+Assert-Equal '{e6647892-a55a-456d-841d-4c4faed607b9}' $identCoreBeta.HideGuid 'chan: core/beta hide GUID'
+
+# ext4 labels are limited to 16 bytes: `devbox-data-beta` is exactly 16.
+Assert-Equal 16 $identAgentsBeta.Label.Length 'chan: beta label is exactly 16 chars'
+Assert-Equal 'devbox-data-beta' "$($identCoreBeta.Label)" 'chan: both variants share the beta label'
+
+# Channel identities must not collide with each other or across variants.
+$stablePairs = @(
+  @($identAgentsStable, $identAgentsBeta),
+  @($identCoreStable, $identCoreBeta)
+)
+foreach ($pair in $stablePairs) {
+  $s = $pair[0]; $b = $pair[1]
+  Assert-True ($s.Distro -ne $b.Distro) "chan: $($s.Variant) stable/beta distro differs"
+  Assert-True ($s.InstallDir -ne $b.InstallDir) "chan: $($s.Variant) stable/beta install dir differs"
+  Assert-True ($s.Label -ne $b.Label) "chan: $($s.Variant) stable/beta label differs"
+  Assert-True ($s.MountName -ne $b.MountName) "chan: $($s.Variant) stable/beta mount name differs"
+  Assert-True ($s.TerminalGuid -ne $b.TerminalGuid) "chan: $($s.Variant) stable/beta terminal GUID differs"
+  Assert-True ($s.HideGuid -ne $b.HideGuid) "chan: $($s.Variant) stable/beta hide GUID differs"
+}
+$allGuids = @(
+  $identAgentsStable.TerminalGuid, $identAgentsBeta.TerminalGuid, $identCoreStable.TerminalGuid, $identCoreBeta.TerminalGuid,
+  $identAgentsStable.HideGuid, $identAgentsBeta.HideGuid, $identCoreStable.HideGuid, $identCoreBeta.HideGuid
+)
+Assert-Equal 8 (@($allGuids | Select-Object -Unique).Count) 'chan: all four rows use distinct Terminal/Hide GUIDs'
+
+# Entry: channel before default dir, default dir before the install-dir prompt.
+$channelIdx    = $webText.IndexOf("`$Channel = if (`$Ref -ne 'main')")
+$defaultDirIdx = $webText.IndexOf('$DefaultInstallDir =')
+$dirPromptIdx  = $webText.IndexOf('Read-Host "安装目录')
+Assert-True ($channelIdx -ge 0) 'chan: the entry derives the channel'
+Assert-True ($channelIdx -ge 0 -and $defaultDirIdx -gt $channelIdx) 'chan: the channel is derived before the default dir'
+Assert-True ($defaultDirIdx -ge 0 -and $dirPromptIdx -gt $defaultDirIdx) 'chan: the default dir is known before the 安装目录 prompt'
+Assert-True ($webText -match '\$Channel = if \(\$Ref -ne ''main''\) \{ ''beta'' \} else \{ ''stable'' \}') 'chan: non-main refs get the beta channel'
+Assert-True ($webText -match '\$ChannelSuffix = if \(\$Channel -eq ''beta''\) \{ ''-beta'' \} else \{ '''' \}') 'chan: only beta gets a suffix'
+Assert-True ($webText -match '\$BaseDistro = if \(\$Variant -eq ''core''\)') 'chan: the base distro is variant-scoped'
+Assert-True ($webText -match '\$Distro = "\$BaseDistro\$ChannelSuffix"') 'chan: the distro is base + channel suffix'
+Assert-True ($webText -match '\$DefaultInstallDir = "D:\\WSL\\\$Distro"') 'chan: the default dir derives from the channel distro'
+Assert-True ($webText -notmatch '\$Distro\s*=\s*if \(\$Variant -eq ''core''\)') 'chan: the old variant-only distro assignment is gone'
+Assert-True ($webText -notmatch '\$InstallDir[^\r\n]*\$ChannelSuffix') 'chan: an explicit -InstallDir is never suffixed'
+Assert-Equal 2 ([regex]::Matches($webText, '\$ChannelSuffix').Count) 'chan: the suffix is only defined and used by the default dir'
+Assert-True ($webText -match 'Channel = \$Channel') 'chan: the entry passes Channel to the installer splat'
+Assert-True ($webText -match 'Write-Host "beta 通道：.*" -ForegroundColor Yellow') 'chan: the entry prints a yellow beta banner'
+
+# Installer: -Channel in, UAC argv forwarding, helper identity, no -Ref.
+Assert-True ($mainText -match '\[ValidateSet\(''stable'', ''beta''\)\]\s*\[string\]\s*\$Channel\s*=\s*''stable''') 'chan: installer declares -Channel (stable default)'
+Assert-True ($mainText -match '\$argv \+= @\(''-Channel'', \$Channel\)') 'chan: installer forwards -Channel to its UAC child'
+Assert-True ($mainText -match 'Get-AgentDevboxChannelIdentity -Variant \$Variant -Channel \$Channel') 'chan: installer resolves the channel identity from the helper'
+Assert-True ($mainText -match 'Get-Command Get-AgentDevboxChannelIdentity') 'chan: a missing helper is detected'
+Assert-True ($mainText -match '请通过 install.ps1 安装') 'chan: the missing-helper error points at install.ps1'
+Assert-True ($mainText -notmatch '\$VariantMap') 'chan: the hardcoded variant map is gone'
+Assert-True ($mainText -notmatch '\$Ref\b') 'chan: the installer never learns -Ref'
+Assert-True ($mainText -notmatch '\$Label\s*=\s*''devbox-data''') 'chan: the label is never hardcoded'
+Assert-True ($mainText -notmatch '\$MountName\s*=\s*''devbox-data''') 'chan: the mount name is never hardcoded'
+Assert-True ($mainText -match '\$Label = \$v\.Label') 'chan: the label comes from the identity'
+Assert-True ($mainText -match '\$MountName = \$v\.MountName') 'chan: the mount name comes from the identity'
+
+# Channel ownership valve: before UAC, marker written without a BOM.
+$markerIdx = $mainText.IndexOf('.agent-devbox-channel')
+$uacIdx    = $mainText.IndexOf('if (-not (Test-Admin))')
+$newDirIdx = $mainText.IndexOf('New-Item -ItemType Directory -Force -Path $InstallDir')
+$writeIdxM = $mainText.IndexOf('WriteAllText($ChannelMarker, $Channel')
+Assert-True ($markerIdx -ge 0) 'chan: the channel marker exists'
+Assert-True ($markerIdx -ge 0 -and $uacIdx -gt $markerIdx) 'chan: the ownership valve runs BEFORE the UAC hand-off'
+Assert-True ($newDirIdx -ge 0 -and $writeIdxM -gt $newDirIdx) 'chan: the marker is written after the install dir exists'
+Assert-True ($mainText -match 'WriteAllText\(\$ChannelMarker, \$Channel, \(New-Object System\.Text\.UTF8Encoding\(\$false\)\)\)') 'chan: the marker is written without a BOM'
+Assert-True ($mainText -match '\$markedChannel = ''stable''') 'chan: a missing marker defaults to the legacy stable channel'
+
+# Ownership = data.vhdx OR ext4.vhdx. A legacy stable install that failed BEFORE
+# the data disk was created still holds ext4.vhdx (its system disk) and no
+# data.vhdx; importing beta into that dir would clobber the stable system disk.
+$ownedStart = $mainText.IndexOf('$ownedByDisk =')
+$ownedGate  = $mainText.IndexOf('if ($ownedByDisk)')
+$ownedBlock = if ($ownedStart -ge 0 -and $ownedGate -gt $ownedStart) { $mainText.Substring($ownedStart, $ownedGate - $ownedStart) } else { '' }
+Assert-True ($ownedStart -ge 0 -and $ownedStart -lt $uacIdx) 'chan: the ownership probe stays before the UAC hand-off'
+Assert-True ($ownedBlock -match 'Test-Path -LiteralPath \(Join-Path \$InstallDir \$VhdxName\)') 'chan: the valve checks data.vhdx'
+Assert-True ($ownedBlock -match 'Test-Path -LiteralPath \(Join-Path \$InstallDir ''ext4\.vhdx''\)') 'chan: the valve also checks ext4.vhdx'
+Assert-True ($ownedBlock -match '-or') 'chan: both ownership probes feed one gate'
+Assert-True ($mainText -match '数据盘（data\.vhdx）或系统盘（ext4\.vhdx') 'chan: the combined ownership rule is documented'
+Assert-True ($mainText -notmatch '\$existingVhdx') 'chan: the old data.vhdx-only probe is gone'
+
+# Fatal datadisk-init: after the arch throw, before printing its output.
+$archThrowIdx = $mainText.IndexOf('导入的 rootfs 架构与主机不匹配')
+$initFailIdx  = $mainText.IndexOf('数据盘初始化失败')
+$initOutIdx   = $mainText.IndexOf('Write-Host $initOut')
+Assert-True ($initFailIdx -ge 0) 'chan: a failed datadisk-init is fatal'
+Assert-True ($archThrowIdx -ge 0 -and $initFailIdx -gt $archThrowIdx) 'chan: the init failure check follows the arch-mismatch throw'
+Assert-True ($initOutIdx -gt $initFailIdx) 'chan: the failure check runs BEFORE writing the init output'
+Assert-True ($mainText -match '数据盘初始化失败（标签 \$Label，退出码 \$initExit）') 'chan: the init failure names the label and the real exit code'
+Assert-True ($mainText -match 'data\.vhdx 已保留') 'chan: the init failure says the data disk is kept'
+
+# Beta rootfs boot-support gate: an old rootfs whose wsl-boot.sh lacks DATA_LABEL
+# falls back to the shared `devbox-data` label when the beta disk is not attached,
+# so it could mount the production data disk. The probe must refuse it BEFORE
+# datadisk-init runs, and the handler must unregister and throw (mkfs never runs).
+$guardVarIdx   = $mainText.IndexOf('$channelBootGuard =')
+$guardEndIdx   = $mainText.IndexOf("`$initOut = Invoke-WslBashScript")
+$guardBlock    = if ($guardVarIdx -ge 0 -and $guardEndIdx -gt $guardVarIdx) { $mainText.Substring($guardVarIdx, $guardEndIdx - $guardVarIdx) } else { '' }
+$guardThrowIdx = $mainText.IndexOf('beta 通道需要包含 DATA_LABEL 支持的 rootfs')
+$guardGrepRel  = $guardBlock.IndexOf('grep -q "DATA_LABEL" /usr/local/bin/wsl-boot.sh')
+$guardInitRel  = $guardBlock.IndexOf('/usr/local/bin/datadisk-init.sh')
+Assert-True ($guardBlock -match '\$Channel -eq ''beta''') 'chan-boot: the guard is beta-gated'
+Assert-True ($guardBlock -match "else \{ '' \}") 'chan-boot: the guard is empty for stable (stable probe unchanged)'
+Assert-True ($guardGrepRel -ge 0) 'chan-boot: the guard greps DATA_LABEL in wsl-boot.sh'
+Assert-True ($guardBlock -match 'CHANNEL_BOOT_UNSUPPORTED') 'chan-boot: the guard reports CHANNEL_BOOT_UNSUPPORTED'
+Assert-True ($guardBlock -match 'exit 43') 'chan-boot: the guard exits 43'
+Assert-True ($guardBlock -match '\$probe = \$channelBootGuard \+') 'chan-boot: the guard is prepended to the probe'
+Assert-True ($guardGrepRel -ge 0 -and $guardInitRel -gt $guardGrepRel) 'chan-boot: the guard runs BEFORE datadisk-init in the probe'
+Assert-True ($mainText -match '\$initExit -eq 43') 'chan-boot: exit 43 is handled explicitly'
+Assert-True ($guardThrowIdx -ge 0 -and $initOutIdx -gt $guardThrowIdx) 'chan-boot: the throw runs BEFORE writing the init output'
+Assert-True ($mainText -match '请用 -ReleaseTag beta') 'chan-boot: the throw hints -ReleaseTag beta'
+
+# Conf: exactly six keys, DATA_LABEL third.
+Assert-Equal 6 ([regex]::Matches($mainText, '(?:DATA_[A-Z]+|PASEO_PASSWORD)=\$\(Quote-Bash').Count) 'conf: exactly six keys are written'
+Assert-True ($mainText -match 'DATA_VHDX=\$\(Quote-Bash \$VhdxPath\)`nDATA_UUID=\$\(Quote-Bash \$uuid\)`nDATA_LABEL=\$\(Quote-Bash \$Label\)`nPASEO_PASSWORD=\$\(Quote-Bash \$pw\)`nDATA_MNTNAME=\$\(Quote-Bash \$MountName\)`nDATA_DISTRO=\$\(Quote-Bash \$Distro\)`n') 'conf: DATA_LABEL is the third key (DATA_VHDX, DATA_UUID, DATA_LABEL, PASEO_PASSWORD, DATA_MNTNAME, DATA_DISTRO)'
+
+# Summary banner names the channel.
+Assert-True ($mainText -match '通道=\$Channel') 'chan: the install summary shows 通道=$Channel'
+
 # datadisk-init takes the ext4 label as its first argument (no hardcoded name).
 Assert-True ($dataInitText -match 'LABEL="\$\{1') 'name: datadisk-init takes the label as $1'
 Assert-True ($dataInitText -notmatch 'LABEL=agent-devbox-data') 'name: datadisk-init has no hardcoded label'
@@ -876,7 +1214,7 @@ Assert-True ($mainText -match 'Copy-Item -LiteralPath \$LogPath -Destination \$s
 Assert-True ($mainText -match 'cat /etc/agent-devbox.conf') 'log: password retrieval command is shown'
 Assert-True ($mainText -notmatch '已生成 paseo 密码：') 'log: password is never printed'
 Assert-True ($mainText -match 'Start-Sleep -Seconds 10') 'task: interactive hold is present'
-Assert-True ($mainText -match '火绒') 'task: AV allow prompt is present'
+Assert-True ($mainText -notmatch '火绒') 'task: the stale AV allow prompt is gone (there is no scheduled task)'
 Assert-True ($mainText -match '-not \$Yes') 'task: hold is gated on -not $Yes'
 # 计划任务已彻底移除：安装器只清理旧版本注册的任务，并自己 attach 一次。
 # conf 现在正好 5 个键（DATA_TASK 已随计划任务一起删除）。
@@ -967,6 +1305,45 @@ Assert-True ($ciText -match 'zstd -dc \| tar -xOf - usr/bin/dash') 'ci: split pa
 Assert-True ($ciText -notmatch '--platform linux/amd64') 'ci: no hardcoded amd64 platform'
 Assert-True ($ciText -match 'retention-days:\s*3') 'ci: transient artifacts expire'
 Assert-True ($ciText -match 'needs: \[plan, export\]') 'ci: publish waits for both exports'
+
+# --- 镜像分层：通用开发工具进 OCI，Docker/PowerShell 只进 WSL rootfs -------
+$ociDockerfile = Get-Content -Raw (Join-Path $here '..' '..' 'Dockerfile')
+$wslDockerfile = Get-Content -Raw (Join-Path $here '..' '..' 'Dockerfile.wsl')
+Assert-True ($ociDockerfile -match '(?m)^# L1b\)') 'layers: L1b exists in the OCI Dockerfile'
+foreach ($pkg in @('bats','shellcheck','gh','man-db','manpages','libicu76','bind9-dnsutils','netcat-openbsd','ethtool','sysstat','bridge-utils','iproute2','iptables','nftables','zstd','parallel')) {
+  Assert-True ($ociDockerfile -match "(?m)^\s+[^\r\n]*\b$([regex]::Escape($pkg))\b") "layers: L1b installs $pkg"
+}
+Assert-True ($ociDockerfile -match 'marksman-linux-\$\{marksman_arch\}') 'layers: marksman is arch-mapped'
+Assert-True ($ociDockerfile -match 'dpkg --print-architecture') 'layers: arch comes from dpkg'
+Assert-True ($ociDockerfile -notmatch 'docker\.io') 'layers: OCI image never installs docker.io'
+Assert-True ($ociDockerfile -notmatch 'docker-compose') 'layers: OCI image never installs docker-compose'
+Assert-True ($ociDockerfile -notmatch 'docker-cli') 'layers: OCI image never installs docker-cli'
+Assert-True ($ociDockerfile -notmatch '(?i)powershell_') 'layers: OCI image never installs PowerShell'
+Assert-True ($ociDockerfile -notmatch '\bpwsh\b') 'layers: OCI image has no pwsh'
+Assert-True ($ociDockerfile -notmatch '\bdockerd\b') 'layers: OCI image has no dockerd'
+# \r?$ keeps these assertions valid on a CRLF checkout (.NET's $ matches
+# before \n but not before \r\n; .gitattributes normally keeps CI LF).
+Assert-True ($wslDockerfile -match '(?m)^ARG BASE_IMAGE\r?$') 'wsl: overlay takes BASE_IMAGE'
+Assert-True ($wslDockerfile -match '(?m)^FROM \$\{BASE_IMAGE\}\r?$') 'wsl: overlay derives from the built image'
+foreach ($pkg in @('docker.io','docker-cli','docker-compose','docker-buildx','fio','osslsigncode','libevtx-utils','python3-evtx')) {
+  Assert-True ($wslDockerfile -match "(?m)^\s+[^\r\n]*\b$([regex]::Escape($pkg))\b") "wsl: overlay installs $pkg"
+}
+Assert-True ($wslDockerfile -match 'policy-rc\.d') 'wsl: overlay blocks postinst service start'
+Assert-True ($wslDockerfile -match 'test ! -e /var/lib/docker') 'wsl: build proves no docker state was baked in'
+Assert-True ($wslDockerfile -match 'docker --version') 'wsl: build proves the docker CLI exists (Debian splits it out of docker.io)'
+Assert-True ($wslDockerfile -match 'ARG POWERSHELL_VERSION=7\.6\.7') 'wsl: PowerShell is pinned'
+Assert-True ($wslDockerfile -match 'powershell_\$\{POWERSHELL_VERSION\}-1\.deb_\$\{arch\}\.deb') 'wsl: PowerShell .deb is arch-mapped'
+Assert-True ($wslDockerfile -match 'pwsh -NoProfile') 'wsl: overlay smoke-runs pwsh'
+$exportBlock = [regex]::Match($ciText, '(?ms)^  export:.*?(?=^  publish:)').Value
+Assert-True ($exportBlock -match 'actions/checkout@v7') 'ci: export checks out the overlay Dockerfile'
+Assert-True ($exportBlock -match 'Dockerfile\.wsl') 'ci: export builds the WSL overlay'
+Assert-True ($exportBlock -match '--build-arg BASE_IMAGE=') 'ci: overlay derives from the built image'
+Assert-True ($exportBlock -match '\$TAG-wsl') 'ci: export uses the overlay tag'
+Assert-True ($exportBlock -match 'docker rmi -f "\$img:\$TAG-wsl"') 'ci: overlay image is removed after export'
+Assert-True ($ciText -match '(?m)^\s+- "Dockerfile\.wsl"\r?$') 'ci: overlay changes trigger a build'
+$smokeBlock = [regex]::Match($ciText, '(?ms)^  smoke:.*?(?=^  export:)').Value
+Assert-True ($smokeBlock -match 'dockerd') 'ci: smoke proves the OCI image has no dockerd'
+Assert-True ($smokeBlock -match 'pwsh') 'ci: smoke proves the OCI image has no pwsh'
 
 Write-Host ''
 if ($script:Failed -gt 0) {

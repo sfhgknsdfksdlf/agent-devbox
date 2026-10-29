@@ -77,3 +77,37 @@ Describe 'Remove-DownloadArtifacts' {
     Test-Path -LiteralPath $keep | Should -BeTrue
   }
 }
+
+Describe 'Get-AgentDevboxChannelIdentity' {
+  It 'keeps the stable agents identity exactly as today' {
+    $id = Get-AgentDevboxChannelIdentity -Variant 'agents' -Channel 'stable'
+    $id.Variant | Should -Be 'agents'
+    $id.Channel | Should -Be 'stable'
+    $id.Distro | Should -Be 'agent-devbox'
+    $id.InstallDir | Should -Be 'D:\WSL\agent-devbox'
+    $id.Label | Should -Be 'devbox-data'
+    $id.MountName | Should -Be 'devbox-data'
+    $id.TerminalGuid | Should -Be '{6f4a1c2e-8b3d-4a97-9c51-0e7d2b8f3a64}'
+    $id.HideGuid | Should -Be '{04014822-8112-5520-a687-27d5f19a9da6}'
+  }
+
+  It 'gives beta core a fully distinct identity' {
+    $id = Get-AgentDevboxChannelIdentity -Variant 'core' -Channel 'beta'
+    $id.Variant | Should -Be 'core'
+    $id.Channel | Should -Be 'beta'
+    $id.Distro | Should -Be 'agent-devbox-core-beta'
+    $id.InstallDir | Should -Be 'D:\WSL\agent-devbox-core-beta'
+    $id.Label | Should -Be 'devbox-data-beta'
+    $id.MountName | Should -Be 'devbox-data-beta'
+    $id.TerminalGuid | Should -Be '{9c0a398c-65c5-4a2f-85e5-220af66bac1b}'
+    $id.HideGuid | Should -Be '{e6647892-a55a-456d-841d-4c4faed607b9}'
+
+    $stable = Get-AgentDevboxChannelIdentity -Variant 'core' -Channel 'stable'
+    $id.Distro | Should -Not -Be $stable.Distro
+    $id.InstallDir | Should -Not -Be $stable.InstallDir
+    $id.Label | Should -Not -Be $stable.Label
+    $id.MountName | Should -Not -Be $stable.MountName
+    $id.TerminalGuid | Should -Not -Be $stable.TerminalGuid
+    $id.HideGuid | Should -Not -Be $stable.HideGuid
+  }
+}

@@ -469,7 +469,19 @@ function Invoke-Native {
   try {
     $script:NativeExit = -1
     if ($null -ne $InputText) {
-      $out = $InputText | & $FilePath @Arguments 2>&1
+      # PS 5.1's default $OutputEncoding is us-ascii, so piping a guest script
+      # turns every Chinese character into '?'. Use UTF-8 without BOM for this
+      # pipe only and restore the caller's preference.
+      $prevEncoding = $OutputEncoding
+      try {
+        # $OutputEncoding is read from the SCRIPT scope by the native pipeline;
+        # a function-local assignment is ignored (measured on 5.1.26100.2161),
+        # so set the script-scope preference and restore it.
+        $script:OutputEncoding = New-Object System.Text.UTF8Encoding($false)
+        $out = $InputText | & $FilePath @Arguments 2>&1
+      } finally {
+        $script:OutputEncoding = $prevEncoding
+      }
     } else {
       $out = & $FilePath @Arguments 2>&1
     }
@@ -478,6 +490,54 @@ function Invoke-Native {
   } finally {
     $ErrorActionPreference = $prev
   }
+}
+
+# Run a guest bash script from stdin instead of the native command line.
+# PowerShell 5.1 wraps native arguments in double quotes but does NOT escape the
+# ones inside them, so wsl.exe splits any script containing `"..."` at the next
+# space. On 2026-10-28 that truncated the data-disk password write at `$(cat `,
+# bash exited 2, and the password leaked into the install log through stderr.
+# `-l` keeps /etc/profile (PATH with sbin); `-s` reads the script from stdin.
+# `--cd /` pins the guest cwd so a stale caller cwd (\\wsl$\<deleted distro>\...)
+# cannot fail every call with 0x8007010b before the script even runs.
+function Invoke-WslBashScript {
+  [CmdletBinding()]
+  param(
+    [Parameter(Mandatory)][string] $Distro,
+    [Parameter(Mandatory)][AllowEmptyString()][string] $Script
+  )
+  # PS 5.1 appends CRLF to native stdin. If the script's last line is a
+  # keyword (`fi`/`done`) the CR sticks to it and bash reports "unexpected end
+  # of file"; on a bare line it runs `$'\r'` and forces exit 127. A trailing
+  # comment line absorbs that CR for every caller.
+  return Invoke-Native 'wsl.exe' @('-d', $Distro, '--cd', '/', '-u', 'root', '-e', 'bash', '-ls') -InputText ($Script + "`n# end")
+}
+
+# Decode the guest's base64 (ASCII-safe) output as UTF-8. Native stdout is
+# decoded with the console OEM code page, so a non-ASCII password must never
+# cross it raw.
+function ConvertFrom-Base64Utf8([string] $Text) {
+  $s = ("$Text" -replace '\s', '')
+  if ([string]::IsNullOrEmpty($s)) { return '' }
+  try { return [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($s)) } catch { return '' }
+}
+
+# Convert a `Read-Host -AsSecureString` value back to plain text in memory only.
+function ConvertFrom-SecureText([Security.SecureString] $Secure) {
+  if ($null -eq $Secure) { return '' }
+  $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($Secure)
+  try { return [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr) } finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) }
+}
+
+# Replace a secret before it reaches the console / transcript. A failed bash
+# command can echo its script back; mask both the raw value and the single-quote
+# escaped form Quote-Bash produces.
+function Hide-SecretText([string] $Text, [string] $Secret) {
+  if ([string]::IsNullOrEmpty($Secret)) { return $Text }
+  $out = $Text
+  $escaped = $Secret.Replace("'", "'\''")
+  if ($escaped -ne $Secret) { $out = $out.Replace($escaped, '***') }
+  return $out.Replace($Secret, '***')
 }
 
 # Map a raw version selection to a release-tag input:
@@ -944,6 +1004,18 @@ function Remove-DownloadSegmentDir {
   param([Parameter(Mandatory)][string] $Dest)
   $dir = Get-DownloadSegmentDir -Dest $Dest
   Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+  # Also drop the now-empty `segments` and `.agent-devbox-download` parents:
+  # a successful install must not leave an empty skeleton behind (2026-10-28:
+  # the install dir kept .agent-devbox-download\segments after cleanup). Stop
+  # at the hidden dir - the install dir itself is never touched.
+  $segmentsRoot = Split-Path -Parent $dir
+  $hidden = Split-Path -Parent $segmentsRoot
+  foreach ($d in @($segmentsRoot, $hidden)) {
+    if ([string]::IsNullOrWhiteSpace($d)) { continue }
+    if (-not (Test-Path -LiteralPath $d)) { continue }
+    if (Get-ChildItem -LiteralPath $d -Force -ErrorAction SilentlyContinue) { continue }
+    Remove-Item -LiteralPath $d -Force -ErrorAction SilentlyContinue
+  }
 }
 
 # Returns $null when the sidecar is missing or unreadable (never throws).
@@ -1051,9 +1123,12 @@ function Remove-DownloadArtifacts {
   [CmdletBinding()]
   param([Parameter(Mandatory)][string] $Dest)
   Remove-Item -LiteralPath $Dest -Force -ErrorAction SilentlyContinue
-  Remove-DownloadSegmentDir -Dest $Dest
+  # Delete the sidecar FIRST: it lives inside .agent-devbox-download, and the
+  # parent prune only removes empty dirs. The old order left an empty hidden
+  # dir behind after every successful install (2026-10-29 field log).
   $meta = Get-DownloadMetaPath -Dest $Dest
   Remove-Item -LiteralPath $meta -Force -ErrorAction SilentlyContinue
+  Remove-DownloadSegmentDir -Dest $Dest
 }
 
 # Pure cleanup decision for the installer's import `finally`. A network/import
@@ -2530,13 +2605,13 @@ function Assert-DataDiskMounted {
   do {
     # boot 日志是文件证据：`wsl -d` 会话不一定能看到 [boot] 会话建立的挂载
     # （2026-10-21 22:05 实测 findmnt 一直看不到，但 boot 日志已写「数据盘挂载成功 / boot complete」）。
-    $tail = Invoke-Native 'wsl.exe' @('-d', $Distro, '-u', 'root', '-e', 'bash', '-lc', "tail -n +$($SinceLine + 1) $bootLogPath 2>/dev/null")
+    $tail = Invoke-WslBashScript -Distro $Distro -Script "tail -n +$($SinceLine + 1) $bootLogPath 2>/dev/null"
     $newLog = "$tail"
     if ($newLog -match 'boot complete') { return $true }
     # 终态标记：boot 失败时 wsl-boot.sh 写 `boot failed: maintenance mode`，绝不会再写
     # `boot complete`。看到它就不要继续空等 45 秒，立刻把可粘贴的修复命令抛给用户。
     if ($newLog -match 'FATAL|boot failed') { break }
-    $out = Invoke-Native 'wsl.exe' @('-d', $Distro, '-u', 'root', '-e', 'bash', '-lc', "findmnt -rno TARGET --mountpoint $target 2>/dev/null")
+    $out = Invoke-WslBashScript -Distro $Distro -Script "findmnt -rno TARGET --mountpoint $target 2>/dev/null | sort -u"
     if ($script:NativeExit -eq 0 -and ("$out".Trim() -eq $target)) { return $true }
     Start-Sleep -Seconds 2
   } while ((Get-Date) -lt $deadline)
@@ -2589,6 +2664,13 @@ function Write-AgentDevboxTerminalProfile {
   $json = New-TerminalProfileFragment -Distro $Distro -ProfileGuid $ProfileGuid -HideGuid $HideGuid `
     -StartingDirectory ('\\wsl$\{0}\root' -f $Distro)
   [System.IO.File]::WriteAllText($path, $json, (New-Object System.Text.UTF8Encoding($false)))
+  # A deleted distribution leaves its fragment behind forever; its
+  # startingDirectory then points at a UNC path that no longer exists, which
+  # makes Windows Terminal fail the whole launch with 0x8007010b (seen
+  # 2026-10-28 after a beta install reused a wiped install dir). Prune only
+  # AgentDevbox-owned fragments whose distro is not registered; the file just
+  # written is always kept even though an upgrade has not re-imported it yet.
+  try { Remove-StaleAgentDevboxTerminalFragments -KeepDistro $Distro | Out-Null } catch { }
   return $path
 }
 
@@ -2614,6 +2696,56 @@ function Remove-StaleWslTerminalFragments {
   return $removed
 }
 
+# Drop AgentDevbox WT fragments whose distribution no longer exists. The file
+# name IS the distro name (`<Distro>.json`). KeepDistro is never deleted: the
+# installer writes the fragment BEFORE `wsl --import`, so at that moment the
+# current distro is legitimately absent from `wsl -l -q`. Other channels /
+# variants stay as long as their distro is still registered.
+function Get-StaleAgentDevboxFragmentNames {
+  [CmdletBinding()]
+  param(
+    [string[]] $Files = @(),
+    [string[]] $Registered = @(),
+    [Parameter(Mandatory)][string] $KeepDistro
+  )
+  $stale = @()
+  foreach ($f in @($Files)) {
+    if ([string]::IsNullOrWhiteSpace($f)) { continue }
+    $base = [System.IO.Path]::GetFileNameWithoutExtension($f)
+    if ($base -ieq $KeepDistro) { continue }
+    if (@($Registered) -contains $base) { continue }
+    $stale += $f
+  }
+  return $stale
+}
+
+function Remove-StaleAgentDevboxTerminalFragments {
+  [CmdletBinding()]
+  param([Parameter(Mandatory)][string] $KeepDistro)
+  if ([string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) { return 0 }
+  $dir = Join-Path $env:LOCALAPPDATA 'Microsoft\Windows Terminal\Fragments\AgentDevbox'
+  if (-not (Test-Path -LiteralPath $dir)) { return 0 }
+  $registered = @()
+  try {
+    $listed = @((Invoke-Native 'wsl.exe' @('-l', '-q')) |
+      ForEach-Object { "$_" -replace "`0", '' } |
+      ForEach-Object { $_.Trim() } |
+      Where-Object { $_ })
+    # Never prune on a failed/unknown listing: an empty set would delete another
+    # channel's profile whose distro still exists.
+    if ($script:NativeExit -ne 0) { return 0 }
+    $registered = $listed
+  } catch { return 0 }
+  $files = @(Get-ChildItem -LiteralPath $dir -Filter *.json -ErrorAction SilentlyContinue | ForEach-Object { $_.Name })
+  $removed = 0
+  foreach ($name in @(Get-StaleAgentDevboxFragmentNames -Files $files -Registered $registered -KeepDistro $KeepDistro)) {
+    $path = Join-Path $dir $name
+    Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+    if (-not (Test-Path -LiteralPath $path)) { $removed++ }
+  }
+  return $removed
+}
+
 function Assert-PaseoHealthy {
   [CmdletBinding()]
   param(
@@ -2622,11 +2754,61 @@ function Assert-PaseoHealthy {
   )
   $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
   do {
-    Invoke-Native 'wsl.exe' @('-d', $Distro, '-u', 'root', '-e', 'bash', '-lc', 'wget -q -T 5 -O /dev/null http://127.0.0.1:6767/api/health') | Out-Null
+    Invoke-WslBashScript -Distro $Distro -Script 'wget -q -T 5 -O /dev/null http://127.0.0.1:6767/api/health' | Out-Null
     if ($script:NativeExit -eq 0) { return $true }
     Start-Sleep -Seconds 2
   } while ((Get-Date) -lt $deadline)
 
   $log = Invoke-Native 'wsl.exe' @('-d', $Distro, '-u', 'root', '-e', 'tail', '-n', '20', '/var/log/paseo-boot.log')
   throw ("paseo 未在 {0}s 内就绪（/api/health 不是 200）。`n{1}" -f $TimeoutSeconds, $log)
+}
+
+# ===========================================================================
+# Channel identity: stable (main) vs beta (any other ref)
+# ===========================================================================
+# A channel is a separate PRODUCT IDENTITY, not a path suffix: its own distro,
+# install dir, ext4 label, mount name and Windows Terminal GUIDs, so a beta
+# install can never unregister, mount or profile-clobber the stable install.
+# The stable rows are the pre-channel literals and must stay byte-identical.
+function Get-AgentDevboxChannelIdentity {
+  [CmdletBinding()]
+  param(
+    [Parameter(Mandatory)][ValidateSet('agents', 'core')][string] $Variant,
+    [Parameter(Mandatory)][ValidateSet('stable', 'beta')][string] $Channel
+  )
+  $suffix = if ($Channel -eq 'beta') { '-beta' } else { '' }
+  $label  = if ($Channel -eq 'beta') { 'devbox-data-beta' } else { 'devbox-data' }
+  $base   = if ($Variant -eq 'core') { 'agent-devbox-core' } else { 'agent-devbox' }
+  $distro = "$base$suffix"
+
+  $terminalGuid = ''
+  $hideGuid     = ''
+  if ($Variant -eq 'core') {
+    if ($Channel -eq 'beta') {
+      $terminalGuid = '{9c0a398c-65c5-4a2f-85e5-220af66bac1b}'
+      $hideGuid     = '{e6647892-a55a-456d-841d-4c4faed607b9}'
+    } else {
+      $terminalGuid = '{c2d7e9a4-3f61-4b08-8e52-7a1d9c4b6f30}'
+      $hideGuid     = '{82ea5eb7-e460-5790-9192-d6a59b44f009}'
+    }
+  } else {
+    if ($Channel -eq 'beta') {
+      $terminalGuid = '{2af7958c-5167-48b1-a6bd-acaabdca12d2}'
+      $hideGuid     = '{0c3f8933-9ad0-429b-a9b8-43861e7fa812}'
+    } else {
+      $terminalGuid = '{6f4a1c2e-8b3d-4a97-9c51-0e7d2b8f3a64}'
+      $hideGuid     = '{04014822-8112-5520-a687-27d5f19a9da6}'
+    }
+  }
+
+  return [pscustomobject]@{
+    Variant      = $Variant
+    Channel      = $Channel
+    Distro       = $distro
+    InstallDir   = ('D:\WSL\{0}' -f $distro)
+    Label        = $label
+    MountName    = $label
+    TerminalGuid = $terminalGuid
+    HideGuid     = $hideGuid
+  }
 }

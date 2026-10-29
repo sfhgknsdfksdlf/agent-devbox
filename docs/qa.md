@@ -253,9 +253,10 @@ paseo 密码都保留，`uname -m` 仍是 `aarch64`。
 ## 为什么升级镜像不会重设 paseo 密码？
 
 `/etc/agent-devbox.conf` 在**系统盘**上，而升级 = 注销 + 重新导入系统盘，配置文件会跟着没。
-所以密码的权威位置放在**数据盘**：`/mnt/devbox-data/.paseo-password`（mode 600）。数据盘跨升级
-保留，安装器在 `[7/10]` 按 UUID 把它挂载起来，先读这个文件；有就直接沿用，没有才询问/生成，
-生成后再写回数据盘。`/etc/agent-devbox.conf` 只是运行期配置（paseo-boot 读它）。
+所以密码的权威位置放在**数据盘**：`/mnt/<DATA_MNTNAME>/.paseo-password`（stable 为 `devbox-data`，
+beta 为 `devbox-data-beta`；mode 600）。数据盘跨升级保留，安装器在 `[7/10]` 按 UUID 把它挂载起来，
+先读这个文件；有就直接沿用，没有才询问/生成，生成后再写回数据盘。
+`/etc/agent-devbox.conf` 只是运行期配置（paseo-boot 读它）。
 
 **不再读旧系统盘的 conf**（2026-10-21 起）：迁移窗口已过（改动之前的安装都已升级过，数据盘上
 都有 `.paseo-password`）。删掉这一步是为了不再为 `cat` 一个文件把旧发行版整机拉起——`[boot]`

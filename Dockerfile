@@ -71,6 +71,32 @@ RUN set -eux; \
     rm -rf /var/lib/apt/lists/*
 
 # -----------------------------------------------------------------------------
+# L1b) repo/dev QA tooling: the suite this repo runs itself (bats/shellcheck),
+#      CI triage (gh), man pages, and general network/forensics CLIs.
+#      `marksman` has no Debian package -> GitHub release binary, arch-mapped.
+#      It is a .NET single-file binary: without libicu76 it aborts with
+#      "Couldn't find a valid ICU package" (exit 139), so the runtime is NOT
+#      optional here.
+# -----------------------------------------------------------------------------
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+      bats shellcheck gh man-db manpages libicu76 \
+      bind9-dnsutils netcat-openbsd ethtool sysstat bridge-utils iproute2 \
+      iptables nftables zstd parallel; \
+    rm -rf /var/lib/apt/lists/*; \
+    case "$(dpkg --print-architecture)" in \
+      amd64) marksman_arch=x64 ;; \
+      arm64) marksman_arch=arm64 ;; \
+      *) echo "unsupported arch: $(dpkg --print-architecture)" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL --retry 5 --retry-all-errors --retry-delay 3 \
+      -o /usr/local/bin/marksman \
+      "https://github.com/artempyanykh/marksman/releases/latest/download/marksman-linux-${marksman_arch}"; \
+    chmod +x /usr/local/bin/marksman; \
+    marksman --version
+
+# -----------------------------------------------------------------------------
 # L2) Playwright Chromium system deps
 # -----------------------------------------------------------------------------
 RUN set -eux; \

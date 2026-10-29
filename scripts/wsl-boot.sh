@@ -10,11 +10,12 @@
 #   that existed while only a Windows logon task could attach the disk.
 #   Everything after the attach stays in Linux:
 #     1. Wait for the attached block device up to DEVICE_WAIT seconds. Only ONE
-#        wait per boot. Identity is resolved by UUID first, then by the shared
-#        ext4 label (`devbox-data`), which is what makes the agents and core
-#        variants' data disks interchangeable: a copied VHDX keeps the source
-#        UUID, so it only resolves by label. Two matches (original + copy both
-#        attached) fail closed — boot never picks one.
+#        wait per boot. Identity is resolved by UUID first, then by the channel's
+#        ext4 label (`devbox-data` stable / `devbox-data-beta` beta), which is
+#        what makes same-channel agents and core data disks interchangeable: a
+#        copied VHDX keeps the source UUID, so it only resolves by label. Two
+#        matches (original + copy both attached) fail closed — boot never picks
+#        one.
 #     2. `mount -t ext4 <dev> /mnt/<mntname>` (mntname from DATA_MNTNAME,
 #        default `devbox-data`, read out of /etc/agent-devbox.conf).
 #     3. VERIFY the mount identity (mountpoint + UUID) — fail closed.
@@ -53,9 +54,11 @@
 #   MAINTENANCE MOTD. So we check every exit status explicitly instead. Errors stay
 #   loud: they are logged and turned into a fail-closed exit 0 (MAINTENANCE MODE).
 #
-# Layout: credentials/identity come from /etc/agent-devbox.conf (5 keys written
+# Layout: credentials/identity come from /etc/agent-devbox.conf (6 keys written
 # by the Windows installer): DATA_VHDX, DATA_UUID, PASEO_PASSWORD, DATA_MNTNAME,
-# DATA_DISTRO.
+# DATA_DISTRO, DATA_LABEL. Label precedence: AGENT_DEVBOX_DATA_LABEL (env) >
+# conf DATA_LABEL > `devbox-data`. Labels are per channel: `devbox-data` (stable)
+# / `devbox-data-beta` (beta, exactly 16 chars — the ext4 limit).
 #
 # This file is safe to SOURCE — every side effect lives in a function, and the
 # entry point is guarded by the BASH_SOURCE check at the bottom.
@@ -79,16 +82,34 @@ DATADIR="${AGENT_DEVBOX_DATADIR:-}"
 # written by the `>>` redirect in main(), so nothing else can bound it.
 PASEO_LOG="${AGENT_DEVBOX_PASEO_LOG:-/var/log/paseo-boot.log}"
 PASEO_LOG_MAX="${AGENT_DEVBOX_PASEO_LOG_MAX:-5242880}"
+# dockerd is only shipped by the WSL rootfs overlay (the OCI image stays lean), so
+# every value here is best-effort. `-` (not `:-`) for the BINARY on purpose: an
+# explicitly empty value means "absent" (the bats suite uses it), while unset
+# means plain `dockerd` from PATH.
+DOCKERD_LOG="${AGENT_DEVBOX_DOCKERD_LOG:-/var/log/dockerd.log}"
+DOCKERD_LOG_MAX="${AGENT_DEVBOX_DOCKERD_LOG_MAX:-5242880}"
+DOCKERD_PID="${AGENT_DEVBOX_DOCKERD_PID:-/run/agent-devbox-dockerd.pid}"
+DOCKERD_BIN="${AGENT_DEVBOX_DOCKERD_BIN-dockerd}"
+# WSL's [boot] command gets no PATH: bash itself resolves names with a built-in
+# default, but children (setsid -> execvp) inherit an empty environment PATH and
+# fail with ENOENT. Export the standard path once so every child can exec by
+# name; the 2026-10-28 install showed `setsid: failed to execute dockerd` on
+# every boot because of exactly this.
+export PATH="${PATH:-/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin}"
 # Boot attach budget: ATTACH_TIMEOUT bounds the interop call (plus 2s kill grace),
 # DEVICE_WAIT bounds the single wait for the block device. Worst case ~30s, which
 # stays inside the installer's 45s assertion.
 ATTACH_TIMEOUT="${AGENT_DEVBOX_ATTACH_TIMEOUT:-8}"
 DEVICE_WAIT="${AGENT_DEVBOX_DEVICE_WAIT:-20}"
-# Data-disk shared identity: both variants use the SAME ext4 label, so a data
-# disk copied from one variant can boot the other. Resolve by UUID first, then
-# by label. A copied VHDX keeps the source UUID, so the original and its copy can
-# be attached together -> multiple matches are an ERROR, never a coin flip.
-DATA_LABEL="${AGENT_DEVBOX_DATA_LABEL:-devbox-data}"
+# Data-disk channel identity: same-channel variants (agents/core) use the SAME
+# ext4 label, so a data disk copied within a channel can boot the other variant.
+# Labels are per channel (stable `devbox-data`, beta `devbox-data-beta`).
+# Precedence: AGENT_DEVBOX_DATA_LABEL (snapshotted below, survives load_conf's
+# reset) > conf DATA_LABEL > `devbox-data`. Resolve by UUID first, then by label.
+# A copied VHDX keeps the source UUID, so the original and its copy can be
+# attached together -> multiple matches are an ERROR, never a coin flip.
+DATA_LABEL_ENV="${AGENT_DEVBOX_DATA_LABEL:-}"
+DATA_LABEL="${DATA_LABEL_ENV:-devbox-data}"
 
 # Installer-populated values (reloaded by load_conf). Pre-declared empty so the
 # functions stay safe under `set -u` even when called directly, or when the file
@@ -117,15 +138,19 @@ log() {
 }
 
 # load_conf(): reset the installer-written values, source the config if present,
-# then resolve the mount name and the concrete DATADIR, and export
-# PASEO_PASSWORD for the daemon child. The data disk is resolved by UUID first,
-# then by the shared label (DATA_LABEL), so the two variants' VHDX files are
-# interchangeable; more than one match fails closed instead of picking one.
+# then resolve the channel label, the mount name and the concrete DATADIR, and
+# export PASEO_PASSWORD for the daemon child. Resetting DATA_LABEL BEFORE the
+# source keeps a second call from leaking the previous conf's label; the env
+# override is snapshotted at source time (DATA_LABEL_ENV) and re-applied AFTER
+# the source, because sourcing the conf would otherwise clobber it. The data
+# disk is resolved by UUID first, then by the channel label (DATA_LABEL), so
+# same-channel VHDX files are interchangeable; more than one match fails closed.
 load_conf() {
   DATA_VHDX=""
   DATA_UUID=""
   DATA_DISTRO=""
   PASEO_PASSWORD=""
+  DATA_LABEL="devbox-data"
   CONF_MISSING=0
   # shellcheck source=/dev/null
   if [ -f "$CONF" ]; then
@@ -133,6 +158,7 @@ load_conf() {
   else
     CONF_MISSING=1
   fi
+  DATA_LABEL="${DATA_LABEL_ENV:-${DATA_LABEL:-devbox-data}}"
   MNTNAME="${DATA_MNTNAME:-devbox-data}"
   if [ -n "${AGENT_DEVBOX_DATADIR:-}" ]; then
     DATADIR="$AGENT_DEVBOX_DATADIR"
@@ -238,9 +264,10 @@ ensure_opencode_shim() {
 }
 
 # data_devs(): print the attached device(s) for the data disk. UUID wins whenever
-# it matches anything: the two variants' own disks have different UUIDs, so both
-# can stay attached without being mistaken for each other. Only when the UUID is
-# absent (a disk copied from the other variant) does the shared label apply.
+# it matches anything: two variants' own disks have different UUIDs, so both can
+# stay attached without being mistaken for each other. Only when the UUID is
+# absent (a disk copied from another variant in the same channel) does the
+# channel label apply.
 # `-t UUID=` (not -U) on purpose: a copied VHDX keeps the source UUID, so all
 # devices sharing it must be enumerated for the multi-match guard to see them.
 data_devs() {
@@ -493,9 +520,80 @@ clear_motd() {
   : > "$MOTD_FILE"
 }
 
+# ensure_cgroup2(): dockerd needs cgroup v2. WSL normally mounts it itself; this
+# is only a best-effort fallback and NEVER fails boot.
+ensure_cgroup2() {
+  if findmnt -rn -t cgroup2 /sys/fs/cgroup >/dev/null 2>&1; then
+    return 0
+  fi
+  mkdir -p /sys/fs/cgroup
+  if mount -t cgroup2 none /sys/fs/cgroup 2>/dev/null; then
+    log "已挂载 cgroup2 到 /sys/fs/cgroup"
+    return 0
+  fi
+  log "警告：cgroup2 未挂载，dockerd 可能启动失败（不影响 boot）"
+  return 1
+}
+
+# start_dockerd(): fire-and-forget start. WSL has systemd disabled, so this is
+# the only place the engine can come up. It must never block or fail boot:
+# stdin is /dev/null so the [boot] pipe cannot be held open, and no readiness
+# wait is performed. Absent binary = no-op (Docker ships only in the rootfs
+# overlay, so the stock image simply skips it).
+start_dockerd() {
+  local bin pid
+  bin="${DOCKERD_BIN-dockerd}"
+  if [ -z "$bin" ]; then
+    log "dockerd 未安装（仅 WSL rootfs 变体带 Docker），跳过"
+    return 0
+  fi
+  # [boot] gets a minimal PATH; Debian ships dockerd in /usr/sbin, so resolve it
+  # explicitly instead of trusting PATH to contain sbin.
+  # Resolve to an ABSOLUTE path: command -v uses the shell's PATH even when it
+  # was never exported, and a relative name then dies in setsid's execvp.
+  if ! bin="$(command -v "$bin" 2>/dev/null)"; then
+    if [ -x /usr/sbin/dockerd ]; then
+      bin=/usr/sbin/dockerd
+    else
+      log "dockerd 未安装（仅 WSL rootfs 变体带 Docker），跳过"
+      return 0
+    fi
+  fi
+  if [ -f "$DOCKERD_PID" ]; then
+    pid="$(cat "$DOCKERD_PID" 2>/dev/null || true)"
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+      log "dockerd 已在运行（pid=$pid）"
+      return 0
+    fi
+  fi
+  ensure_cgroup2 || true
+  rotate_log "$DOCKERD_LOG" "$DOCKERD_LOG_MAX"
+  log "启动 dockerd（后台，日志 $DOCKERD_LOG）"
+  setsid "$bin" </dev/null >>"$DOCKERD_LOG" 2>&1 &
+  echo $! > "$DOCKERD_PID"
+  return 0
+}
+
+# verify_data_uuid(): compare the mounted UUID(s) with DATA_UUID. `sort -u`
+# collapses the same device stacked twice by a boot race; two DIFFERENT UUIDs
+# still produce two lines and fail closed. Returns 1 after writing the
+# maintenance banner; main() exits 0 on that (boot must never propagate a
+# failure status).
+verify_data_uuid() {
+  [ -n "${DATA_UUID:-}" ] || return 0
+  local cur
+  cur="$(findmnt -rno UUID --mountpoint "$DATADIR" 2>/dev/null | sort -u)"
+  if [ "$cur" != "$DATA_UUID" ]; then
+    log "FATAL: data disk UUID mismatch (found='$cur' expected='$DATA_UUID')（数据盘 UUID 不匹配）"
+    log "boot failed: maintenance mode"
+    write_maintenance_motd
+    return 1
+  fi
+  return 0
+}
+
 # main(): the full boot sequence.
 main() {
-  local cur
   load_conf
 
   if ! ensure_mounted; then
@@ -514,13 +612,7 @@ main() {
 
   # --- verify identity; fail closed on UUID mismatch -------------------------
   if [ -n "${DATA_UUID:-}" ]; then
-    cur="$(findmnt -rno UUID --mountpoint "$DATADIR" 2>/dev/null)"
-    if [ "$cur" != "$DATA_UUID" ]; then
-      log "FATAL: data disk UUID mismatch (found='$cur' expected='$DATA_UUID')（数据盘 UUID 不匹配）"
-      log "boot failed: maintenance mode"
-      write_maintenance_motd
-      exit 0
-    fi
+    verify_data_uuid || exit 0
   fi
 
   # --- first-run seed (marker-based; only mark after a FULL successful copy) --
@@ -554,6 +646,9 @@ main() {
   # --- desktop-app CLI visibility (must run AFTER the binds: /root and /home/*
   # live on the data disk, so an image-side link alone cannot repair an upgrade) -
   ensure_opencode_shim /root /home/*
+
+  # --- Docker Engine (rootfs overlay only; fire-and-forget, never blocks) ----
+  start_dockerd
 
   # --- start the daemon as paseo (single owner) ------------------------------
   if [ -f /run/agent-devbox-paseo.pid ] && kill -0 "$(cat /run/agent-devbox-paseo.pid)" 2>/dev/null; then
