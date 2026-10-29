@@ -255,6 +255,7 @@ if (-not (Test-Admin)) {
       }
     } catch {}
     Ok "安装完成。进入环境：wsl -d $Distro"
+    Write-Host '交互式终端（wsl -d）打开后会自动把持久数据盘接入 /home /root /workspace；Docker 模式下不会执行。'
     exit 0
   } finally {
     Remove-Item -LiteralPath $parentLog -Force -ErrorAction SilentlyContinue
@@ -1014,6 +1015,7 @@ Ok "通道=$Channel"
 Ok "Release：$ReleaseTag"
 Ok "安装目录：$InstallDir"
 Ok "进入环境：wsl -d $Distro"
+Write-UiLine '交互式终端（wsl -d）打开时会自动把 /home /root /workspace 接到持久数据盘（约 1-3 秒）。'
 if ($distroGuid) { Ok "发行版 GUID：$distroGuid（每次重装都会换新 GUID）" }
 Write-UiLine '若 wsl-ui 打开终端异常：关掉 Windows Terminal 与 wsl-ui 后重开（WT 会按当前注册的发行版重新生成 profile，无需手工改配置）。'
 # wsl-ui 的发行版列表是**它自己的 Windows 侧缓存**（%LOCALAPPDATA%\wsl-ui），不在数据盘上。
@@ -1026,6 +1028,7 @@ try {
 } catch { }
 Write-UiLine 'paseo 网页界面：在打开的 WSL 里启动 paseo 后，浏览器访问 http://localhost:6767（登录密码见 /etc/agent-devbox.conf，下方有查看命令）。'
 Write-UiLine '若要修改 paseo 密码：编辑 /etc/agent-devbox.conf，或在启动前设置环境变量 PASEO_PASSWORD。'
+Write-UiLine "非交互命令（wsl -d $Distro -e ...）在第一次交互式登录前仍看到系统盘；需要数据盘时先开一次交互终端。"
 Write-Host "安装日志：$script:InstallLog"
 Write-Host "查看安装日志：Get-Content -LiteralPath '$script:InstallLog' -Tail 200"
 Write-Host "查看 paseo 密码（Windows 侧）：wsl -d $Distro -u root -e cat /etc/agent-devbox.conf"

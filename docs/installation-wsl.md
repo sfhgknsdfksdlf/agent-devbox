@@ -609,6 +609,22 @@ wsl -d $Distro    # agent-devbox / agent-devbox-core / agent-devbox-beta / agent
 # root shell; paseo daemon configured on http://localhost:6767 (from Windows)
 ```
 
+Interactive `wsl -d $Distro` and wsl-ui terminals **mount the data disk automatically on first
+login** (about 1-3 seconds): WSL keeps two mount namespaces per distro (elevated / non-elevated,
+shared by all sessions of that elevation), and a `/etc/profile.d` hook re-mounts the disk
+read-write inside the terminal's own mount namespace (an elevated terminal that shares the boot
+namespace fast-paths; otherwise it mounts once like any other terminal), and binds `/home` `/root`
+`/workspace`. It is idempotent (a second terminal makes no mount calls), and it does nothing in
+Docker mode. Non-interactive commands
+(`wsl -d $Distro -e ...`) do **not** run the hook, so they still see the system disk until the first
+interactive login; if a script needs the data disk, open a terminal once before running it. When the
+disk is missing, the hook only warns: it never blocks login, attaches, or formats, and the repair
+path stays `mount-datadisk.cmd` in the install dir. If the device exists but boot did not mount it,
+the hook may still mount/bind in the session (it never starts the daemon or seeds). Verify in a
+real terminal with `findmnt /home /root /workspace` and
+`stat -c '%d:%i' /root /mnt/devbox-data/root` (both lines must match; use `devbox-data-beta` on the
+beta channel).
+
 Desktop apps that attach to this distro look for their CLI in a specific place, so
 where it was installed decides whether they find it. See
 [desktop-cli-detection.md](desktop-cli-detection.md) for the rules per app; to check

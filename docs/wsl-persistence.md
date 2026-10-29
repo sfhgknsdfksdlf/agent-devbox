@@ -30,6 +30,17 @@ Goal: **upgrading the image (re-importing the distro) must not lose your data.**
 
   Label precedence is `AGENT_DEVBOX_DATA_LABEL` (environment) > the conf's
   `DATA_LABEL` > `devbox-data`.
+- WSL gives **each distro two mount namespaces**, one per elevation (elevated /
+  non-elevated); sessions of the same elevation share one. PID 1 / boot services use
+  the namespace of the elevation that started the distro (usually elevated, because
+  the installer starts it). Ordinary terminals use the other one, which is an
+  `unshare` snapshot taken at the first session of that elevation and may lack the
+  boot binds, so a freshly opened `wsl -d $Distro` terminal would otherwise still
+  resolve `/home` `/root` `/workspace` on the system disk. A login hook
+  (`/etc/profile.d/zz-agent-devbox-session-mount.sh`) repeats the
+  `mount -t ext4 -o rw` and the binds inside the current session's mount namespace
+  on the first interactive root login. It is idempotent: a second terminal makes
+  zero mount calls.
 
 ```
 升级前:  agent-devbox[-beta](系统盘 ext4.vhdx)  +  data.vhdx(你的 /home /root /workspace)
@@ -47,6 +58,7 @@ VM lives. Split of responsibility:
 |---|---|
 | Windows installer (`irm .../windows/install.ps1 \| iex` → `install-agent-devbox.ps1`) | create + attach `data.vhdx`, initialize it (only when brand new; ext4 label `devbox-data` for stable / `devbox-data-beta` for beta), write `/etc/agent-devbox.conf` (6 keys), resolve the data-disk UUID by the channel's label before falling back to the old conf UUID (logs a swap, e.g. a copied same-channel variant disk), attach the disk itself and unregister legacy `agent-devbox*-mount-datadisk` tasks (no task is registered), copy the pure-batch `mount-datadisk.cmd` / `unmount-datadisk.cmd` helpers into the install dir |
 | Image boot (`wsl-boot.sh`) | attach the VHDX itself when the device is absent (one bounded `wsl.exe --mount --vhd --bare`), locate the device by UUID (`blkid -t UUID=`) then by the channel's label (`devbox-data` / `devbox-data-beta`), fail closed on a multi-match, `mount -t ext4` at `/mnt/<DATA_MNTNAME>`, **verify** the disk, bind `/home` `/root` `/workspace`, start the daemon |
+| Interactive session (`/etc/profile.d` hook) | on the first interactive root login, re-mount the data disk read-write inside the terminal's own mount namespace and bind `/home` `/root` `/workspace`; idempotent (a second terminal makes no mount calls). It **never** attaches, unmounts, formats, or calls any Windows interop; when the disk is missing it only warns and leaves the login shell usable |
 
 ## Safety guarantees
 
@@ -148,6 +160,8 @@ ls -la ~ /workspace
 |---|---|---|
 | Data disk mounted | `mount \| grep devbox-data` | present (at `/mnt/devbox-data` or `/mnt/devbox-data-beta`) |
 | `/home` from data disk | `findmnt /home` | source under `/mnt/devbox-data/home` or `/mnt/devbox-data-beta/home` |
+| `/home` in a real interactive terminal | open `wsl -d $Distro`, then `findmnt /home` and `stat -c '%d:%i' /root /mnt/devbox-data/root` | both `%d:%i` lines are identical (`devbox-data-beta` on beta) |
+| Second terminal is idempotent | open a second `wsl -d $Distro`, `findmnt -rn -o TARGET \| wc -l` | same count as the first terminal (no stacked duplicates) |
 | Manual repair entry | `mount-datadisk.cmd` in the install dir (pure batch, no UAC) | attaches `data.vhdx`; 3 attempts logged to `datadisk-attach.log`, real exit code |
 | Manual detach entry | `unmount-datadisk.cmd` in the install dir (pure batch, no UAC) | detaches `data.vhdx`; an existing but not-attached disk prints `[INFO]` and exits 0; real failures stay non-zero |
 | Mount survives a distro restart | `wsl --terminate $Distro` then reopen; `mount \| grep devbox-data` | attach kept; boot re-mounts it (`wsl --shutdown` only on a confirmed networking-mode change) |

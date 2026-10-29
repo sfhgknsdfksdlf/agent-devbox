@@ -143,8 +143,9 @@ irm https://raw.githubusercontent.com/sfhgknsdfksdlf/agent-devbox/main/windows/i
   Range 断点续传，实时显示 `MiB/s`，停滞自动换连接；下载结束**强制校验文件长度 = Release
   资产大小**，短读只续传、绝不保留。
 
-安装行为本身没有变：仍然先检查磁盘空间再下载、仍然三级回退导入、仍然注册数据盘挂载任务；
-但该任务现在**没有触发器**（只作按需修复入口），发行版每次启动由 boot 脚本自己 attach 数据盘。
+安装行为本身没有变：仍然先检查磁盘空间再下载、仍然三级回退导入。数据盘**不注册任何计划任务**：
+安装器只自己附加一次，之后发行版每次启动由 `wsl-boot.sh` 在发行版内部重新 attach 并挂载；
+交互式终端的 `/etc/profile.d` 钩子再把同一块盘接进**该会话所在的挂载命名空间**。
 安装脚本从 `main` 取，Release 只用于 rootfs 分片和 1Panel 本地应用包。
 
 ## 为什么 rootfs 分片用托管 .NET 下载器，而不是外部下载工具？
@@ -267,6 +268,32 @@ beta 为 `devbox-data-beta`；mode 600）。数据盘跨升级保留，安装器
 `-Yes` / `-KeepExisting` 时才会问一行——**回车 = 覆盖升级**，`n` = 取消（不下载、不注销、不做
 任何改动，退出码 0）；输入其它内容只再问一次，第二次仍无法识别就取消。重定向/无人值守时不会
 卡在提问上，直接升级。数据盘（`/home`、`/root`、`/workspace`）与 paseo 密码保留。
+
+## 为什么新开的 WSL 终端里 /root 又回到系统盘？
+
+**因为 WSL 每个发行版只有两个挂载命名空间（提升 / 非提升各一个）。** 普通（非提升）会话共用一个
+命名空间，它是**首次出现该级别会话时**从当时状态快照（`unshare`）出来的，可能早于/没有 boot 的挂载；
+`[boot]` / PID 1（dockerd、paseo）则在另一个命名空间里（启动发行版的那个提升级别，通常是提升级别，
+因为安装器启动它）。所以 `wsl-boot.sh` 明明已经把数据盘挂好并 bind 了 `/home` `/root` `/workspace`，
+普通终端里的 `/root` 却仍是系统盘。
+
+**补丁是 `/etc/profile.d` 的登录钩子。** 第一次以交互式 root 登录时，它调用
+`/usr/local/bin/wsl-session-mount.sh`，在当前会话自己的命名空间里把数据盘以读写方式重新 mount，
+再 bind 三个目录；成功后打印一次 `已把持久数据盘接入当前会话：/home /root /workspace`。它是**幂等**
+的：第二个终端发现挂载已在位就直接跳过（零 mount 调用）；提升会话本来就在 PID 1 命名空间里，也直接跳过。
+
+**为什么不挂到 `/mnt/wsl`？** `/mnt/wsl` 是**跨发行版共享**的，把数据盘挂到那里会让同一台机器上其它
+发行版也看到这块盘，直接破坏通道隔离（stable / beta 的盘不能互相可见）。所以挂载点保持在
+`/mnt/<DATA_MNTNAME>`（`/mnt/devbox-data` / `/mnt/devbox-data-beta`），并且钩子运行前会检查父目录的
+传播属性，遇到 `shared` 就拒绝挂载。
+
+**Docker 模式**：镜像是同一个，`IS_DOCKER=true` 时钩子和 helper 都直接返回，**不执行任何 mount**。
+
+**非交互命令**（`wsl -d $Distro -e ...`、`bash -lc` 探针、桌面版 CLI 探测）不会经过登录钩子，所以在
+第一次交互登录之前它们看到的仍是系统盘；需要数据盘的脚本请先手动开一次终端。
+
+**维护模式 / 数据盘未附加**：钩子只告警（提示用安装目录的 `mount-datadisk.cmd` 修复），不阻塞登录、
+不 attach、不格式化。它全程不调用任何 Windows interop。
 
 ## OpenCode 桌面版添加 WSL 服务器提示「未安装 OpenCode」？
 

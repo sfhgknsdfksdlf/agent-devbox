@@ -131,6 +131,34 @@ beta 盘也不能给正式用（卷标 / 挂载名不同，安装器的目录所
 详见 **[docs/installation-wsl.md](docs/installation-wsl.md)** 和
 **[docs/wsl-persistence.md](docs/wsl-persistence.md)**。
 
+### 交互式终端与数据盘
+
+WSL 每个发行版**只有两个挂载命名空间**：提升（elevated）和非提升（non-elevated）各一个，
+**同一提升级别的所有会话共用一个**。`[boot]`（PID 1、dockerd、paseo）运行在**启动发行版的那个提升级别**
+的命名空间里（通常是提升级别，因为安装器启动它）；普通终端用的是另一个命名空间，它在**该提升级别
+第一次出现会话时**从当时状态快照（`unshare`）出来，可能早于或没有 boot 做的 `mount` / `bind`，
+所以**新开的终端**默认看到的 `/home` `/root` `/workspace` 仍是系统盘。
+镜像在 `/etc/profile.d` 放了一个登录钩子
+（`zz-agent-devbox-session-mount.sh`）来补这一步：
+
+- 第一次以交互式 root 登录（`wsl -d $Distro` 或 wsl-ui 终端）时，钩子把数据盘以**读写**方式重新挂到
+  **当前会话**，并把 `/home` `/root` `/workspace` **bind** 进去，约 1–3 秒；
+- 它是**幂等**的：第二个终端发现挂载已在位就什么都不做（零 mount 调用）；提升会话（PID 1 命名空间）
+  本来就是挂好的，直接跳过；
+- Docker 模式（`IS_DOCKER=true`）自动 **no-op**，不执行任何 mount；
+- 数据盘未附加或处于维护模式时**只告警**：不阻塞登录、不 attach、不格式化。修复仍走安装目录的
+  `mount-datadisk.cmd`，再 `wsl --terminate <发行版>` 重开。
+
+> **非交互命令**（`wsl -d $Distro -e ...`、`bash -lc` 探针、桌面版 CLI 探测）不会跑这个钩子，
+> 所以在**第一次交互登录之前**它们仍看到系统盘。需要数据盘的脚本，请先手动开一次终端。
+
+验证（先 `wsl -d $Distro` 进到终端里再执行）：
+
+```bash
+findmnt /home /root /workspace
+stat -c '%d:%i' /root /mnt/devbox-data/root   # 两行必须相同；beta 通道把 devbox-data 换成 devbox-data-beta
+```
+
 ## Beta 通道（完全隔离）
 
 从**非 `main` 的代码 ref** 安装时，安装器会把这次安装放进 **beta 通道**：

@@ -715,6 +715,7 @@ Assert-Equal '未知错误' (Format-DownloadErrorMessage -Exception $null) 'dl-e
 $readmeText  = Get-Content -Raw (Join-Path $here '..' '..' 'README.md')
 $installDoc  = Get-Content -Raw (Join-Path $here '..' '..' 'docs' 'installation-wsl.md')
 $persistDoc  = Get-Content -Raw (Join-Path $here '..' '..' 'docs' 'wsl-persistence.md')
+$qaText      = Get-Content -Raw (Join-Path $here '..' '..' 'docs' 'qa.md')
 Assert-True ($readmeText -match '\$Distro') 'variant: README resolves the distro name once'
 Assert-True ($installDoc -match '\$Distro') 'variant: installation-wsl resolves the distro name once'
 Assert-True ($persistDoc -match '\$Distro') 'variant: wsl-persistence resolves the distro name once'
@@ -722,6 +723,19 @@ Assert-True ($readmeText -notmatch 'wsl -d agent-devbox -u root') 'variant: READ
 Assert-True ($mainText -notmatch '@\(.--set-default., \$Distro\)') 'variant: the installer never changes the user default distro'
 Assert-True ($mainText -notmatch 'Remove-Item -LiteralPath \$uiMeta') 'variant: the installer does not delete another app cache'
 Assert-True ($mainText -match 'wsl-ui\\distro-metadata\.json') 'variant: the manual wsl-ui cache hint is printed'
+
+# --- 交互式会话自动挂载持久数据盘（T2，先红后绿） ---------------------------
+# 登录 hook + helper 是产品面；这里只钉安装器提示、文档与两个新文件的存在。
+# 安装器/文档尚未落地时这 9 条必须保持红色。
+Assert-True ($mainText -match '交互式终端（wsl -d）') 'session: installer summary names the interactive terminal'
+Assert-True ($mainText -match '自动把持久数据盘接入') 'session: installer summary says the data disk is attached automatically'
+Assert-True ($mainText -match 'Docker 模式下不会执行') 'session: installer summary says Docker does not run the mount'
+Assert-True ($mainText -match '非交互命令') 'session: installer summary warns about non-interactive commands'
+Assert-True ($qaText -notmatch '仍然注册数据盘挂载任务') 'session: qa no longer claims a scheduled mount task'
+Assert-True ($qaText -match '挂载命名空间|mount namespace') 'session: qa explains the mount namespace split'
+Assert-True ($readmeText -match '非交互') 'session: README documents the non-interactive caveat'
+Assert-True (Test-Path (Join-Path $here '..' '..' 'scripts' 'wsl-session-mount.sh')) 'session: the session-mount helper exists'
+Assert-True (Test-Path (Join-Path $here '..' '..' 'config' 'profile.d' 'zz-agent-devbox-session-mount.sh')) 'session: the profile.d hook exists'
 
 # --- Windows Terminal profile：固定 GUID（安装器写 fragment） ---------------
 # WSL 每次 import 都按注册表 GUID 生成 profile -> 重装换 GUID、用户自定义留在旧条目。
@@ -1217,7 +1231,7 @@ Assert-True ($mainText -match 'Start-Sleep -Seconds 10') 'task: interactive hold
 Assert-True ($mainText -notmatch '火绒') 'task: the stale AV allow prompt is gone (there is no scheduled task)'
 Assert-True ($mainText -match '-not \$Yes') 'task: hold is gated on -not $Yes'
 # 计划任务已彻底移除：安装器只清理旧版本注册的任务，并自己 attach 一次。
-# conf 现在正好 5 个键（DATA_TASK 已随计划任务一起删除）。
+# conf 现在正好 6 个键（DATA_TASK 已随计划任务一起删除）。
 Assert-True ($mainText -match 'DATA_DISTRO=\$\(Quote-Bash \$Distro\)') 'conf: installer writes DATA_DISTRO'
 Assert-True ($mainText -notmatch 'DATA_TASK') 'conf: installer no longer writes DATA_TASK'
 
