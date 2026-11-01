@@ -1,19 +1,19 @@
 {
   "_comment": "Last resolved upstream versions. The scheduled build skips when nothing here would change.",
   "opencode-ai": "1.19.5",
-  "oh-my-openagent": "5.1.51",
+  "oh-my-openagent": "5.1.55",
   "@getpaseo/cli": "0.14.0",
   "wrangler": "4.156.0",
   "create-cloudflare": "2.74.5",
   "@anthropic-ai/claude-code": "2.1.316",
   "@openai/codex": "0.166.0",
   "@google/gemini-cli": "0.66.0",
-  "@qwen-code/qwen-code": "0.26.4",
+  "@qwen-code/qwen-code": "0.26.5",
   "@charmland/crush": "0.99.0",
   "@github/copilot": "1.0.105",
   "@earendil-works/pi-coding-agent": "1.4.0",
   "@deepseek-ai/dsh": "0.2.1-rc.5",
   "@xai-official/grok": "1.0.70",
-  "zcode-app-cli": "3.17.1-42",
+  "zcode-app-cli": "3.17.1-43",
   "aider-chat": "0.86.2"
 }
