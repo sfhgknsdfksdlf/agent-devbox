@@ -11,13 +11,14 @@ The default image `agent-devbox` adds these on top of `agent-devbox-core`.
 | Crush | `@charmland/crush` | `crush` | Node | git |
 | GitHub Copilot CLI | `@github/copilot` | `copilot` | Node | git, `gh` auth |
 | Pi | `@earendil-works/pi-coding-agent` | `pi` | Node >=22.19 | git, ripgrep |
-| DeepSeek Harness | `@deepseek-ai/dsh` | `dsh` | Node ^22.19 \|\| >=24 | **pnpm** (plugins), git |
+| DeepSeek Harness | `@deepseek-ai/dsh` | `dsh` | Node >=24.9 | **pnpm** (plugins), git |
 | Grok Build | `@xai-official/grok` | `grok` | native binary | git, `config.toml`, API key |
 | zcode | `zcode-app-cli` | `zcode` | Node >=22.19 | git (community client of Z.ai ZCode) |
 | Aider | `pipx install aider-chat` | `aider` | Python | git, OpenAI/Anthropic keys |
 
 Common baseline already present: `git`, `ripgrep`, `gh` (install via apt or the
-GitHub CLI), Node 22.23 (satisfies the >=22.19 requirement), `patch`, `rsync`.
+GitHub CLI), Node 24.x (satisfies the >=24.9 dsh floor and the >=22.19
+requirements of Pi/zcode), `patch`, `rsync`.
 
 ## Notes / caveats
 

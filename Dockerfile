@@ -3,7 +3,9 @@
 # agent-devbox-core — paseo (daemon + bundled Web UI) + OpenCode (latest V1) +
 #                     omo (oh-my-openagent) + a broad dev/test toolchain.
 #
-# Base: node:22-trixie-slim  (Debian 13 "trixie", Node 22.x)
+# Base: node:24-trixie-slim  (Debian 13 "trixie", Node 24.x)
+# Node 24 is REQUIRED (>=24.9.0): the derived Dockerfile.agents layer installs
+# @deepseek-ai/dsh, whose current releases declare that engine floor.
 # Dual-mode from ONE image:
 #   * Docker (VPS):      IS_DOCKER=true  -> docker-entrypoint.sh (folders bind-mounted)
 #   * WSL2 distro:       IS_DOCKER unset -> wsl-boot.sh (VHDX data disk persisted)
@@ -23,7 +25,7 @@
 # V1 via `opencode-ai@^1`, omo = `oh-my-openagent@latest`) so a rebuild picks up
 # the newest, while `versions.json` + a CI diff-gate records what was resolved.
 # =============================================================================
-FROM node:22-trixie-slim
+FROM node:24-trixie-slim
 
 ARG PLAYWRIGHT_VERSION=1.64.1
 ARG GO_VERSION=1.27.2

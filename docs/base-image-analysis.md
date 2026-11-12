@@ -2,8 +2,10 @@
 
 ## Decision
 
-Base is **`node:22-trixie-slim`** = **Debian 13 (trixie)** + **Node 22.x**, built
+Base is **`node:24-trixie-slim`** = **Debian 13 (trixie)** + **Node 24.x**, built
 from scratch. We do **not** use the official `ghcr.io/getpaseo/paseo` image.
+Node 24 is the current LTS line and satisfies the `@deepseek-ai/dsh`
+`engines.node >=24.9.0` floor of the default agents layer.
 
 ## Why we can self-build (paseo has no proprietary magic)
 
@@ -21,7 +23,7 @@ recreate: `tini` (PID 1), `gosu` (drop to `paseo`), the `paseo` user (uid/gid
 | glibc | 2.36 | 2.41 |
 | wrangler/workerd need | glibc >= 2.35 (OK) | OK |
 | packages | older | newer |
-| Node 22 image | `node:22-bookworm-slim` | `node:22-trixie-slim` |
+| Node 24 image | `node:24-bookworm-slim` | `node:24-trixie-slim` |
 
 Both satisfy `wrangler`'s glibc requirement. trixie was chosen for currency and
 a longer support window.

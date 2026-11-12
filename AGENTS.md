@@ -7,7 +7,7 @@ One OCI image = an AI dev/test environment (paseo daemon + web UI, OpenCode V1, 
 
 ## STRUCTURE
 ```
-Dockerfile / Dockerfile.agents   # core image (Debian 13 + node 22) / default multi-agent layer
+Dockerfile / Dockerfile.agents   # core image (Debian 13 + node 24) / default multi-agent layer
 docker-compose.yml               # pull-only (Docker mode)
 versions.json                    # upstream-version manifest for the CI diff-gate
 scripts/                         # runtime boot logic

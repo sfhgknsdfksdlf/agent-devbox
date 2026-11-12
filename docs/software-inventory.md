@@ -7,7 +7,7 @@ ecosystem it belongs to, plus what was **removed** and **added**.
 
 | Item | Ecosystem | Notes |
 |---|---|---|
-| Debian 13 (trixie) + Node 22 | OS / Node runtime | base `node:22-trixie-slim` |
+| Debian 13 (trixie) + Node 24 | OS / Node runtime | base `node:24-trixie-slim` |
 
 ## AI agent cluster
 
@@ -41,7 +41,7 @@ ecosystem it belongs to, plus what was **removed** and **added**.
 | build-essential, pkg-config, libssl-dev | native build (all) |
 | Go + gopls + dlv + **wails3** + GTK/WebKit dev libs | Go / **Wails3 desktop** |
 | Python 3 + pip + venv + dev + pipx + **uv** | Python |
-| Node 22 + npm; **bun / pm2 / tsx / esbuild / vite** | Node / JS |
+| Node 24 + npm; **bun / pm2 / tsx / esbuild / vite** | Node / JS |
 
 ## Editors / LSP / code tools
 
