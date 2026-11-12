@@ -450,7 +450,7 @@ jobs:
           echo "health=$code (after up to $i attempts)"; docker logs smoke | tail -40
           [ "$code" = "200" ]
       - name: Daemon runs as non-root paseo
-        run: docker exec smoke sh -lc "ps -o user= -C node | sort -u | grep -q '^paseo$'"
+        run: docker exec smoke sh -lc 'ps -eo user= | grep -qx paseo'
       - name: Desktop app CLI probe (image contract)
         run: |
           set -euo pipefail
