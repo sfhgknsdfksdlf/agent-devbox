@@ -350,14 +350,16 @@ profile 缓存在进程里，所以注销/重装/换通道后仍可能命中旧�
 
 **禁止在本地构建 / 编译** —— 又慢，又会在本机产生大量垃圾。镜像和所有产物**只在 GitHub Actions 里生成**：
 
-- 推送到**任意分支**都会自动构建；定时（每 3 天一次）和手动触发也会构建；
+- 推送到**任意分支**（`automation/versions` 状态分支除外）都会自动构建；定时（每周日）
+  和手动触发也会构建；
 - 每次构建都同时产出 **amd64 + arm64**，再合并成一个多架构镜像
   （用 GitHub 免费的原生 ARM 机器，不做模拟）；
 - **WSL rootfs 分片现在也同时产出 amd64 + arm64**：两个架构各自在**原生 runner** 上导出
   （amd64 用 `ubuntu-latest`、arm64 用 `ubuntu-24.04-arm`），上传为临时 artifact，再由发布
   任务下载两套分片、校验分片编号连续，写一份**覆盖两架构的 `SHA256SUMS`**，最后创建 Release；
 - 定时构建时，如果所有跟踪的上游版本都没变，会自动跳过
-  （靠 `versions.json` 做比对）；
+  （靠 `automation/versions` 分支上的状态做比对；main 里的 `versions.json`
+  只作为首次 bootstrap 的 seed）；
 - **只有 定时 / 手动 才会把镜像推为 `latest` 并创建 Release**；推送触发的构建只产出**测试标签**，
   不会覆盖 `latest`：
   - main 分支 → 镜像标签 `<YYYYMMDD.HHMM>`，预发布为 `beta-<YYYYMMDD.HHMM>`

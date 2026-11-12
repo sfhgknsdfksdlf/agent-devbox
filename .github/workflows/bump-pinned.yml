@@ -3,7 +3,7 @@
 # (PLAYWRIGHT_VERSION, GO_VERSION) to the latest upstream, then rebuild.
 #
 # The floating packages (OpenCode, omo, wrangler, ...) refresh on the regular
-# every-3-day build; these two are pinned on purpose so they only move on this
+# weekly build; these two are pinned on purpose so they only move on this
 # slower cadence. A run with no upstream change does nothing.
 #
 # NOTE: a `git push` made with the workflow GITHUB_TOKEN does NOT trigger other

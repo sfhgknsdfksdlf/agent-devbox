@@ -2,16 +2,17 @@ name: build
 # Builds BOTH images in CI (never locally) and publishes them to ghcr.io:
 #   ghcr.io/<owner>/agent-devbox-core   (lean base)
 #   ghcr.io/<owner>/agent-devbox        (multi-agent, DEFAULT)
-# Every push builds; only schedule / workflow_dispatch promote `latest` and cut
-# a stable Release. Test builds (pushes) are DATED and bounded:
+# Every push (except automation/versions) builds; only schedule /
+# workflow_dispatch promote `latest` and cut a stable Release.
+# Test builds (pushes) are DATED and bounded:
 #   push to main       -> image <YYYYMMDD.HHMM>, prerelease beta-<YYYYMMDD.HHMM>
 #   push to any branch -> image beta-<YYYYMMDD.HHMM>, prerelease beta-<YYYYMMDD.HHMM>
 #   both pushes also move the :beta image alias; older beta-* prereleases are
 #   pruned so only the newest survives (never `latest`).
 # Scheduled/manual runs rebuild with no-cache so they actually fetch the latest
 # upstream versions (a cached `npm install -g` layer would be reused otherwise);
-# after such a run the workflow records the resolved versions into versions.json
-# with a `[skip actions]` commit so the scheduled diff-gate can skip next time.
+# after such a run the workflow records the resolved versions on the
+# automation/versions branch so the scheduled diff-gate can skip next time.
 # The Release carries the WSL rootfs parts (the WSL image) + the 1Panel
 # local-app zip (the local app store entry).
 # amd64 and arm64 are BOTH built on every run - natively on ubuntu-latest and
@@ -21,11 +22,14 @@ name: build
 # merged SHA256SUMS covering both arches; Tier 3 (zstd.exe) is x64-only.
 on:
   schedule:
-    # ~every 3 days, in a quiet UTC window and off the top of the hour
+    # Weekly on Sunday, in a quiet UTC window and off the top of the hour
     # (scheduled workflows queue behind everything else; top-of-hour is worst).
-    - cron: "23 3 */3 * *"
+    - cron: "23 3 * * 0"
   push:
-    branches: ["**"]
+    # The publish job writes the resolved-version state here; it must never
+    # trigger a build (that commit only changes versions.json).
+    branches-ignore:
+      - automation/versions
     # Only files that can change the images (an empty keepalive commit matches
     # nothing here, so it no longer triggers a full build + Release).
     paths:
@@ -73,10 +77,25 @@ jobs:
       changed: ${{ steps.diff.outputs.changed }}
     steps:
       - uses: actions/checkout@v7
+      - name: Load resolved-version state
+        id: state
+        run: |
+          set -euo pipefail
+          if git ls-remote --exit-code --heads origin automation/versions >/dev/null 2>&1; then
+            git fetch --depth=1 origin automation/versions
+            git show FETCH_HEAD:versions.json > "$RUNNER_TEMP/versions-state.json"
+            echo "file=$RUNNER_TEMP/versions-state.json" >> "$GITHUB_OUTPUT"
+            echo "source=automation/versions" >> "$GITHUB_OUTPUT"
+          else
+            echo "file=versions.json" >> "$GITHUB_OUTPUT"
+            echo "source=main-seed" >> "$GITHUB_OUTPUT"
+          fi
       - id: diff
         run: |
           set -euo pipefail
           changed=false
+          state="${{ steps.state.outputs.file }}"
+          echo "state: $state"
           pkgs="
           opencode-ai
           oh-my-openagent
@@ -96,12 +115,12 @@ jobs:
           "
           for pkg in $pkgs; do
             latest="$(npm view "$pkg" version 2>/dev/null || echo ERR)"
-            have="$(jq -r --arg k "$pkg" '.[$k] // "MISSING"' versions.json)"
+            have="$(jq -r --arg k "$pkg" '.[$k] // "MISSING"' "$state")"
             echo "$pkg  have=$have  latest=$latest"
             if [ "$latest" != "ERR" ] && [ "$latest" != "$have" ]; then changed=true; fi
           done
           aider_latest="$(curl -fsSL https://pypi.org/pypi/aider-chat/json 2>/dev/null | jq -r '.info.version' 2>/dev/null || echo ERR)"
-          aider_have="$(jq -r '."aider-chat" // "MISSING"' versions.json)"
+          aider_have="$(jq -r '."aider-chat" // "MISSING"' "$state")"
           echo "aider-chat  have=$aider_have  latest=$aider_latest"
           if [ "$aider_latest" != "ERR" ] && [ "$aider_latest" != "$aider_have" ]; then changed=true; fi
           if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.force }}" = "true" ]; then changed=true; fi
@@ -555,8 +574,8 @@ jobs:
   #                                    survives; `:beta` tracks the newest push.
   #                                    Never `latest`.
   # Scheduled/manual builds run with no-cache, so they actually fetch the latest
-  # upstream versions; after such a build the resolved versions are recorded into
-  # versions.json with a `[skip actions]` commit.
+  # upstream versions; after such a build the resolved versions are recorded on
+  # the automation/versions branch, never on main.
   # ---------------------------------------------------------------------------
   publish:
     needs: [plan, export]
@@ -658,14 +677,22 @@ jobs:
 
       # -------------------------------------------------------------------------
       # The build above ran with no-cache for scheduled/manual runs, so record the
-      # upstream versions this image actually resolved. The scheduled diff-gate
-      # then skips a run when nothing changed. `[skip actions]` stops this commit
-      # from re-triggering the workflow (versions.json is in on.push.paths).
+      # upstream versions this image actually resolved on the dedicated state
+      # branch. main stays free of bot commits, so feature branches do not drift
+      # every time the scheduled build runs. `[skip actions]` is belt-and-braces:
+      # the automation/versions branch is already excluded from on.push.
       # -------------------------------------------------------------------------
       - name: Record resolved upstream versions
         if: github.event_name != 'push'
         run: |
           set -euo pipefail
+          if git ls-remote --exit-code --heads origin automation/versions >/dev/null 2>&1; then
+            git fetch --depth=1 origin automation/versions
+            git checkout -B automation/versions FETCH_HEAD
+          else
+            git fetch --depth=1 origin main
+            git checkout -b automation/versions FETCH_HEAD
+          fi
           pkgs="
           opencode-ai
           oh-my-openagent
@@ -706,4 +733,7 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add versions.json
           git commit -m "chore: record resolved upstream versions [skip actions]"
-          git push
+          if ! git push origin HEAD:automation/versions; then
+            git pull --rebase origin automation/versions
+            git push origin HEAD:automation/versions
+          fi

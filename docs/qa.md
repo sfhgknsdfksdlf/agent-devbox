@@ -19,13 +19,14 @@ No. There is no penalty for scheduled builds. Two real caveats:
 
 1. GitHub **disables `on.schedule` workflows in a public repo after 60 days
    without repository activity**. The `keepalive` workflow makes an empty commit
-   every 20 days to reset the timer.
+   only when main has been quiet for ~50 days (well inside that window).
 2. Actions minutes: **public repos are free**; GHCR public images are free to
    pull. (Private repos get 2000 Actions minutes/month.)
 
 Scheduled runs share the global runner queue; scheduled times are best-effort.
-We schedule at `23 3 */3 * *` (quiet UTC window, off the top of the hour) and
-use a `concurrency` group.
+We schedule weekly on Sunday at `23 3 * * 0` (quiet UTC window, off the top of
+the hour) and use a `concurrency` group. The resolved-version state lives on
+`automation/versions`, so scheduled builds no longer commit to `main`.
 
 ## Compression / image size
 
