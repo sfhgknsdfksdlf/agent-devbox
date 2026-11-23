@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
-# Test harness for agent-devbox. Runs the bats suite when bats is available.
+# Test harness for agent-devbox. bats is required: never pass silently without it.
 set -euo pipefail
-cd "$(dirname "$0")/.."
-if command -v bats >/dev/null 2>&1; then
-  exec bats tests/bats
-else
-  echo "bats not installed; skipping unit tests (CI installs it)."
+
+if ! command -v bats >/dev/null 2>&1; then
+  echo "error: bats is required to run tests (install bats-core)." >&2
+  exit 127
 fi
+
+cd -- "$(dirname -- "$0")/.."
+exec bats tests/bats

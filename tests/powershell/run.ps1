@@ -23,6 +23,19 @@ function Assert-Equal {
   param($Expected, $Actual, [string] $Message)
   Assert-True ($Expected -eq $Actual) "$Message (expected [$Expected] got [$Actual])"
 }
+# An invalid argument must THROW (never return a value/false), and the error is
+# user-facing, so it must be Chinese: silent acceptance is the bug being fixed.
+function Assert-ThrowsChinese {
+  param([scriptblock] $Action, [string] $Message, [string] $Pattern = '')
+  $threw = $false
+  $err = ''
+  try { & $Action | Out-Null } catch { $threw = $true; $err = $_.Exception.Message }
+  Assert-True $threw "$Message — throws"
+  if ($threw) {
+    Assert-True ($err -match '[\u4e00-\u9fff]') "$Message — Chinese message"
+    if ($Pattern) { Assert-True ($err -match $Pattern) "$Message — message matches /$Pattern/" }
+  }
+}
 
 # --- Normalize-ReleaseTag --------------------------------------------------
 Assert-Equal 'beta' (Normalize-ReleaseTag 'b') 'Normalize: b -> beta'
@@ -170,6 +183,30 @@ Assert-Equal ([long]((2 * $c) + 2147483648 + 3221225472)) $segmented 'disk: Segm
 Assert-True (Test-DiskSpace -RequiredBytes 100 -AvailableBytes 100) 'disk: equal available passes'
 Assert-True (-not (Test-DiskSpace -RequiredBytes 100 -AvailableBytes 99)) 'disk: short available fails'
 
+# --- Disk estimate: input validation + exact decimal/ceil (P2-C2) ----------
+# MarginPct boundaries stay valid (0 and 1).
+Assert-Equal ([long]2) (Get-RequiredDiskBytes -CompressedBytes 1 -UncompressedBytes 1 -Tier Segmented -DataDiskReserve 0 -MarginMinBytes 0 -MarginPct 0) 'disk: MarginPct 0 is accepted'
+Assert-Equal ([long]4) (Get-RequiredDiskBytes -CompressedBytes 1 -UncompressedBytes 1 -Tier Segmented -DataDiskReserve 0 -MarginMinBytes 0 -MarginPct 1) 'disk: MarginPct 1 is accepted'
+# C=1,U=1,Stream: 1 + ceil(1.05) = 3 (a double cast loses the .05 and returns 2).
+Assert-Equal ([long]3) (Get-RequiredDiskBytes -CompressedBytes 1 -UncompressedBytes 1 -Tier Stream -DataDiskReserve 0 -MarginMinBytes 0 -MarginPct 0) 'disk: Stream rounds V up (1 + ceil(1.05) = 3)'
+# C=3,U=1,Segmented: 6 + ceil(0.6) = 7 (the margin must never be dropped).
+Assert-Equal ([long]7) (Get-RequiredDiskBytes -CompressedBytes 3 -UncompressedBytes 1 -Tier Segmented -DataDiskReserve 0 -MarginMinBytes 0 -MarginPct 0.1) 'disk: Segmented rounds margin up (6 + ceil(0.6) = 7)'
+
+Assert-ThrowsChinese { Get-RequiredDiskBytes -CompressedBytes 0 } 'disk: CompressedBytes 0 is rejected' '压缩'
+Assert-ThrowsChinese { Get-RequiredDiskBytes -CompressedBytes -1 } 'disk: CompressedBytes -1 is rejected' '压缩'
+Assert-ThrowsChinese { Get-RequiredDiskBytes -CompressedBytes 1 -UncompressedBytes -1 } 'disk: UncompressedBytes -1 is rejected' '负'
+Assert-ThrowsChinese { Get-RequiredDiskBytes -CompressedBytes 1 -DataDiskReserve -1 } 'disk: DataDiskReserve -1 is rejected' '负'
+Assert-ThrowsChinese { Get-RequiredDiskBytes -CompressedBytes 1 -MarginMinBytes -1 } 'disk: MarginMinBytes -1 is rejected' '负'
+Assert-ThrowsChinese { Get-RequiredDiskBytes -CompressedBytes 1 -MarginPct -0.1 } 'disk: MarginPct -0.1 is rejected' '比例'
+Assert-ThrowsChinese { Get-RequiredDiskBytes -CompressedBytes 1 -MarginPct 1.1 } 'disk: MarginPct 1.1 is rejected' '比例'
+Assert-ThrowsChinese { Get-RequiredDiskBytes -CompressedBytes 1 -MarginPct ([double]::NaN) } 'disk: MarginPct NaN is rejected' '比例'
+Assert-ThrowsChinese { Get-RequiredDiskBytes -CompressedBytes 1 -MarginPct ([double]::PositiveInfinity) } 'disk: MarginPct +Infinity is rejected' '比例'
+Assert-ThrowsChinese { Get-RequiredDiskBytes -CompressedBytes 1 -MarginPct ([double]::NegativeInfinity) } 'disk: MarginPct -Infinity is rejected' '比例'
+# Int64 overflow must throw instead of clamping or wrapping.
+Assert-ThrowsChinese { Get-RequiredDiskBytes -CompressedBytes ([long]::MaxValue) -UncompressedBytes 1 -Tier Segmented -DataDiskReserve 0 -MarginMinBytes 0 -MarginPct 0 } 'disk: 2C overflow is rejected' '超出'
+Assert-ThrowsChinese { Get-RequiredDiskBytes -CompressedBytes 1 -UncompressedBytes ([long]::MaxValue) -Tier Stream -DataDiskReserve 0 -MarginMinBytes 0 -MarginPct 0 } 'disk: ceil(1.05U) overflow is rejected' '超出'
+Assert-ThrowsChinese { Get-RequiredDiskBytes -CompressedBytes 1 -UncompressedBytes 1 -Tier Segmented -DataDiskReserve ([long]::MaxValue) -MarginMinBytes 0 -MarginPct 0 } 'disk: reserve overflow is rejected' '超出'
+
 # --- Workstream D：纯分段计划（S5-S9 的基础） ------------------------------
 $plan10 = @(Get-SegmentPlan -TotalBytes 10 -Connections 4)
 Assert-Equal 4 $plan10.Count 'segplan: 10/4 -> four ranges'
@@ -219,6 +256,16 @@ $threw = $false
 try { Assert-DiskSpace -Path $tmp -RequiredBytes 1000000000 -Override 1000 | Out-Null } catch { $threw = $true; Assert-True ($_.Exception.Message -match '磁盘空间不足') 'disk: insufficient -> Chinese error' }
 Assert-True $threw 'disk: insufficient blocks install'
 Assert-True (Assert-DiskSpace -Path $tmp -RequiredBytes 1000 -Override 1000000000) 'disk: sufficient passes'
+# Negative sizes are never "enough": every entry point must throw, not pass.
+Assert-ThrowsChinese { Test-DiskSpace -RequiredBytes -1 -AvailableBytes 100 } 'disk: Test-DiskSpace rejects negative RequiredBytes' '负'
+Assert-ThrowsChinese { Test-DiskSpace -RequiredBytes 100 -AvailableBytes -1 } 'disk: Test-DiskSpace rejects negative AvailableBytes' '负'
+Assert-ThrowsChinese { Get-FreeDiskSpaceBytes -Path $tmp -Override -1 } 'disk: negative free-space Override is rejected' '负'
+Assert-ThrowsChinese { Assert-DiskSpace -Path $tmp -RequiredBytes -1 -Override 1000000000 } 'disk: Assert-DiskSpace rejects negative RequiredBytes' '负'
+Assert-ThrowsChinese { Assert-DiskSpace -Path $tmp -RequiredBytes 1000 -Override -1 } 'disk: Assert-DiskSpace rejects negative Override' '负'
+# Zero is a legitimate boundary (0 free bytes, 0 required), not a negative.
+Assert-Equal ([long]0) (Get-FreeDiskSpaceBytes -Path $tmp -Override 0) 'disk: Override 0 is valid'
+Assert-True (Test-DiskSpace -RequiredBytes 0 -AvailableBytes 0) 'disk: zero required/available is valid'
+Assert-True (Assert-DiskSpace -Path $tmp -RequiredBytes 0 -Override 0) 'disk: Assert-DiskSpace accepts zero with Override 0'
 
 # --- Structural tripwire: disk check must precede any download ------------
 $installer = Join-Path $here '..' '..' 'windows' 'install-agent-devbox.ps1'
@@ -574,6 +621,8 @@ Assert-True ($mainText -match 'Save-Download[^\r\n]*-Sha256') 'dl: installer pas
 Assert-True ($mainText -match 'SHA256SUMS') 'dl: installer fetches SHA256SUMS'
 Assert-True ($mainText -match '该 Release 未提供 SHA256SUMS') 'dl: old releases still install (warn + length-only)'
 Assert-True ($ensureText -match 'If-Match') 'dl: conditional resume uses If-Match'
+Assert-True ($ensureText -match 'function Test-DownloadStrongETag') 'dl: a strong ETag is the only reusable validator'
+Assert-True ($ensureText -match 'function Test-DownloadHandleEofError') 'dl: Windows 1097 (ERROR_HANDLE_EOF) has a structural detector'
 # Only the header we actually SEND matters; the comment explaining why the other
 # conditional header is unusable is allowed to name it.
 Assert-True ($ensureText -notmatch "TryAddWithoutValidation\('If-Range'") 'dl: If-Range is never sent (GitHub/Azure ignore it)'
@@ -869,10 +918,21 @@ try {
   Assert-Equal '"v1"' $s.etag 'id: sidecar round-trip etag'
   Assert-Equal ([long]12) $s.length 'id: sidecar round-trip length'
   Assert-True (Test-DownloadSidecarIdentity -Sidecar $s -Url 'http://h/a' -Length 12 -Sha256 $shaA) 'id: matching identity accepted'
+  Assert-True (Test-DownloadStrongETag -ETag '"v1"') 'id: a quoted strong ETag is accepted'
+  Assert-True (-not (Test-DownloadStrongETag -ETag 'W/"v1"')) 'id: a weak ETag is rejected'
+  Assert-True (-not (Test-DownloadStrongETag -ETag '')) 'id: an empty ETag is rejected'
   Assert-True (-not (Test-DownloadSidecarIdentity -Sidecar $s -Url 'http://h/b' -Length 12)) 'id: a different url is rejected'
   Assert-True (-not (Test-DownloadSidecarIdentity -Sidecar $s -Url 'http://h/a' -Length 13)) 'id: a different length is rejected'
   Assert-True (-not (Test-DownloadSidecarIdentity -Sidecar $s -Url 'http://h/a' -Length 12 -Sha256 $shaB)) 'id: a different digest is rejected'
   Assert-True (-not (Test-DownloadSidecarIdentity -Sidecar $null -Url 'http://h/a' -Length 12)) 'id: a missing sidecar is rejected'
+  $weakMeta = [pscustomobject]@{ url = 'http://h/a'; length = [long]12; sha256 = $shaA; etag = 'W/"v1"' }
+  Assert-True (-not (Test-DownloadSidecarIdentity -Sidecar $weakMeta -Url 'http://h/a' -Length 12 -Sha256 $shaA)) 'id: a weak ETag is rejected even with matching url/length/sha'
+  $noEtagMeta = [pscustomobject]@{ url = 'http://h/a'; length = [long]12; sha256 = $shaA; etag = '' }
+  Assert-True (-not (Test-DownloadSidecarIdentity -Sidecar $noEtagMeta -Url 'http://h/a' -Length 12 -Sha256 $shaA)) 'id: a missing ETag is rejected even with matching url/length/sha'
+  $emptyTagMeta = [pscustomobject]@{ url = 'http://h/a'; length = [long]12; sha256 = $shaA; etag = '""' }
+  Assert-True (-not (Test-DownloadSidecarIdentity -Sidecar $emptyTagMeta -Url 'http://h/a' -Length 12 -Sha256 $shaA)) 'id: an empty opaque tag is not a usable strong ETag'
+  $strongNoSha = [pscustomobject]@{ url = 'http://h/a'; length = [long]12; sha256 = ''; etag = '"v9"' }
+  Assert-True (Test-DownloadSidecarIdentity -Sidecar $strongNoSha -Url 'http://h/a' -Length 12) 'id: a strong ETag with no digest is accepted when the caller has none'
   Assert-Equal 1 $s.version 'id: a v1 sidecar still reads with version 1'
   Assert-Equal 0 $s.connections 'id: a v1 sidecar defaults connections to 0'
   Assert-Equal '' $s.segmentState 'id: a v1 sidecar defaults segmentState to empty'
@@ -887,7 +947,10 @@ try {
   Assert-Equal 1 $globbed.Count 'id: nested segment files are invisible to the rootfs part glob'
   Write-DownloadSidecar -Path $meta -Url 'http://h/a' -ETag '"v2"' -Length 12 -Sha256 $shaA -Complete $false `
     -Connections 4 -SegmentSize 3 -SegmentCount 4 -SegmentState 'active'
+  $tmpLeft = @(Get-ChildItem -LiteralPath (Split-Path -Parent $meta) -Filter '*.tmp-*' -Force -ErrorAction SilentlyContinue)
+  Assert-Equal 0 $tmpLeft.Count 'id: an atomic sidecar write leaves no .tmp-* file behind'
   $s2 = Read-DownloadSidecar -Path $meta
+  Assert-Equal '"v2"' $s2.etag 'id: the atomically replaced sidecar is readable'
   Assert-Equal 2 $s2.version 'id: a segmented sidecar is version 2'
   Assert-Equal 4 $s2.connections 'id: sidecar v2 round-trips connections'
   Assert-Equal ([long]3) $s2.segmentSize 'id: sidecar v2 round-trips segmentSize'
@@ -900,9 +963,9 @@ try {
   Assert-True (-not (Test-SegmentStateCompatible -Sidecar $s -Connections 4 -SegmentSize 3)) 'segplan: a v1 sidecar is incompatible with segments'
   # A sidecar that recorded no digest cannot prove identity when the caller
   # knows the expected digest (e.g. the manifest gained sums after the fact).
-  $emptyMeta = [pscustomobject]@{ url = 'http://h/a'; length = [long]12; sha256 = '' }
+  $emptyMeta = [pscustomobject]@{ url = 'http://h/a'; length = [long]12; sha256 = ''; etag = '' }
   Assert-True (-not (Test-DownloadSidecarIdentity -Sidecar $emptyMeta -Url 'http://h/a' -Length 12 -Sha256 $shaA)) 'id: an empty recorded digest is rejected when a digest is known'
-  Assert-True (Test-DownloadSidecarIdentity -Sidecar $emptyMeta -Url 'http://h/a' -Length 12) 'id: an empty recorded digest is accepted when the caller has none'
+  Assert-True (-not (Test-DownloadSidecarIdentity -Sidecar $emptyMeta -Url 'http://h/a' -Length 12)) 'id: a sidecar without a strong ETag is rejected even when the caller has no digest'
   Assert-True ($null -eq (Read-DownloadSidecar -Path (Join-Path $qa 'nope.meta'))) 'id: a missing sidecar reads as null'
   [System.IO.File]::WriteAllText($meta, '{not json')
   Assert-True ($null -eq (Read-DownloadSidecar -Path $meta)) 'id: a corrupt sidecar reads as null'
@@ -929,6 +992,34 @@ try {
 } finally {
   Remove-Item -LiteralPath $qa -Recurse -Force -ErrorAction SilentlyContinue
 }
+
+# --- Windows 1097 / ERROR_HANDLE_EOF 判定 --------------------------------
+# 失效的句柄会让一个残片永久无法复用；catch 路径必须按 HResult 低 16 位 0x0449
+# 识别，而不是匹配消息文本。Exception.HResult 在 5.1 是 protected setter，测试
+# 用私有字段写入（两种宿主都有 _HResult）。
+function New-TestHResultException {
+  param([int] $HResult, [string] $Message = 'boom')
+  $ex = [System.Exception]::new($Message)
+  $field = [System.Exception].GetField('_HResult', [System.Reflection.BindingFlags]'NonPublic, Instance')
+  if ($field) {
+    $field.SetValue($ex, $HResult)
+  } else {
+    $setter = [System.Exception].GetProperty('HResult').GetSetMethod($true)
+    [void]$setter.Invoke($ex, @($HResult))
+  }
+  return $ex
+}
+$eofFull = New-TestHResultException -HResult ([Convert]::ToInt32('80070449', 16))
+$eofLow = New-TestHResultException -HResult 1097
+Assert-True (Test-DownloadHandleEofError -Exception $eofFull) 'eof: HResult 0x80070449 / -2147023799 is detected'
+Assert-True (Test-DownloadHandleEofError -Exception $eofLow) 'eof: the low 16 bits alone (1097) are enough'
+$eofWrapped = [System.Exception]::new('wrapper', $eofFull)
+Assert-True (Test-DownloadHandleEofError -Exception $eofWrapped) 'eof: an InnerException wrapper is detected'
+$eofAggregate = [System.AggregateException]::new('aggregate', $eofFull)
+Assert-True (Test-DownloadHandleEofError -Exception $eofAggregate) 'eof: an AggregateException chain is detected'
+Assert-True (-not (Test-DownloadHandleEofError -Exception (New-TestHResultException -HResult ([Convert]::ToInt32('80070005', 16))))) 'eof: another HResult is not 1097'
+Assert-True (-not (Test-DownloadHandleEofError -Exception $null)) 'eof: null is false'
+Assert-True (-not (Test-DownloadHandleEofError -Exception ([System.Exception]::new('handle error 1097')))) 'eof: matching message text alone is never enough'
 
 # --- 下载失败的可读原因（AggregateException 解包） ------------------------
 # 2026-10-20 的安装日志里重试告警只剩 PowerShell 的包装套话
@@ -1041,6 +1132,48 @@ try {
   $env:LOCALAPPDATA = $savedLocalAppData
   Remove-Item -LiteralPath $fragRoot -Recurse -Force -ErrorAction SilentlyContinue
 }
+
+# --- WT profile：清理失败只告警，绝不中断安装 -----------------------------
+# 当前 fragment 在清理之前就已写入；清理（例如文件被占用）失败必须保留它并
+# 继续安装，同时用中文告警点名 Terminal profile 清理失败。
+$warnRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('adbox-fragwarn-' + [guid]::NewGuid().ToString('N'))
+$savedLocalAppData2 = $env:LOCALAPPDATA
+$env:LOCALAPPDATA = $warnRoot
+try {
+  $identCoreBetaWrite = Get-AgentDevboxChannelIdentity -Variant 'core' -Channel 'beta'
+  $warnRes = $null
+  $warnThrew = $false
+  try {
+    $warnRes = & {
+      # 真实的 Remove-* 永不执行：这里模拟“清理抛错”（文件被占用等）。
+      function Remove-StaleAgentDevboxTerminalFragments { throw 'locked' }
+      $w = @()
+      $p = Write-AgentDevboxTerminalProfile -Distro 'agent-devbox-core-beta' `
+        -ProfileGuid $identCoreBetaWrite.TerminalGuid -HideGuid $identCoreBetaWrite.HideGuid `
+        -WarningVariable w -WarningAction SilentlyContinue
+      [pscustomobject]@{ Path = $p; Warnings = @($w) }
+    }
+  } catch { $warnThrew = $true }
+  Assert-True (-not $warnThrew) 'wt-warn: a cleanup failure does not abort the profile writer'
+  Assert-True ($null -ne $warnRes -and [bool]$warnRes.Path) 'wt-warn: the fragment path is still returned'
+  $warnExpect = Join-Path $warnRoot 'Microsoft\Windows Terminal\Fragments\AgentDevbox\agent-devbox-core-beta.json'
+  Assert-True ($null -ne $warnRes -and $warnRes.Path -eq $warnExpect) 'wt-warn: the returned path is this distro fragment'
+  Assert-True (Test-Path -LiteralPath $warnExpect) 'wt-warn: the current fragment still exists after the cleanup failure'
+  $warnCount = if ($null -ne $warnRes) { @($warnRes.Warnings).Count } else { 0 }
+  Assert-True ($warnCount -ge 1) 'wt-warn: a warning is emitted'
+  if ($warnCount -ge 1) {
+    $warnText = (@($warnRes.Warnings) | ForEach-Object { "$($_.Message)" }) -join ' '
+    Assert-True ($warnText -match '清理.*Terminal.*profile') 'wt-warn: the warning names the Terminal profile cleanup'
+    Assert-True ($warnText -match '[\u4e00-\u9fff]') 'wt-warn: the warning is Chinese'
+    Assert-True ($warnText -match 'locked') 'wt-warn: the warning includes the failure message'
+  }
+} finally {
+  $env:LOCALAPPDATA = $savedLocalAppData2
+  Remove-Item -LiteralPath $warnRoot -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+Assert-True ($ensureText -notmatch 'Remove-StaleAgentDevboxTerminalFragments[^\r\n]*catch \{ \}') 'wt-warn: the cleanup no longer uses an empty catch'
+Assert-True ($ensureText -match '清理旧的 Windows Terminal profile 失败（不影响安装）') 'wt-warn: the cleanup failure warning text exists'
 
 # --- PS 5.1 native quoting: guest bash scripts travel on stdin ------------
 # PS 5.1 wraps a native argument in quotes without escaping inner ones; wsl.exe
@@ -1637,6 +1770,12 @@ Assert-True ($smokeBlock -match '@\$\{\{\s*needs\.merge\.outputs\.core_digest\s*
 Assert-True ($smokeBlock -match 'smoke-core') 'ci: both image variants are smoke-tested'
 Assert-True ($smokeBlock -match '--platform "?linux/\$\{\{\s*matrix\.arch\s*\}\}"?') 'ci: smoke selects the matrix arch from the index'
 Assert-True ($smokeBlock -notmatch 'needs\.plan\.outputs\.tag') 'ci: smoke does not use a mutable candidate tag'
+Assert-True ($smokeBlock -match 'paseo\.pid') 'ci: smoke reads the supervisor pidfile'
+Assert-True ($smokeBlock -match '/proc/\$pid/status') 'ci: smoke checks the recorded daemon process UID'
+Assert-True ($smokeBlock -match 'Paseo Superviso') 'ci: smoke checks the daemon identity, not any paseo process'
+Assert-True ($smokeBlock -notmatch 'ps -eo user=') 'ci: smoke never accepts an unrelated paseo process'
+Assert-True ($smokeBlock -match 'name:\s+Interactive shell has a PTY') 'ci: the PTY step names what it actually proves'
+Assert-True ($smokeBlock -match 'Published images stay lean') 'ci: smoke keeps the WSL-only negative assertions'
 
 Assert-True ($exportBlock -match '--build-arg BASE_IMAGE="\$img@\$digest"') 'ci: export derives from the merged index digest'
 Assert-True ($exportBlock -match 'needs\.merge\.outputs\.core_digest') 'ci: export pulls core by index digest'
@@ -1658,8 +1797,13 @@ Assert-True ($publishBlock -match '--agents-digest\s+"\$\{\{\s*needs\.merge\.out
 Assert-True ($publishBlock -match 'promotion-state\.json') 'ci: promotion persists recovery state'
 Assert-True ($publishBlock -match 'Persist promotion recovery state') 'ci: recovery state is uploaded'
 Assert-True ($publishBlock -match '(?m)^\s+if:\s+always\(\)\s*$') 'ci: recovery state uploads even on failure'
-Assert-True ($publishBlock -match 'is-newer') 'ci: prune/state guard compares run order'
-Assert-True ($publishBlock -notmatch 'gh release delete[^\r\n]*\|\| true') 'ci: prune never swallows delete failures'
+Assert-True ($publishBlock -match 'prune-releases\.sh') 'ci: prune is delegated to the tested helper'
+$pruneText = Get-Content -Raw (Join-Path $here '..' '..' '.github' 'scripts' 'prune-releases.sh')
+Assert-True ($pruneText -match 'is-newer') 'ci: prune helper compares run order'
+Assert-True ($pruneText -match 'gh api') 'ci: prune helper reads the paginated API'
+Assert-True ($pruneText -match 'max-pages') 'ci: prune helper is page-bounded'
+Assert-True ($pruneText -notmatch 'gh release list') 'ci: prune helper does not use the 100-item list limit'
+Assert-True ($pruneText -notmatch 'gh release delete[^\r\n]*\|\| true') 'ci: prune never swallows delete failures'
 
 $draftIdx   = $publishBlock.IndexOf('Create draft Release')
 $verifyIdx  = $publishBlock.IndexOf('Verify uploaded Release assets')

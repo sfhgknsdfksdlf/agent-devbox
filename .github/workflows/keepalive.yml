@@ -8,19 +8,15 @@ on:
   workflow_dispatch:
 permissions:
   contents: write
+concurrency:
+  group: keepalive
+  cancel-in-progress: false
 jobs:
   ping:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: main
       - name: Empty commit only when main has been quiet for ~50 days
-        run: |
-          set -euo pipefail
-          if [ -n "$(git log -1 --since='50 days ago' --format=%H)" ]; then
-            echo "main has a commit within the last 50 days; skipping keepalive"
-            exit 0
-          fi
-          git config user.name  "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git commit --allow-empty -m "chore: keepalive (avoid 60-day schedule auto-disable)"
-          git push
+        run: .github/scripts/keepalive.sh --branch main --now "$(date -u +%s)"

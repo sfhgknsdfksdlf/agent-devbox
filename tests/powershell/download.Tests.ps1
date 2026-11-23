@@ -119,6 +119,9 @@ $handler = {
     $response.StatusCode = $status
     $response.ContentLength64 = $bodyLen
     $response.AddHeader('Accept-Ranges', 'bytes')
+    # A stable strong ETag so a real resume can be guarded by If-Match (the
+    # server deliberately does not reject a mismatch; 412 is a config mode).
+    if ($status -eq 200 -or $status -eq 206) { $response.AddHeader('ETag', '"adbox-asset"') }
     if ($status -eq 206) {
       $response.AddHeader('Content-Range', ('bytes {0}-{1}/{2}' -f $from, $to, $Content.Length))
     }
@@ -175,15 +178,6 @@ try {
   try { $pool.Dispose() } catch { }
 }
 '@
-}
-
-AfterAll {
-  foreach ($n in $script:ProxyNames) {
-    [Environment]::SetEnvironmentVariable($n, $script:SavedEnv[$n])
-  }
-}
-
-BeforeAll {
   # Test-only port acquisition: bind a TcpListener on an ephemeral loopback
   # port instead of guessing a port in a fixed range. Port 0 lets the OS pick a
   # free port; a real bind failure is retried 5 times, then thrown so the caller
@@ -377,6 +371,12 @@ function Test-FileEqualsBytes {
   }
   return $true
 }
+}
+
+AfterAll {
+  foreach ($n in $script:ProxyNames) {
+    [Environment]::SetEnvironmentVariable($n, $script:SavedEnv[$n])
+  }
 }
 
 Describe 'Save-Download segmented mode' {
@@ -576,6 +576,151 @@ Describe 'Save-Download segmented mode' {
         }).Count | Should -Be 0
       $meta = Read-DownloadSidecar -Path (Get-DownloadMetaPath -Dest $dest)
       $meta.segmentState | Should -Be 'complete'
+    } finally {
+      Stop-DownloadServer -Server $server
+    }
+  }
+}
+
+Describe 'Save-Download resume identity' {
+  It 're-downloads a complete destination whose bytes do not match the sidecar SHA without -Sha256' {
+    $server = Start-TestDownloadServer -Config @{ Mode = 'range'; Total = $script:Total }
+    if ($null -eq $server) { return }
+    try {
+      $dest = Join-Path $server.Base 'rootfs-core-amd64.tar.zst.part-00'
+      $wrong = New-Object byte[] $script:Total
+      for ($i = 0; $i -lt $wrong.Length; $i++) { $wrong[$i] = [byte](($i * 7 + 3) % 256) }
+      [System.IO.File]::WriteAllBytes($dest, $wrong)
+      Write-DownloadSidecar -Path (Get-DownloadMetaPath -Dest $dest) -Url $server.Url -ETag '"strong-1"' `
+        -Length $script:Total -Sha256 $script:ContentSha -Complete $true
+      Save-Download -Url $server.Url -Dest $dest -ExpectedBytes $script:Total -Connections 1 `
+        -SlowWindowSeconds 0 -StallSeconds 10 -Retries 3 6>$null
+      (Test-FileEqualsBytes -Path $dest -Bytes $script:Content) | Should -BeTrue
+      @(Get-TestLog -Path $server.Log).Count | Should -BeGreaterThan 0
+      (Read-DownloadSidecar -Path (Get-DownloadMetaPath -Dest $dest)).sha256 | Should -Be $script:ContentSha
+    } finally {
+      Stop-DownloadServer -Server $server
+    }
+  }
+
+  It 'starts from zero when the partial sidecar has no ETag' {
+    $server = Start-TestDownloadServer -Config @{ Mode = 'range'; Total = $script:Total }
+    if ($null -eq $server) { return }
+    try {
+      $dest = Join-Path $server.Base 'rootfs-core-amd64.tar.zst.part-00'
+      $partial = 1000
+      $prefixBytes = New-Object byte[] $partial
+      [Array]::Copy($script:Content, 0, $prefixBytes, 0, $partial)
+      [System.IO.File]::WriteAllBytes($dest, $prefixBytes)
+      Write-DownloadSidecar -Path (Get-DownloadMetaPath -Dest $dest) -Url $server.Url -ETag '' `
+        -Length $script:Total -Sha256 $script:ContentSha -Complete $false
+      Save-Download -Url $server.Url -Dest $dest -ExpectedBytes $script:Total -Sha256 $script:ContentSha `
+        -Connections 1 -SlowWindowSeconds 0 -StallSeconds 10 -Retries 3 6>$null
+      (Test-FileEqualsBytes -Path $dest -Bytes $script:Content) | Should -BeTrue
+      $entries = Get-TestLog -Path $server.Log
+      [string]$entries[0].Range | Should -Be ''
+      [string]$entries[0].IfMatch | Should -Be ''
+    } finally {
+      Stop-DownloadServer -Server $server
+    }
+  }
+
+  It 'starts from zero when the partial sidecar ETag is weak' {
+    $server = Start-TestDownloadServer -Config @{ Mode = 'range'; Total = $script:Total }
+    if ($null -eq $server) { return }
+    try {
+      $dest = Join-Path $server.Base 'rootfs-core-amd64.tar.zst.part-00'
+      $partial = 1000
+      $prefixBytes = New-Object byte[] $partial
+      [Array]::Copy($script:Content, 0, $prefixBytes, 0, $partial)
+      [System.IO.File]::WriteAllBytes($dest, $prefixBytes)
+      Write-DownloadSidecar -Path (Get-DownloadMetaPath -Dest $dest) -Url $server.Url -ETag 'W/"v1"' `
+        -Length $script:Total -Sha256 $script:ContentSha -Complete $false
+      Save-Download -Url $server.Url -Dest $dest -ExpectedBytes $script:Total -Sha256 $script:ContentSha `
+        -Connections 1 -SlowWindowSeconds 0 -StallSeconds 10 -Retries 3 6>$null
+      (Test-FileEqualsBytes -Path $dest -Bytes $script:Content) | Should -BeTrue
+      $entries = Get-TestLog -Path $server.Log
+      [string]$entries[0].Range | Should -Be ''
+      [string]$entries[0].IfMatch | Should -Be ''
+    } finally {
+      Stop-DownloadServer -Server $server
+    }
+  }
+
+  It 'resumes a partial with If-Match when the sidecar has a strong ETag' {
+    $server = Start-TestDownloadServer -Config @{ Mode = 'range'; Total = $script:Total }
+    if ($null -eq $server) { return }
+    try {
+      $dest = Join-Path $server.Base 'rootfs-core-amd64.tar.zst.part-00'
+      $partial = 1000
+      $prefixBytes = New-Object byte[] $partial
+      [Array]::Copy($script:Content, 0, $prefixBytes, 0, $partial)
+      [System.IO.File]::WriteAllBytes($dest, $prefixBytes)
+      Write-DownloadSidecar -Path (Get-DownloadMetaPath -Dest $dest) -Url $server.Url -ETag '"strong-1"' `
+        -Length $script:Total -Sha256 $script:ContentSha -Complete $false
+      Save-Download -Url $server.Url -Dest $dest -ExpectedBytes $script:Total -Sha256 $script:ContentSha `
+        -Connections 1 -SlowWindowSeconds 0 -StallSeconds 10 -Retries 3 6>$null
+      (Test-FileEqualsBytes -Path $dest -Bytes $script:Content) | Should -BeTrue
+      $entries = Get-TestLog -Path $server.Log
+      [string]$entries[0].Range | Should -Be ('bytes={0}-{1}' -f $partial, ($script:Total - 1))
+      [string]$entries[0].IfMatch | Should -Be '"strong-1"'
+    } finally {
+      Stop-DownloadServer -Server $server
+    }
+  }
+
+  It 'never splices a wrong-byte prefix of the right length into success' {
+    $server = Start-TestDownloadServer -Config @{ Mode = 'range'; Total = $script:Total }
+    if ($null -eq $server) { return }
+    try {
+      $dest = Join-Path $server.Base 'rootfs-core-amd64.tar.zst.part-00'
+      $partial = 1000
+      $wrong = New-Object byte[] $partial
+      for ($i = 0; $i -lt $wrong.Length; $i++) { $wrong[$i] = 0xAB }
+      [System.IO.File]::WriteAllBytes($dest, $wrong)
+      Write-DownloadSidecar -Path (Get-DownloadMetaPath -Dest $dest) -Url $server.Url -ETag '"strong-1"' `
+        -Length $script:Total -Sha256 $script:ContentSha -Complete $false
+      Save-Download -Url $server.Url -Dest $dest -ExpectedBytes $script:Total -Sha256 $script:ContentSha `
+        -Connections 1 -SlowWindowSeconds 0 -StallSeconds 10 -Retries 3 6>$null
+      (Test-FileEqualsBytes -Path $dest -Bytes $script:Content) | Should -BeTrue
+      $entries = Get-TestLog -Path $server.Log
+      @($entries | Where-Object {
+          [string]$_.Range -eq ('bytes={0}-{1}' -f $partial, ($script:Total - 1)) -and [string]$_.IfMatch -eq '"strong-1"'
+        }).Count | Should -BeGreaterThan 0
+      # The digest failure must remove the spliced file and restart without Range.
+      @($entries | Where-Object {
+          [int]$_.Seq -gt 1 -and [string]$_.Range -eq '' -and [string]$_.IfMatch -eq ''
+        }).Count | Should -BeGreaterThan 0
+    } finally {
+      Stop-DownloadServer -Server $server
+    }
+  }
+
+  It 'drops a sidecar digest when HTTP 412 proves the object changed' {
+    $server = Start-TestDownloadServer -Config @{ Mode = '412'; Total = $script:Total; First412 = 1 }
+    if ($null -eq $server) { return }
+    try {
+      $dest = Join-Path $server.Base 'rootfs-core-amd64.tar.zst.part-00'
+      $partial = 1000
+      $prefixBytes = New-Object byte[] $partial
+      [Array]::Copy($script:Content, 0, $prefixBytes, 0, $partial)
+      [System.IO.File]::WriteAllBytes($dest, $prefixBytes)
+      $bogusSha = ('d' * 64) -join ''
+      Write-DownloadSidecar -Path (Get-DownloadMetaPath -Dest $dest) -Url $server.Url -ETag '"old-etag"' `
+        -Length $script:Total -Sha256 $bogusSha -Complete $false
+      # No -Sha256: the only digest is the sidecar one, and 412 proves it stale.
+      Save-Download -Url $server.Url -Dest $dest -ExpectedBytes $script:Total `
+        -Connections 1 -SlowWindowSeconds 0 -StallSeconds 10 -Retries 3 6>$null
+      (Test-FileEqualsBytes -Path $dest -Bytes $script:Content) | Should -BeTrue
+      $entries = Get-TestLog -Path $server.Log
+      @($entries | Where-Object { [int]$_.Status -eq 412 }).Count | Should -BeGreaterThan 0
+      $first412 = @($entries | Where-Object { [int]$_.Status -eq 412 })[0]
+      [string]$first412.IfMatch | Should -Be '"old-etag"'
+      # The restart must not reuse the old validator or the bogus digest.
+      @($entries | Where-Object {
+          [int]$_.Seq -gt [int]$first412.Seq -and [string]$_.Range -eq '' -and [string]$_.IfMatch -eq ''
+        }).Count | Should -BeGreaterThan 0
+      [string](Read-DownloadSidecar -Path (Get-DownloadMetaPath -Dest $dest)).sha256 | Should -Be ''
     } finally {
       Stop-DownloadServer -Server $server
     }

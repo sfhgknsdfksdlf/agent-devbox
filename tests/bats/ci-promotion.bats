@@ -18,6 +18,10 @@ setup() {
   mkdir -p "$STATE_DIR" "$TMP/bin"
   : > "$FAKE_LOG"
 
+  # Workflow-level image names must not leak into this fixture: the scripts
+  # under test receive the explicit testowner image names below.
+  unset CORE_IMAGE AGENTS_IMAGE
+
   export TAGS="$BATS_TEST_DIRNAME/../../.github/scripts/release-tags.sh"
   export MERGE="$BATS_TEST_DIRNAME/../../.github/scripts/merge-digests.sh"
   export PROMOTE="$BATS_TEST_DIRNAME/../../.github/scripts/release-promote.sh"

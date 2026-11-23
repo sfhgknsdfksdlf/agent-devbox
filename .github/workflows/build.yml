@@ -43,6 +43,7 @@ on:
       - "1panel/**"
       - "versions.json"
       - ".github/scripts/version-state.sh"
+      - ".github/scripts/prune-releases.sh"
       - ".github/workflows/build.yml"
       - ".github/workflows/keepalive.yml"
   workflow_dispatch:
@@ -553,11 +554,27 @@ jobs:
             docker logs "$name" | tail -40
             [ "$code" = "200" ]
           done
-      - name: Daemons run as non-root paseo
+      - name: paseo daemon identity matches the supervisor lock
         run: |
           set -euo pipefail
           for name in smoke smoke-core; do
-            docker exec "$name" sh -lc 'ps -eo user= | grep -qx paseo'
+            docker exec "$name" sh -lc '
+              set -eu
+              pidfile=/home/paseo/.paseo/paseo.pid
+              [ -s "$pidfile" ] || { echo "missing $pidfile" >&2; exit 1; }
+              pid=$(jq -er ".pid | select(type == \"number\" and . > 0)" "$pidfile")
+              uid=$(jq -er ".uid | select(type == \"number\")" "$pidfile")
+              want=$(id -u paseo)
+              [ "$uid" -eq "$want" ] || { echo "pidfile uid=$uid want=$want" >&2; exit 1; }
+              [ -r "/proc/$pid/status" ] || { echo "pid $pid is not running" >&2; exit 1; }
+              comm=$(cat "/proc/$pid/comm")
+              [ "$comm" = "Paseo Superviso" ] || { echo "pid $pid comm=$comm" >&2; exit 1; }
+              uid_line=$(grep "^Uid:" "/proc/$pid/status")
+              set -- $uid_line
+              [ "$1" = "Uid:" ] && [ "$2" = "$want" ] && [ "$3" = "$want" ] && [ "$4" = "$want" ] && [ "$5" = "$want" ] || {
+                echo "pid $pid uid line=$uid_line want=$want" >&2; exit 1; }
+              echo "ok: $name paseo pid=$pid uid=$uid"
+            '
           done
       - name: Desktop app CLI probe (image contract)
         run: |
@@ -568,7 +585,7 @@ jobs:
             [ "$out" = "/root/.opencode/bin/opencode" ]
             docker exec "$name" desktop-cli-check.sh --home /root
           done
-      - name: PTY works (node-pty path)
+      - name: Interactive shell has a PTY
         run: |
           set -euo pipefail
           for name in smoke smoke-core; do
@@ -923,45 +940,10 @@ jobs:
           REL: ${{ needs.plan.outputs.release_tag }}
         run: |
           set -euo pipefail
-          if [ "$CHANNEL" != "beta" ]; then
-            echo "not a beta channel; skip prune"
-            exit 0
-          fi
-          tags="$(gh release list --limit 100 --json tagName,isPrerelease,isDraft --jq '.[] | select(.isPrerelease and (.isDraft | not)) | select(.tagName | startswith("beta-")) | .tagName')"
-          latest="$(printf '%s\n' "$tags" | .github/scripts/release-tags.sh newest)"
-          set +e
-          .github/scripts/release-tags.sh is-newer --candidate "$REL" --latest "$latest" --allow-equal
-          rc=$?
-          set -e
-          if [ "$rc" -eq 1 ]; then
-            echo "older run ($REL < $latest); skip prune"
-            exit 0
-          fi
-          if [ "$rc" -ne 0 ]; then
-            echo "ERROR: cannot compare $REL with $latest"; exit 1
-          fi
-          failed=()
-          while IFS= read -r t; do
-            [ -n "$t" ] || continue
-            if [ "$t" = "$REL" ]; then continue; fi
-            set +e
-            .github/scripts/release-tags.sh is-newer --candidate "$t" --latest "$REL"
-            rc=$?
-            set -e
-            if [ "$rc" -eq 2 ]; then echo "ERROR: cannot compare $t with $REL"; exit 1; fi
-            if [ "$rc" -eq 0 ]; then
-              echo "keep newer release: $t"
-              continue
-            fi
-            echo "deleting old beta release: $t"
-            if ! gh release delete "$t" --yes --cleanup-tag; then failed+=("$t"); fi
-          done <<< "$tags"
-          if [ "${#failed[@]}" -gt 0 ]; then
-            for t in "${failed[@]}"; do
-              echo "retrying delete: $t"
-              gh release delete "$t" --yes --cleanup-tag || { echo "ERROR: failed to prune $t"; exit 1; }
-            done
-          fi
+          .github/scripts/prune-releases.sh \
+            --repo "$GITHUB_REPOSITORY" \
+            --current "$REL" \
+            --channel "$CHANNEL"
 
       # -------------------------------------------------------------------------
       # The build above ran with no-cache for scheduled/manual runs. Record what

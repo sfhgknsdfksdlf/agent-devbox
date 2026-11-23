@@ -666,7 +666,12 @@ function Join-Parts {
 function Get-FreeDiskSpaceBytes {
   [CmdletBinding()]
   param([Parameter(Mandatory)][string] $Path, [Nullable[long]] $Override = $null)
-  if ($null -ne $Override) { return [long]$Override }
+  if ($null -ne $Override) {
+    if ($Override -lt 0) {
+      throw ("磁盘空间检查参数无效：Override（可用字节数）不能为负数，实际为 {0}。" -f $Override)
+    }
+    return [long]$Override
+  }
 
   $full = [System.IO.Path]::GetFullPath($Path)
   try {
@@ -779,6 +784,10 @@ function Get-ZstdUncompressedSizeFromUrl {
 #   Segmented = 2C             (segment files + growing destination, C each)
 # where C = compressed parts, U = uncompressed tar, V = U * 1.05 (dynamic vhdx).
 # The segmented peak is below 2C because each segment is deleted as it is copied.
+# All arithmetic is [decimal] so long inputs cannot wrap; V and the margin are
+# rounded UP (Ceiling) so a fractional byte can never under-estimate the need.
+# Every input is validated BEFORE use and the result must fit Int64: a bad or
+# overflowing estimate fails closed with a Chinese message instead of clamping.
 function Get-RequiredDiskBytes {
   [CmdletBinding()]
   param(
@@ -789,22 +798,49 @@ function Get-RequiredDiskBytes {
     [long] $MarginMinBytes = 3221225472,
     [double] $MarginPct = 0.10
   )
-  if ($UncompressedBytes -le 0) { $UncompressedBytes = [long]($CompressedBytes * 4.0) }
-  $v = [long]($UncompressedBytes * 1.05)
-  switch ($Tier) {
-    'Stream'    { $base = $CompressedBytes + $v }
-    'Merge'     { $base = (2 * $CompressedBytes) + $v }
-    'Legacy'    { $base = (2 * $CompressedBytes) + $UncompressedBytes + $v }
-    'Segmented' { $base = 2 * $CompressedBytes }
+  if ($CompressedBytes -le 0) {
+    throw ("磁盘估算参数无效：CompressedBytes（压缩分片总字节数）必须大于 0，实际为 {0}。" -f $CompressedBytes)
   }
-  $margin = [long]($base * $MarginPct)
-  if ($margin -lt $MarginMinBytes) { $margin = $MarginMinBytes }
-  return [long]($base + $DataDiskReserve + $margin)
+  if ($UncompressedBytes -lt 0) {
+    throw ("磁盘估算参数无效：UncompressedBytes（未压缩字节数）不能为负数，实际为 {0}。" -f $UncompressedBytes)
+  }
+  if ($DataDiskReserve -lt 0) {
+    throw ("磁盘估算参数无效：DataDiskReserve（数据盘预留字节数）不能为负数，实际为 {0}。" -f $DataDiskReserve)
+  }
+  if ($MarginMinBytes -lt 0) {
+    throw ("磁盘估算参数无效：MarginMinBytes（最小余量字节数）不能为负数，实际为 {0}。" -f $MarginMinBytes)
+  }
+  if ([double]::IsNaN($MarginPct) -or [double]::IsInfinity($MarginPct) -or $MarginPct -lt 0 -or $MarginPct -gt 1) {
+    throw ("磁盘估算参数无效：MarginPct（余量比例）必须是 0 到 1 之间的有限数值，实际为 {0}。" -f $MarginPct)
+  }
+
+  $c = [decimal]$CompressedBytes
+  if ($UncompressedBytes -eq 0) { $u = $c * [decimal]4 } else { $u = [decimal]$UncompressedBytes }
+  $v = [Math]::Ceiling($u * [decimal]1.05)
+  switch ($Tier) {
+    'Stream'    { $base = $c + $v }
+    'Merge'     { $base = ([decimal]2 * $c) + $v }
+    'Legacy'    { $base = ([decimal]2 * $c) + $u + $v }
+    'Segmented' { $base = [decimal]2 * $c }
+  }
+  $margin = [Math]::Ceiling($base * [decimal]$MarginPct)
+  if ($margin -lt [decimal]$MarginMinBytes) { $margin = [decimal]$MarginMinBytes }
+  $required = $base + [decimal]$DataDiskReserve + $margin
+  if ($required -lt [decimal]0 -or $required -gt [decimal][long]::MaxValue) {
+    throw ("磁盘估算结果超出可表示范围：约 {0} 字节，超过 Int64 上限 {1}。请检查分片/未压缩大小或预留参数。" -f $required, [long]::MaxValue)
+  }
+  return [long]$required
 }
 
 function Test-DiskSpace {
   [CmdletBinding()]
   param([Parameter(Mandatory)][long] $RequiredBytes, [Parameter(Mandatory)][long] $AvailableBytes)
+  if ($RequiredBytes -lt 0) {
+    throw ("磁盘空间检查参数无效：RequiredBytes（需要字节数）不能为负数，实际为 {0}。" -f $RequiredBytes)
+  }
+  if ($AvailableBytes -lt 0) {
+    throw ("磁盘空间检查参数无效：AvailableBytes（可用字节数）不能为负数，实际为 {0}。" -f $AvailableBytes)
+  }
   return ($AvailableBytes -ge $RequiredBytes)
 }
 
@@ -816,6 +852,12 @@ function Assert-DiskSpace {
     [Parameter(Mandatory)][long] $RequiredBytes,
     [Nullable[long]] $Override = $null
   )
+  if ($RequiredBytes -lt 0) {
+    throw ("磁盘空间检查参数无效：RequiredBytes（需要字节数）不能为负数，实际为 {0}。" -f $RequiredBytes)
+  }
+  if ($null -ne $Override -and $Override -lt 0) {
+    throw ("磁盘空间检查参数无效：Override（可用字节数）不能为负数，实际为 {0}。" -f $Override)
+  }
   $free = Get-FreeDiskSpaceBytes -Path $Path -Override $Override
   if (Test-DiskSpace -RequiredBytes $RequiredBytes -AvailableBytes $free) { return $true }
   $gi = 1073741824.0
@@ -1095,8 +1137,36 @@ function Write-DownloadSidecar {
       $o['segmentState'] = $state
     }
     $json = $o | ConvertTo-Json -Compress
-    [System.IO.File]::WriteAllText($Path, $json, (New-Object System.Text.UTF8Encoding($false)))
+    # Atomic replace: a temp file in the SAME directory (Replace/Move need the
+    # same volume) is written first, so a crash never leaves a half-written
+    # sidecar and a failed write never destroys the previous good record.
+    $tmp = ('{0}.tmp-{1}' -f $Path, [guid]::NewGuid().ToString('N'))
+    try {
+      [System.IO.File]::WriteAllText($tmp, $json, (New-Object System.Text.UTF8Encoding($false)))
+      if ([System.IO.File]::Exists($Path)) {
+        # A true null (not PowerShell's '' coercion) for the backup argument.
+        [System.IO.File]::Replace($tmp, $Path, [NullString]::Value)
+      } else {
+        [System.IO.File]::Move($tmp, $Path)
+      }
+    } catch {
+      if ([System.IO.File]::Exists($tmp)) {
+        try { [System.IO.File]::Delete($tmp) } catch { }
+      }
+    }
   } catch { }
+}
+
+# Pure predicate: a strong HTTP entity-tag (RFC 7232 opaque-tag, no W/ prefix).
+# Resume bytes may only be appended when If-Match can prove the remote object
+# did not change; a missing, empty or weak tag can never do that.
+function Test-DownloadStrongETag {
+  [CmdletBinding()]
+  param([AllowNull()][AllowEmptyString()][string] $ETag = '')
+  $tag = "$ETag".Trim()
+  if (-not $tag) { return $false }
+  if ($tag -match '^[Ww]/') { return $false }
+  return ($tag -match '^"[^"\r\n]+"$')
 }
 
 # Pure predicate: may this sidecar be trusted to describe the requested object?
@@ -1111,6 +1181,9 @@ function Test-DownloadSidecarIdentity {
   if ($null -eq $Sidecar) { return $false }
   if ("$($Sidecar.url)" -cne $Url) { return $false }
   if ($Length -gt 0 -and [long]$Sidecar.length -ne $Length) { return $false }
+  # A strong ETag is mandatory: without it a Range resume cannot be guarded by
+  # If-Match, so the partial must be discarded instead of appended.
+  if (-not (Test-DownloadStrongETag -ETag "$($Sidecar.etag)")) { return $false }
   $want = "$Sha256".Trim()
   $had  = "$($Sidecar.sha256)".Trim()
   # A recorded-but-empty digest cannot prove content identity: if the caller
@@ -1552,6 +1625,37 @@ function Format-DownloadErrorMessage {
   return '未知错误'
 }
 
+# Pure predicate: is this failure Windows ERROR_HANDLE_EOF (1097)? A failed
+# handle (or a file opened on a vanished volume) surfaces as HResult low word
+# 0x0449 - 1097, full signed 0x80070449 / -2147023799 - and may be wrapped by
+# MethodInvocationException / AggregateException. Such a partial is untrusted:
+# the caller removes it (and its sidecar) and restarts from zero. Message text
+# alone is never evidence.
+function Test-DownloadHandleEofError {
+  [CmdletBinding()]
+  param([AllowNull()] $Exception)
+  $stack = New-Object System.Collections.Generic.Stack[object]
+  $stack.Push($Exception)
+  $seen = 0
+  while ($stack.Count -gt 0 -and $seen -lt 32) {
+    $seen++
+    $cur = $stack.Pop()
+    if ($null -eq $cur) { continue }
+    $hr = 0
+    try { $hr = [int]$cur.HResult } catch { $hr = 0 }
+    if (($hr -band 0xFFFF) -eq 0x0449) { return $true }
+    try {
+      if ($cur.InnerException) { $stack.Push($cur.InnerException) }
+    } catch { }
+    if ($cur -is [System.AggregateException]) {
+      try {
+        foreach ($ie in $cur.InnerExceptions) { $stack.Push($ie) }
+      } catch { }
+    }
+  }
+  return $false
+}
+
 # A failed `wsl --import` can leave <InstallDir>\ext4.vhdx behind, which then
 # makes every fallback tier fail too. Remove it ONLY when the distro is not
 # registered - never touch a live distro's disk. Never throws.
@@ -1952,6 +2056,7 @@ function Save-DownloadSegmented {
           if ($seg.Cts) { try { $seg.Cts.Dispose() } catch { } ; $seg.Cts = $null }
           $anyRead = $true
         } catch {
+          if (Test-DownloadHandleEofError -Exception $_.Exception) { throw }
           & $closeSegment $seg
           $retryBatch = $true
         }
@@ -1992,7 +2097,7 @@ function Save-DownloadSegmented {
         }
         if ($null -eq $seg) { continue }
         $n = 0
-        try { $n = [int]$task.Result } catch { $n = -1 }
+        try { $n = [int]$task.Result } catch { if (Test-DownloadHandleEofError -Exception $_.Exception) { throw }; $n = -1 }
         if ($n -lt 0) {
           & $closeSegment $seg
           continue
@@ -2014,6 +2119,7 @@ function Save-DownloadSegmented {
         try {
           $seg.Stream.Write($seg.Buffer, 0, $write)
         } catch {
+          if (Test-DownloadHandleEofError -Exception $_.Exception) { throw }
           & $closeSegment $seg
           continue
         }
@@ -2050,6 +2156,7 @@ function Save-DownloadSegmented {
         try {
           $seg.ReadTask = $seg.ResponseStream.ReadAsync($seg.Buffer, 0, $seg.Buffer.Length)
         } catch {
+          if (Test-DownloadHandleEofError -Exception $_.Exception) { throw }
           & $closeSegment $seg
           continue
         }
@@ -2229,6 +2336,19 @@ function Save-Download {
         -StatusCode $diagStatus -Connections $diagConnections)
   }
 
+  # Effective digest: the caller's -Sha256 wins; otherwise a sidecar that still
+  # describes THIS object (same URL/length/strong ETag) supplies the digest.
+  # A manifest/sidecar SHA must never be skipped just because -Sha256 was
+  # omitted. Empty when neither source has a usable digest.
+  $effectiveSha = $Sha256
+  if (-not $effectiveSha) {
+    $seedMeta = Read-DownloadSidecar -Path $metaPath
+    if ($seedMeta -and (Test-DownloadSidecarIdentity -Sidecar $seedMeta -Url $Url -Length $ExpectedBytes)) {
+      $seedSha = "$($seedMeta.sha256)".Trim().ToLowerInvariant()
+      if ($seedSha -match '^[0-9a-f]{64}$') { $effectiveSha = $seedSha }
+    }
+  }
+
   # PowerShell 5.1 does not preload System.Net.Http; loading the assembly keeps
   # us clear of the AV-sensitive inline C# / P/Invoke shapes.
   $httpOk = $true
@@ -2244,7 +2364,7 @@ function Save-Download {
       try {
         Invoke-WebRequest -Uri $Url -OutFile $Dest -UseBasicParsing -ErrorAction Stop
         $got = (Get-Item -LiteralPath $Dest).Length
-        if ($got -eq $ExpectedBytes -and (-not $Sha256 -or (Get-FileSha256 -Path $Dest) -eq $Sha256)) { return }
+        if ($got -eq $ExpectedBytes -and (-not $effectiveSha -or (Get-FileSha256 -Path $Dest) -eq $effectiveSha)) { return }
         throw ("下载不完整或校验失败：{0} / {1} 字节" -f $got, $ExpectedBytes)
       } catch {
         Write-Warning ("下载中断，重试 {0}/{1}：{2}" -f $i, $Retries, (Format-DownloadErrorMessage -Exception $_.Exception))
@@ -2280,9 +2400,10 @@ function Save-Download {
     }
   }
 
+  $eofRestarts = 0
   while ($useSegmented) {
     try {
-      $null = Save-DownloadSegmented -Url $Url -Dest $Dest -ExpectedBytes $ExpectedBytes -Sha256 $Sha256 `
+      $null = Save-DownloadSegmented -Url $Url -Dest $Dest -ExpectedBytes $ExpectedBytes -Sha256 $effectiveSha `
         -Retries $Retries -StallSeconds $StallSeconds -HeaderTimeoutSeconds $HeaderTimeoutSeconds `
         -SlowSpeedBytesPerSec $SlowSpeedBytesPerSec -SlowWindowSeconds $SlowWindowSeconds -Connections $Connections `
         -Stats $stats
@@ -2293,16 +2414,35 @@ function Save-Download {
       $isUnsupported = ($errText -match 'SEGMENT_UNSUPPORTED') -or ($rawText -match 'SEGMENT_UNSUPPORTED')
       $isIdentity = ($errText -match 'SEGMENT_IDENTITY_CHANGED') -or ($rawText -match 'SEGMENT_IDENTITY_CHANGED')
       $isContentBad = ($errText -match 'SEGMENT_CONTENT_BAD') -or ($rawText -match 'SEGMENT_CONTENT_BAD')
+      if (Test-DownloadHandleEofError -Exception $_.Exception) {
+        # ERROR_HANDLE_EOF (1097): the handle died mid-transfer, so neither the
+        # partial destination nor the segment/sidecar state can be trusted.
+        # Discard everything and restart from zero; never reuse the old sidecar.
+        $eofRestarts++
+        Remove-DownloadArtifacts -Dest $Dest
+        Write-Warning ("{0} 的下载句柄提前结束（Windows 错误 1097），已丢弃旧分片并从零重新开始" -f $label)
+        if ($eofRestarts -ge 3) {
+          $diag = & $makeDiag ([Math]::Max(1, $eofRestarts))
+          Write-Host $diag
+          throw ("下载句柄反复提前结束（Windows 错误 1097）：$Url`n$diag")
+        }
+        Start-Sleep -Seconds 1
+        continue
+      }
       if ($isUnsupported) {
         Remove-DownloadArtifacts -Dest $Dest
         Write-Warning '服务器不支持分段下载（HTTP 200），改用单连接'
-        return (Save-Download -Url $Url -Dest $Dest -ExpectedBytes $ExpectedBytes -Sha256 $Sha256 `
+        return (Save-Download -Url $Url -Dest $Dest -ExpectedBytes $ExpectedBytes -Sha256 $effectiveSha `
             -Retries $Retries -StallSeconds $StallSeconds -HeaderTimeoutSeconds $HeaderTimeoutSeconds `
             -SlowSpeedBytesPerSec $SlowSpeedBytesPerSec -SlowWindowSeconds $SlowWindowSeconds `
             -SegmentMinBytes $SegmentMinBytes -Connections 1)
       }
       if ($isIdentity) {
         $identityRestarts++
+        # The remote object changed: a sidecar-derived digest is stale and must
+        # not gate the restart. The caller's -Sha256 (if any) is authoritative
+        # and is never cleared.
+        $effectiveSha = $Sha256
         if ($identityRestarts -ge 2) {
           $diag = & $makeDiag ([Math]::Max(1, $identityRestarts))
           Write-Host $diag
@@ -2340,34 +2480,45 @@ function Save-Download {
     $have = 0L
     if (Test-Path -LiteralPath $Dest) { $have = (Get-Item -LiteralPath $Dest).Length }
     $lastOffset = $have
+    $metaEtag = ''
     if ($have -gt 0) {
       # A partial may only be continued when we can prove it belongs to THIS
       # remote object. No sidecar, or one recorded for another URL / size /
-      # digest (the usual case: the previous release tag, same part filename)
-      # means the bytes cannot be trusted - drop them and start at zero.
+      # digest / weak-or-missing ETag (the usual case: the previous release
+      # tag, same part filename) means the bytes cannot be trusted - drop them
+      # and start at zero.
       $meta = Read-DownloadSidecar -Path $metaPath
-      if (-not (Test-DownloadSidecarIdentity -Sidecar $meta -Url $Url -Length $ExpectedBytes -Sha256 $Sha256)) {
-        Write-Warning ("{0} 的残片没有可用的下载记录（可能来自其它版本），已丢弃并重新下载" -f $label)
+      if (-not (Test-DownloadSidecarIdentity -Sidecar $meta -Url $Url -Length $ExpectedBytes -Sha256 $effectiveSha)) {
+        Write-Warning ("{0} 的残片没有可用的下载记录或缺少强 ETag（可能来自其它版本），已丢弃并重新下载" -f $label)
         Remove-DownloadArtifacts -Dest $Dest
         $have = 0L
+      } else {
+        # Adopt a sidecar-recorded digest for the rest of this call: it must
+        # still gate the final content even when the caller omitted -Sha256.
+        if (-not $effectiveSha) {
+          $sidecarSha = "$($meta.sha256)".Trim().ToLowerInvariant()
+          if ($sidecarSha -match '^[0-9a-f]{64}$') { $effectiveSha = $sidecarSha }
+        }
+        $metaEtag = "$($meta.etag)".Trim()
       }
     }
     if ($ExpectedBytes -gt 0 -and $have -eq $ExpectedBytes) {
-      if (-not $Sha256) {
+      if (-not $effectiveSha) {
         Write-Host ("     {0}  已完整（{1:N0} MiB），跳过下载" -f $label, ($have / $mb))
         return
       }
       Write-Host ("     校验 {0} 的 SHA256…" -f $label)
       $actualSha = Get-FileSha256 -Path $Dest
-      if ($actualSha -eq $Sha256) {
+      if ($actualSha -eq $effectiveSha) {
         Write-Host ("     {0}  已完整且校验通过（{1:N0} MiB）" -f $label, ($have / $mb))
-        Write-DownloadSidecar -Path $metaPath -Url $Url -Length $have -Sha256 $Sha256 -Complete $true
+        Write-DownloadSidecar -Path $metaPath -Url $Url -ETag $metaEtag -Length $have -Sha256 $effectiveSha -Complete $true
         return
       }
       $hashFails++
-      Write-Warning ("{0} 的 SHA256 不符（期望 {1}，实际 {2}），删除后重新下载" -f $label, $Sha256, $actualSha)
+      Write-Warning ("{0} 的 SHA256 不符（期望 {1}，实际 {2}），删除后重新下载" -f $label, $effectiveSha, $actualSha)
       Remove-DownloadArtifacts -Dest $Dest
       $have = 0L
+      $metaEtag = ''
       if ($hashFails -ge 2) {
         $script:ContentSuspect = $true
         $diag = & $makeDiag $i
@@ -2428,20 +2579,26 @@ function Save-Download {
         # headers.Range and converts both ends, so a non-null end is mandatory.
         $req.Headers.Range = [System.Net.Http.Headers.RangeHeaderValue]::new([long]$have, [long]$end)
 
-        # Conditional resume with the stored strong ETag. MEASURED: GitHub
+        # Conditional resume with the stored STRONG ETag. MEASURED: GitHub
         # Releases (Azure blob) IGNORE `If-Range` - a stale validator still
         # returns 206 - so If-Range cannot protect the append. `If-Match` is
         # honoured: a changed object returns 412 and we restart from zero.
-        $m = Read-DownloadSidecar -Path $metaPath
-        if ($m -and $m.etag) { $reqEtag = [string]$m.etag }
-        if ($reqEtag) {
-          $sent = $false
-          try { $sent = [bool]$req.Headers.TryAddWithoutValidation('If-Match', $reqEtag) } catch { $sent = $false }
-          if (-not $sent) {
-            Write-Warning ("{0} 的 ETag 无法作为 If-Match 发送，本次只按 Range 续传（完成后仍会校验长度/哈希）" -f $label)
-          }
-        } else {
-          Write-Warning ("{0} 没有可用的 ETag，本次只按 Range 续传（完成后仍会校验长度/哈希）" -f $label)
+        # Identity already required a strong tag, so Range is NEVER sent
+        # without If-Match; any gap here fails closed and restarts at zero.
+        $reqEtag = "$metaEtag".Trim()
+        if (-not (Test-DownloadStrongETag -ETag $reqEtag)) {
+          Remove-DownloadArtifacts -Dest $Dest
+          $have = 0L
+          $metaEtag = ''
+          throw '残片缺少强 ETag，放弃续传并从零重新下载'
+        }
+        $sent = $false
+        try { $sent = [bool]$req.Headers.TryAddWithoutValidation('If-Match', $reqEtag) } catch { $sent = $false }
+        if (-not $sent) {
+          Remove-DownloadArtifacts -Dest $Dest
+          $have = 0L
+          $metaEtag = ''
+          throw '无法发送 If-Match 头，放弃续传并从零重新下载'
         }
       }
 
@@ -2463,6 +2620,11 @@ function Save-Download {
         Write-Warning ("{0} 的云端文件已更新（HTTP 412），丢弃旧分片重新下载" -f $label)
         Remove-DownloadArtifacts -Dest $Dest
         $have = 0L
+        # The remote object changed, so a digest learned from the old sidecar
+        # is STALE. The caller's -Sha256 stays authoritative (never cleared);
+        # only a sidecar-only digest is dropped so the NEW bytes are not
+        # checked against the old object's hash.
+        $effectiveSha = $Sha256
         if ($identityRestarts -ge 2) {
           $fatal = $true
           throw '下载内容在多次尝试中持续变化，已放弃（请稍后重试）'
@@ -2481,10 +2643,15 @@ function Save-Download {
         if ($t -gt 0 -and $have -eq $t) {
           $knownTotal = $t
           $skipRead = $true
+          # Keep the validated strong tag in the completed sidecar.
+          $etag = $reqEtag
         } else {
           Write-Warning ("$label 的续传位置无效（HTTP 416），从头重新下载")
           $have = 0L
           Remove-DownloadArtifacts -Dest $Dest
+          # The partial is bogus; an old sidecar digest must not gate the
+          # fresh download. -Sha256 (caller) remains authoritative.
+          $effectiveSha = $Sha256
           throw 'HTTP 416（续传位置无效）'
         }
       } elseif (-not $resp.IsSuccessStatusCode) {
@@ -2529,7 +2696,7 @@ function Save-Download {
         # dropping it would permanently degrade later resumes to Range-only.
         if (-not $etag) { $etag = $reqEtag }
         $sidecarLen = if ($ExpectedBytes -gt 0) { [long]$ExpectedBytes } else { [long]$knownTotal }
-        Write-DownloadSidecar -Path $metaPath -Url $Url -ETag $etag -Length $sidecarLen -Sha256 $Sha256 -Complete $false
+        Write-DownloadSidecar -Path $metaPath -Url $Url -ETag $etag -Length $sidecarLen -Sha256 $effectiveSha -Complete $false
         $stream = $resp.Content.ReadAsStreamAsync().GetAwaiter().GetResult()
       }
 
@@ -2619,6 +2786,19 @@ function Save-Download {
       }
     } catch {
       $errText = Format-DownloadErrorMessage -Exception $_.Exception
+      if (Test-DownloadHandleEofError -Exception $_.Exception) {
+        # ERROR_HANDLE_EOF (1097): the failed handle makes the partial and its
+        # sidecar untrusted. Drop both (and any segments), reset the partial
+        # state, and restart from zero - never resume the old sidecar.
+        Remove-DownloadArtifacts -Dest $Dest
+        $have = 0L
+        $metaEtag = ''
+        $lastHave = -1L
+        $noProgress = 0
+        Write-Warning ("{0} 的下载句柄提前结束（Windows 错误 1097），已丢弃旧残片并从零重试" -f $label)
+        Start-Sleep -Seconds 1
+        continue
+      }
       $isSlow = ($errText -match '传输过慢')
       if ($isSlow) { $slowAborts++ } else { $slowAborts = 0 }
       $diag = & $makeDiag $i
@@ -2657,12 +2837,12 @@ function Save-Download {
     # Content gate. The length can be right and the bytes still wrong (a mixed
     # prefix from another release), so when the Release publishes SHA256SUMS the
     # digest decides - not the length.
-    if ($Sha256) {
+    if ($effectiveSha) {
       Write-Host ("     校验 {0} 的 SHA256…" -f $label)
       $actualSha = Get-FileSha256 -Path $Dest
-      if ($actualSha -ne $Sha256) {
+      if ($actualSha -ne $effectiveSha) {
         $hashFails++
-        Write-Warning ("{0} 的 SHA256 不符（期望 {1}，实际 {2}），删除后重新下载" -f $label, $Sha256, $actualSha)
+        Write-Warning ("{0} 的 SHA256 不符（期望 {1}，实际 {2}），删除后重新下载" -f $label, $effectiveSha, $actualSha)
         Remove-DownloadArtifacts -Dest $Dest
         if ($hashFails -ge 2) {
           $script:ContentSuspect = $true
@@ -2673,7 +2853,7 @@ function Save-Download {
         continue
       }
     }
-    Write-DownloadSidecar -Path $metaPath -Url $Url -ETag $etag -Length $actual -Sha256 $Sha256 -Complete $true
+    Write-DownloadSidecar -Path $metaPath -Url $Url -ETag $etag -Length $actual -Sha256 $effectiveSha -Complete $true
     Write-Host ("     {0}  完成 {1:N0} MiB" -f $label, ($actual / $mb))
     return
   }
@@ -2811,7 +2991,13 @@ function Write-AgentDevboxTerminalProfile {
   # 2026-10-28 after a beta install reused a wiped install dir). Prune only
   # AgentDevbox-owned fragments whose distro is not registered; the file just
   # written is always kept even though an upgrade has not re-imported it yet.
-  try { Remove-StaleAgentDevboxTerminalFragments -KeepDistro $Distro | Out-Null } catch { }
+  try {
+    Remove-StaleAgentDevboxTerminalFragments -KeepDistro $Distro | Out-Null
+  } catch {
+    # The fresh fragment is already on disk; a cleanup failure (file locked,
+    # ACL, ...) must never abort the install or delete that fragment.
+    Write-Warning ("清理旧的 Windows Terminal profile 失败（不影响安装）：{0}" -f $_.Exception.Message)
+  }
   return $path
 }
 
