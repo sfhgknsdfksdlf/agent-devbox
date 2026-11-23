@@ -32,6 +32,14 @@ _paseo_uid() {
   id -u paseo 2>/dev/null
 }
 
+_paseo_gid() {
+  if [ -n "${AGENT_DEVBOX_PASEO_GID:-}" ]; then
+    printf '%s\n' "$AGENT_DEVBOX_PASEO_GID"
+    return 0
+  fi
+  id -g paseo 2>/dev/null
+}
+
 _paseo_node() {
   local bin
   if [ -n "${AGENT_DEVBOX_NODE_BIN:-}" ]; then
@@ -137,6 +145,56 @@ clear_stale_pidfile() {
   return 0
 }
 
+# ensure_owned_dir <path> <label> <fatal|warn>: chown ONLY the directory itself
+# (never recurse the data disk), then re-stat and require the exact numeric
+# owner. `fatal` refuses to start (paseo home); `warn` continues (workspace).
+ensure_owned_dir() {
+  local path="$1" label="$2" severity="$3" want current
+  want="$PASEO_UID:$PASEO_GID"
+  if [ ! -d "$path" ]; then
+    if [ "$severity" = fatal ]; then
+      echo "FATAL: $label $path is missing; refusing to start." >&2
+      return 1
+    fi
+    echo "WARN: $label $path is missing; skipping ownership check." >&2
+    return 0
+  fi
+  if ! current="$("$STAT_BIN" -c '%u:%g' -- "$path")"; then
+    if [ "$severity" = fatal ]; then
+      echo "FATAL: could not read the owner of $label $path; refusing to start." >&2
+      return 1
+    fi
+    echo "WARN: could not read the owner of $label $path; skipping." >&2
+    return 0
+  fi
+  if [ "$current" = "$want" ]; then
+    echo "$label $path is already owned by $want; no change."
+    return 0
+  fi
+  if ! "$CHOWN_BIN" "$want" -- "$path"; then
+    if [ "$severity" = fatal ]; then
+      echo "FATAL: could not chown $label $path to $want; refusing to start." >&2
+      return 1
+    fi
+    echo "WARN: could not chown $label $path to $want; continuing." >&2
+    return 0
+  fi
+  current="unknown"
+  if ! current="$("$STAT_BIN" -c '%u:%g' -- "$path")"; then
+    current="unknown"
+  fi
+  if [ "$current" != "$want" ]; then
+    if [ "$severity" = fatal ]; then
+      echo "FATAL: $label $path is owned by $current, expected $want; refusing to start." >&2
+      return 1
+    fi
+    echo "WARN: $label $path is owned by $current, expected $want; continuing." >&2
+    return 0
+  fi
+  echo "chowned $label $path to $want."
+  return 0
+}
+
 # Sourced by tests: define functions only (no side effects).
 if [ "${BASH_SOURCE[0]}" != "$0" ]; then return 0; fi
 
@@ -160,9 +218,13 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin${PATH:
 GOSU_BIN="${AGENT_DEVBOX_GOSU_BIN:-$(command -v gosu)}" || { echo "FATAL: gosu not found in PATH" >&2; exit 1; }
 ENV_BIN="$(command -v env)"   || { echo "FATAL: env not found in PATH" >&2; exit 1; }
 SEED_BIN="${AGENT_DEVBOX_SEED_BIN:-$(command -v seed-agent-config.sh)}" || { echo "FATAL: seed-agent-config.sh not found in PATH" >&2; exit 1; }
+STAT_BIN="${AGENT_DEVBOX_STAT_BIN:-$(command -v stat)}" || { echo "FATAL: stat not found in PATH" >&2; exit 1; }
+CHOWN_BIN="${AGENT_DEVBOX_CHOWN_BIN:-$(command -v chown)}" || { echo "FATAL: chown not found in PATH" >&2; exit 1; }
+FLOCK_BIN="${AGENT_DEVBOX_FLOCK_BIN:-$(command -v flock)}" || { echo "FATAL: flock not found in PATH" >&2; exit 1; }
 
 PASEO_USER=paseo
-PASEO_HOME_DIR=/home/paseo
+PASEO_HOME_DIR="${AGENT_DEVBOX_PASEO_HOME_DIR:-/home/paseo}"
+WORKSPACE_DIR="${AGENT_DEVBOX_WORKSPACE_DIR:-/workspace}"
 export PASEO_HOME="${AGENT_DEVBOX_PASEO_HOME:-$PASEO_HOME_DIR/.paseo}"
 PASEO_LOCK_DIR="${AGENT_DEVBOX_PASEO_LOCK_DIR:-/run}"
 
@@ -177,14 +239,58 @@ fi
 
 mkdir -p "$PASEO_LOCK_DIR"
 exec 9>"$PASEO_LOCK_DIR/agent-devbox-paseo.lock"
-if ! flock -n 9; then
-  echo "paseo launcher is already running; nothing to do."
-  exit 0
+# util-linux exits 75 on a held lock (`-E 75`); any other rc is a real error.
+if "$FLOCK_BIN" -n -E 75 9; then
+  :
+else
+  rc=$?
+  if [ "$rc" -eq 75 ]; then
+    echo "paseo launcher is already running; nothing to do."
+    exit 0
+  fi
+  echo "FATAL: could not acquire the paseo launcher lock (rc=$rc); refusing to start." >&2
+  exit 1
 fi
 
-# Fix ownership of the top-level homes only (never recurse the whole data disk).
-chown "$PASEO_USER:$PASEO_USER" "$PASEO_HOME_DIR" 2>/dev/null || true
-if [ -d /workspace ]; then chown "$PASEO_USER:$PASEO_USER" /workspace 2>/dev/null || true; fi
+PASEO_UID="$(_paseo_uid || true)"
+PASEO_GID="$(_paseo_gid || true)"
+if [ -z "$PASEO_UID" ] || [ -z "$PASEO_GID" ]; then
+  echo "FATAL: could not resolve the paseo uid/gid; refusing to start." >&2
+  exit 1
+fi
+ensure_owned_dir "$PASEO_HOME_DIR" "paseo home" fatal || exit 1
+ensure_owned_dir "$WORKSPACE_DIR" "workspace" warn
+
+# Trust /workspace for the service user's git in BOTH modes (Docker + WSL).
+# Always run as paseo with paseo's own HOME so root's global git config is never
+# touched, read the existing entries first, and add only when the exact line is
+# missing (never --replace-all / never drop other entries). Best-effort: a
+# missing git or any git failure only warns and never blocks startup.
+GIT_BIN="${AGENT_DEVBOX_GIT_BIN:-$(command -v git 2>/dev/null || true)}"
+GIT_SAFE_DIR=/workspace
+if [ -z "$GIT_BIN" ]; then
+  echo "WARN: git not found; skipping $GIT_SAFE_DIR safe.directory setup." >&2
+else
+  git_safe_dirs=""
+  git_rc=0
+  git_safe_dirs="$("$GOSU_BIN" "$PASEO_USER" "$ENV_BIN" HOME="$PASEO_HOME_DIR" \
+    "$GIT_BIN" config --global --get-all safe.directory 2>/dev/null)" || git_rc=$?
+  if [ "$git_rc" -ne 0 ]; then
+    # git exits 1 when the key is unset; anything else is a real read failure.
+    if [ "$git_rc" -ne 1 ]; then
+      echo "WARN: could not read git safe.directory (git rc=$git_rc); continuing." >&2
+    fi
+    git_safe_dirs=""
+  fi
+  if grep -Fxq -- "$GIT_SAFE_DIR" <<< "$git_safe_dirs"; then
+    echo "$GIT_SAFE_DIR is already a trusted git directory; no change."
+  elif ! "$GOSU_BIN" "$PASEO_USER" "$ENV_BIN" HOME="$PASEO_HOME_DIR" \
+      "$GIT_BIN" config --global --add safe.directory "$GIT_SAFE_DIR"; then
+    echo "WARN: could not add $GIT_SAFE_DIR to git safe.directory; continuing." >&2
+  else
+    echo "added $GIT_SAFE_DIR to git safe.directory for $PASEO_USER."
+  fi
+fi
 
 # Seed missing config as paseo.
 "$GOSU_BIN" "$PASEO_USER" "$ENV_BIN" HOME="$PASEO_HOME_DIR" "$SEED_BIN"

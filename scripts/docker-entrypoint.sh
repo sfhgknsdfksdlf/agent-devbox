@@ -13,9 +13,6 @@ if [ "${IS_DOCKER:-false}" != "true" ]; then
   exec /usr/local/bin/wsl-boot.sh "$@"
 fi
 
-chown paseo:paseo /home/paseo /workspace 2>/dev/null || true
-if [ -d /workspace ]; then
-  gosu paseo git config --global --add safe.directory /workspace 2>/dev/null || true
-fi
-
+# Ownership (B3) and the git safe.directory trust (B4) are both handled inside
+# the shared paseo-boot.sh; this entrypoint only dispatches.
 exec /usr/local/bin/paseo-boot.sh

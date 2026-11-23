@@ -43,7 +43,10 @@ export PATH
 # shellcheck disable=SC2016
 PROBE_SCRIPT='if [ -x "$HOME/.opencode/bin/opencode" ]; then printf "%s\n" "$HOME/.opencode/bin/opencode"; fi'
 CLI_LIST="${AGENT_DEVBOX_DESKTOP_CLIS:-opencode claude codex gemini qwen crush copilot pi dsh grok zcode aider}"
-VERSION_TIMEOUT="${AGENT_DEVBOX_VERSION_TIMEOUT:-10}"
+VERSION_TIMEOUT="${AGENT_DEVBOX_VERSION_TIMEOUT-10}"
+# `timeout` is optional in a minimal WSL rootfs; capture() refuses to run a
+# target without it instead of falling back to an unbounded execution.
+TIMEOUT_BIN="${AGENT_DEVBOX_TIMEOUT_BIN:-$(command -v timeout 2>/dev/null || true)}"
 
 HOMES=()
 ALSO_HOMES=()
@@ -73,11 +76,46 @@ usage() {
 
 环境变量:
   AGENT_DEVBOX_DESKTOP_CLIS        要检查的 CLI 名称列表（空格分隔）
-  AGENT_DEVBOX_VERSION_TIMEOUT     --version 的超时秒数（默认 10）
+  AGENT_DEVBOX_VERSION_TIMEOUT     --version 的超时秒数（整数 1..60，默认 10）
   AGENT_DEVBOX_DESKTOP_CURRENT_HOME 仅供测试：覆盖当前账户 HOME（生产不要设置）
 
 退出码: 0 = 关键项通过 · 1 = 关键项失败/未完整验证 · 2 = 用法错误
 EOF
+}
+
+timeout_available() {
+  [ -n "$TIMEOUT_BIN" ] && [ -x "$TIMEOUT_BIN" ]
+}
+
+# validate_inputs(): reject invalid env input with rc 2 BEFORE any probe runs.
+validate_inputs() {
+  local name
+  local -a names
+
+  case "$VERSION_TIMEOUT" in
+    ''|*[!0-9]*|0*)
+      printf '错误: AGENT_DEVBOX_VERSION_TIMEOUT 必须是 1..60 的整数（收到: %q）\n' "$VERSION_TIMEOUT" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+  if [ "${#VERSION_TIMEOUT}" -gt 2 ] || [ "$VERSION_TIMEOUT" -gt 60 ]; then
+    printf '错误: AGENT_DEVBOX_VERSION_TIMEOUT 超出范围 1..60（收到: %s）\n' "$VERSION_TIMEOUT" >&2
+    usage >&2
+    exit 2
+  fi
+
+  read -r -a names <<< "$CLI_LIST"
+  for name in "${names[@]}"; do
+    if [ -z "$name" ]; then
+      continue
+    fi
+    if [[ ! "$name" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ ]]; then
+      printf '错误: AGENT_DEVBOX_DESKTOP_CLIS 中的 CLI 名称不合法: %q（只允许字母数字开头，后接字母数字 . _ + -）\n' "$name" >&2
+      usage >&2
+      exit 2
+    fi
+  done
 }
 
 # canonical_path <path>: realpath -m, then readlink -f, then the raw value.
@@ -141,14 +179,13 @@ resolve_current_home() {
   canonical_path "$home"
 }
 
-# capture <cmd> [args...]: run with a timeout when available, stdout only.
-# `timeout` is an optional tool, so guard it instead of assuming coreutils.
+# capture <cmd> [args...]: run under the validated timeout, stdout only.
+# Without an executable timeout it refuses to invoke the target (rc 127).
 capture() {
-  if command -v timeout >/dev/null 2>&1; then
-    timeout "$VERSION_TIMEOUT" "$@" 2>/dev/null
-  else
-    "$@" 2>/dev/null
+  if ! timeout_available; then
+    return 127
   fi
+  "$TIMEOUT_BIN" "$VERSION_TIMEOUT" "$@" 2>/dev/null
 }
 
 # probe_home <home> <expected-version>: the desktop app's exact probe + version.
@@ -160,18 +197,24 @@ probe_home() {
   expected="$2"
 
   if [ "$home_dir" != "$CURRENT_HOME" ]; then
-    printf '  ✗ 拒绝在非当前账户 HOME 执行探测: %s\n' "$home_dir"
+    printf '  ✗ 拒绝在非当前账户 HOME 执行探测: %q\n' "$home_dir"
     return 1
   fi
 
-  printf '\n[1] 当前账户 HOME 桌面版探测  HOME=%s\n' "$home_dir"
+  printf '\n[1] 当前账户 HOME 桌面版探测  HOME=%q\n' "$home_dir"
   printf "  探测命令（桌面版只用这一条，不查 PATH）:\n"
   printf "    wsl.exe -d <发行版> -- sh -lc '%s'\n" "$PROBE_SCRIPT"
+
+  if ! timeout_available; then
+    printf '  ✗ 缺少可执行的 timeout（%q）；拒绝无上限执行桌面版探测\n' "${TIMEOUT_BIN:-}"
+    version_fail=1
+    return 1
+  fi
 
   # Execute the probe verbatim, exactly as the app does (HOME overridden).
   out="$(capture env HOME="$home_dir" sh -lc "$PROBE_SCRIPT")"
   if [ -z "$out" ]; then
-    printf '  ✗ 未解析到 CLI: %s（桌面版会认为“未安装”）\n' "$home_dir/.opencode/bin/opencode"
+    printf '  ✗ 未解析到 CLI: %q（桌面版会认为“未安装”）\n' "$home_dir/.opencode/bin/opencode"
     probe_missing=1
     if [ -z "$missing_home" ]; then
       missing_home="$home_dir"
@@ -180,14 +223,14 @@ probe_home() {
   fi
 
   path="${out%%$'\n'*}"
-  printf '  ✓ 解析到: %s\n' "$path"
+  printf '  ✓ 解析到: %q\n' "$path"
 
   # Capture, then cut the FIRST line in-shell. Never pipe into `head`: under
   # pipefail that can die on SIGPIPE when the CLI writes more than one line.
   ver="$(capture env HOME="$home_dir" "$path" --version)"
   ver_status=$?
   if [ "$ver_status" -ne 0 ]; then
-    printf '  ✗ 版本命令失败（退出码 %s）: %s --version\n' "$ver_status" "$path"
+    printf '  ✗ 版本命令失败（退出码 %s）: %q --version\n' "$ver_status" "$path"
     version_fail=1
     return 1
   fi
@@ -241,13 +284,16 @@ check_hard_deps() {
 # Absent names are recorded for the "installed somewhere invisible" section.
 check_path_clis() {
   local -a clis
-  local name path ver silent_opencode
-  silent_opencode=0
+  local name path ver ver_status detail critical
+  critical=0
 
   printf '\n[3] 已知 CLI（按 PATH 解析）\n'
   read -r -a clis <<< "$CLI_LIST"
   for name in "${clis[@]}"; do
-    path="$(command -v "$name" 2>/dev/null)"
+    if [ -z "$name" ]; then
+      continue
+    fi
+    path="$(command -v -- "$name" 2>/dev/null)"
     if [ -z "$path" ]; then
       if [ "$name" = "opencode" ]; then
         printf '  %-8s 未安装（core 也应提供，缺失说明 PATH 或安装异常）\n' "$name"
@@ -258,18 +304,48 @@ check_path_clis() {
       continue
     fi
 
+    case "$path" in
+      /*) ;;
+      *)
+        if [ "$name" = "opencode" ]; then
+          printf '  ✗ %-8s 解析结果不是绝对路径（%q），拒绝执行\n' "$name" "$path"
+          critical=1
+          version_fail=1
+        else
+          printf '  %-8s %q  （不是绝对路径，未执行）\n' "$name" "$path"
+          printf '  警告: %q 不是绝对的外部程序（内置/别名/相对路径），不会执行 --version\n' "$path"
+          warn=1
+        fi
+        continue
+        ;;
+    esac
+
     ver="$(capture "$path" --version)"
+    ver_status=$?
     ver="${ver%%$'\n'*}"
-    if [ -z "$ver" ]; then
-      ver="(无输出)"
-      if [ "$name" = "opencode" ]; then
-        silent_opencode=1
+    if [ "$ver_status" -ne 0 ] || [ -z "$ver" ]; then
+      if ! timeout_available; then
+        detail="timeout 不可用"
+      elif [ "$ver_status" -ne 0 ]; then
+        detail="退出码 $ver_status"
+      else
+        detail="无输出"
+        printf '  %-8s %q  (无输出)\n' "$name" "$path"
       fi
+      if [ "$name" = "opencode" ]; then
+        printf '  ✗ %s 版本命令失败（%s）\n' "$name" "$detail"
+        critical=1
+        version_fail=1
+      else
+        printf '  警告: %q 已存在但无法取得可用版本（%s）\n' "$path" "$detail"
+        warn=1
+      fi
+      continue
     fi
-    printf '  %-8s %s  %s\n' "$name" "$path" "$ver"
+    printf '  %-8s %q  %s\n' "$name" "$path" "$ver"
   done
 
-  if [ "$silent_opencode" -ne 0 ]; then
+  if [ "$critical" -ne 0 ]; then
     return 1
   fi
   return 0
@@ -289,8 +365,8 @@ check_misplaced() {
         if [ -x "$found" ]; then
           any=1
           warn=1
-          printf '  警告: %s 不在 PATH 上，PATH 消费者（Paseo 守护进程 / 登录 shell）看不到它\n' "$found"
-          printf '    修复提示（仅打印，不会执行）: ln -sfn %s /usr/local/bin/%s\n' "$found" "$name"
+          printf '  警告: %q 不在 PATH 上，PATH 消费者（Paseo 守护进程 / 登录 shell）看不到它\n' "$found"
+          printf '    修复提示（仅打印，不会执行）: ln -sfn -- %q %q\n' "$found" "/usr/local/bin/$name"
         fi
       done
     done
@@ -315,9 +391,9 @@ check_existence_homes() {
   for home_dir in "${EXISTENCE_HOMES[@]}"; do
     path="$home_dir/.opencode/bin/opencode"
     if [ -x "$path" ]; then
-      printf '  存在/可执行: %s（仅存在性，未执行）\n' "$path"
+      printf '  存在/可执行: %q（仅存在性，未执行）\n' "$path"
     else
-      printf '  缺失: %s（不存在或不可执行；仅存在性检查，未执行）\n' "$path"
+      printf '  缺失: %q（不存在或不可执行；仅存在性检查，未执行）\n' "$path"
     fi
   done
 }
@@ -327,6 +403,9 @@ main() {
   local -a probe_homes=()
   local -a foreign_homes=()
   local limited=0
+  local hint_home
+
+  validate_inputs
 
   while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -359,7 +438,7 @@ main() {
         exit 0
         ;;
       *)
-        printf '错误: 未知参数 %s\n' "$1" >&2
+        printf '错误: 未知参数 %q\n' "$1" >&2
         usage >&2
         exit 2
         ;;
@@ -390,11 +469,11 @@ main() {
 
   printf '== agent-devbox 桌面版 CLI 自查 ==\n'
   printf '身份: %s  EUID=%s\n' "$(id -un 2>/dev/null || printf '%s' "$EUID")" "$EUID"
-  printf '当前账户 HOME: %s（getent/realpath）\n' "$CURRENT_HOME"
+  printf '当前账户 HOME: %q（getent/realpath）\n' "$CURRENT_HOME"
 
   if [ "${#probe_homes[@]}" -eq 0 ]; then
     printf '\n[1] 当前账户 HOME 桌面版探测\n'
-    printf '  （当前账户 HOME=%s 未被 --home 请求，跳过探测；其他 --home 只做存在性检查）\n' "$CURRENT_HOME"
+    printf '  （当前账户 HOME=%q 未被 --home 请求，跳过探测；其他 --home 只做存在性检查）\n' "$CURRENT_HOME"
   else
     for home_dir in "${probe_homes[@]}"; do
       if ! probe_home "$home_dir" "$EXPECTED_VERSION"; then
@@ -416,9 +495,9 @@ main() {
 
   printf '\n[6] 结论\n'
   if [ "$fail" -eq 0 ] && [ "$limited" -ne 0 ]; then
-    printf '  结论: 未完整验证（当前账户 HOME=%s 未被 --home 请求）\n' "$CURRENT_HOME"
+    printf '  结论: 未完整验证（当前账户 HOME=%q 未被 --home 请求）\n' "$CURRENT_HOME"
     printf '  只对请求的其他账户目录做了存在性检查（未执行其中任何 CLI），不能证明桌面版可用。\n'
-    printf '  需要完整结论: 请加 --home %s\n' "$CURRENT_HOME"
+    printf '  需要完整结论: 请加 --home %q\n' "$CURRENT_HOME"
     exit 1
   fi
   if [ "$fail" -eq 0 ]; then
@@ -433,8 +512,9 @@ main() {
   printf '  结论: FAIL\n'
   printf '  修复（手动，脚本不会执行）:\n'
   if [ "$probe_missing" -ne 0 ]; then
-    printf '    - 探测路径缺失（%s）：\n' "${missing_home:-$CURRENT_HOME}"
-    printf '      mkdir -p "%s/.opencode/bin" && ln -sfn /usr/local/bin/opencode "%s/.opencode/bin/opencode"\n' "${missing_home:-$CURRENT_HOME}" "${missing_home:-$CURRENT_HOME}"
+    hint_home="${missing_home:-$CURRENT_HOME}"
+    printf '    - 探测路径缺失（%q）：\n' "$hint_home"
+    printf '      mkdir -p -- %q && ln -sfn -- /usr/local/bin/opencode %q\n' "$hint_home/.opencode/bin" "$hint_home/.opencode/bin/opencode"
   fi
   if [ "$version_fail" -ne 0 ]; then
     printf '    - 版本不一致/无法取版本：把桌面版升级到与 CLI 相同版本，或用桌面版的「更新 OpenCode」让它自己装一份\n'
@@ -443,7 +523,7 @@ main() {
     printf '    - 缺少运行依赖：发行版内必须有 bash 与 curl\n'
   fi
   if [ "$limited" -ne 0 ]; then
-    printf '  注意: 当前账户 HOME=%s 未被 --home 请求，本次未做桌面版探测。\n' "$CURRENT_HOME"
+    printf '  注意: 当前账户 HOME=%q 未被 --home 请求，本次未做桌面版探测。\n' "$CURRENT_HOME"
   fi
   printf '  如果刚添加/重装过发行版仍不生效: 完全退出桌面版（含托盘）后重开，再添加发行版\n'
   exit 1

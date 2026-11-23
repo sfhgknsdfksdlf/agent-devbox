@@ -17,7 +17,7 @@
 | `ghcr.io/sfhgknsdfksdlf/agent-devbox` | **默认版** —— 上面的全部，**外加** Claude Code、Codex、Gemini、Pi、DeepSeek Harness、Grok Build、zcode、Aider、Crush、Qwen Code、GitHub Copilot CLI |
 | `ghcr.io/sfhgknsdfksdlf/agent-devbox-core` | 精简版（不含额外的 AI 助手） |
 
-标签：`latest`、稳定版日期标签 `YYYYMMDD.HHMM`（例如 `20261017.2205`），以及推送构建的 `beta-YYYYMMDD.HHMM` / `:beta` 别名。
+标签：`latest`（正式 Release）、候选镜像标签 `<YYYYMMDD.HHMM>-<run_id>.<attempt>`（例如 `20261017.2205-1234567890.1`）、稳定版 Release `build-<YYYYMMDD.HHMM>-<run_id>.<attempt>`，以及推送构建的 `beta-<YYYYMMDD.HHMM>-<run_id>.<attempt>` / `:beta` 别名。旧的无后缀日期标签（`YYYYMMDD.HHMM` / `build-YYYYMMDD.HHMM`）仍可安装。
 
 ## 快速开始 —— Docker
 
@@ -209,7 +209,7 @@ fragment（beta 是 `agent-devbox-beta.json` / `agent-devbox-core-beta.json`）�
 写配置，因此另一个通道的磁盘 UUID / 密码不会被写进本通道的 `/etc/agent-devbox.conf`；失败时
 `data.vhdx` 保留，方便重试或换目录。
 
-> beta **通道**不是 beta **发布**：上文的 `beta-<YYYYMMDD.HHMM>` / `:beta` 是 Release / 镜像标签，
+> beta **通道**不是 beta **发布**：上文的 `beta-<YYYYMMDD.HHMM>-<run_id>.<attempt>` / `:beta` 是 Release / 镜像标签，
 > `-ReleaseTag b|beta` 选的是最新的 `beta-*` 预发布（rootfs）；`-Ref` 选的才是代码分支。
 > beta 通道用正式 rootfs 或 beta rootfs 都行，**前提是该 rootfs 里的 `wsl-boot.sh` 支持通道标签
 > （`DATA_LABEL`）**；更旧的镜像会被直接拒绝：安装器注销刚导入的发行版、保留 `data.vhdx`，并提示改用
@@ -227,8 +227,9 @@ fragment（beta 是 `agent-devbox-beta.json` / `agent-devbox-core-beta.json`）�
 - `/mnt/<DATA_MNTNAME>/.paseo-password`：**升级来源**，存在数据盘上（stable `devbox-data` /
   beta `devbox-data-beta`），跨升级保留。
 
-升级只从数据盘读密码；读不到时会**明确警告并当作新密码处理（旧密码失效）**，不会去读旧系统盘的
-`/etc/agent-devbox.conf`，也没有旧 conf 迁移。每个通道的密码各自独立，互不沿用。安装后这样取
+升级只从数据盘读密码；读不到时会**明确警告并当作新密码处理（旧密码失效）**，读密码时不会去读
+旧系统盘的 `/etc/agent-devbox.conf`（旧 conf 里的 `DATA_UUID` 只作设备身份提示，绝不作为密码来源），
+也没有旧 conf 迁移。每个通道的密码各自独立，互不沿用。安装后这样取
 （读的是运行期副本）：
 
 ```powershell
@@ -368,21 +369,28 @@ profile 缓存在进程里，所以注销/重装/换通道后仍可能命中旧�
 
 **禁止在本地构建 / 编译** —— 又慢，又会在本机产生大量垃圾。镜像和所有产物**只在 GitHub Actions 里生成**：
 
-- 推送到**任意分支**（`automation/versions` 状态分支除外）都会自动构建；定时（每周日）
-  和手动触发也会构建；
+- 推送到 `main` 或其他分支时，只有改动命中 `on.push.paths` 才会构建：`Dockerfile` /
+  `Dockerfile.agents` / `Dockerfile.wsl`、`.dockerignore`、`scripts/**`、`config/**`、
+  `windows/**`、`1panel/**`、`versions.json`、`.github/scripts/version-state.sh`、
+  `.github/workflows/build.yml`、`.github/workflows/keepalive.yml`；`automation/versions`
+  状态分支被忽略。定时（每周日）和手动
+  触发走同一套流程（定时在跟踪版本都没变时会跳过，见下）；
 - 每次构建都同时产出 **amd64 + arm64**，再合并成一个多架构镜像
   （用 GitHub 免费的原生 ARM 机器，不做模拟）；
 - **WSL rootfs 分片现在也同时产出 amd64 + arm64**：两个架构各自在**原生 runner** 上导出
   （amd64 用 `ubuntu-latest`、arm64 用 `ubuntu-24.04-arm`），上传为临时 artifact，再由发布
   任务下载两套分片、校验分片编号连续，写一份**覆盖两架构的 `SHA256SUMS`**，最后创建 Release；
-- 定时构建时，如果所有跟踪的上游版本都没变，会自动跳过
-  （靠 `automation/versions` 分支上的状态做比对；main 里的 `versions.json`
-  只作为首次 bootstrap 的 seed）；
-- **只有 定时 / 手动 才会把镜像推为 `latest` 并创建 Release**；推送触发的构建只产出**测试标签**，
-  不会覆盖 `latest`：
-  - main 分支 → 镜像标签 `<YYYYMMDD.HHMM>`，预发布为 `beta-<YYYYMMDD.HHMM>`
-  - 其他分支 → 镜像标签和预发布都是 `beta-<YYYYMMDD.HHMM>`
-  - 每次 push 还会把 **`:beta` 镜像别名**移到这次最新的推送构建上
+- 版本状态 `versions.json` 是 v2：`floating`（npm/PyPI 跟踪）、`fixed`（固定工具 / 镜像摘要）、
+  `tools` + `packages.dpkg`（每架构实际安装版本）、`last_built`。定时构建用上游 `floating` 对比
+  已安装的 `tools`；缺键、查询失败或状态超过 28 天都会 fail-open 重建，没变化才跳过。状态在
+  `automation/versions` 分支，main 里的 `versions.json` 只作为首次 bootstrap 的 seed；
+- **只有 定时 / 手动 才会把镜像推为 `latest` 并创建正式 Release**；推送触发的构建只产出**测试标签**，
+  不会覆盖 `latest`。每次运行都用 `<YYYYMMDD.HHMM>-<run_id>.<attempt>` 作候选镜像标签，后缀不截断：
+  - 定时 / 手动 → 镜像 `<YYYYMMDD.HHMM>-<run_id>.<attempt>`，正式 Release
+    `build-<YYYYMMDD.HHMM>-<run_id>.<attempt>`，通过后晋级 `latest`
+  - main 分支 → 镜像 `<YYYYMMDD.HHMM>-<run_id>.<attempt>`，预发布
+    `beta-<YYYYMMDD.HHMM>-<run_id>.<attempt>`，移动 `:beta`
+  - 其他分支 → 镜像和预发布都是 `beta-<YYYYMMDD.HHMM>-<run_id>.<attempt>`，移动 `:beta`
   - 旧的 `beta-*` 预发布会被**清理**，只保留最新一个（每个约 4.7GB）
 - 先给候选版本做冒烟测试，通过后才更新 `latest`。
 
@@ -390,14 +398,17 @@ profile 缓存在进程里，所以注销/重装/换通道后仍可能命中旧�
 > ```bash
 > # 最新的推送构建（多架构；`:beta` 始终指向最新一次 push）
 > docker pull ghcr.io/sfhgknsdfksdlf/agent-devbox:beta
-> # 某次具体构建（<标签> 换成该次运行页面显示的 YYYYMMDD.HHMM 或 beta-YYYYMMDD.HHMM）
+> # 某次具体构建（<标签> 换成该次运行页面显示的 <YYYYMMDD.HHMM>-<run_id>.<attempt>
+> # 或 beta-<YYYYMMDD.HHMM>-<run_id>.<attempt>）
 > docker pull ghcr.io/sfhgknsdfksdlf/agent-devbox:<标签>
 > ```
 > 每次 push 还会把 **WSL rootfs 分片 + 1Panel 包**传到**日期化的预发布**（Releases 里
-> tag 为 `beta-<YYYYMMDD.HHMM>` 的那个；只保留最新一个，旧的会被自动清理）。用 WSL 测这个版本：
+> tag 为 `beta-<YYYYMMDD.HHMM>-<run_id>.<attempt>` 的那个；只保留最新一个，旧的会被自动清理）。用 WSL 测这个版本：
 > **运行上面那条 `irm` 一行命令，安装脚本会问要装哪个** —— 回车＝正式版（`latest`），输入 `b`／`beta`
 > ＝最新的 `beta-*` 预发布（脚本经 GitHub API 解析），或直接输入某个版本号
-> （`build-YYYYMMDD.HHMM`／`beta-YYYYMMDD.HHMM`，裸日期如 `20261018.0731` 会自动补 `build-` 前缀）。
+> （`build-<YYYYMMDD.HHMM>-<run_id>.<attempt>`／`beta-<YYYYMMDD.HHMM>-<run_id>.<attempt>`；
+> 裸日期如 `20261018.0731` 仍会补成旧式 `build-20261018.0731`，显式旧/新 tag 都按原样精确查询，
+> 后缀不会被截断）。
 > **已装过时，交互式运行会问一行：回车 = 覆盖升级，`n` = 取消** —— 换系统盘，但数据盘
 > （`/home`、`/root`、`/workspace`）和 **paseo 密码都保留**（升级来源是数据盘上的
 > `/mnt/<DATA_MNTNAME>/.paseo-password`：正式通道 `devbox-data`，beta 通道 `devbox-data-beta`；

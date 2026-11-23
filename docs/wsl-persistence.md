@@ -56,7 +56,7 @@ VM lives. Split of responsibility:
 
 | Who | Does |
 |---|---|
-| Windows installer (`irm .../windows/install.ps1 \| iex` → `install-agent-devbox.ps1`) | create + attach `data.vhdx`, initialize it (only when brand new; ext4 label `devbox-data` for stable / `devbox-data-beta` for beta), write `/etc/agent-devbox.conf` (6 keys), resolve the data-disk UUID by the channel's label before falling back to the old conf UUID (logs a swap, e.g. a copied same-channel variant disk), attach the disk itself and unregister legacy `agent-devbox*-mount-datadisk` tasks (no task is registered), copy the pure-batch `mount-datadisk.cmd` / `unmount-datadisk.cmd` helpers into the install dir |
+| Windows installer (`irm .../windows/install.ps1 \| iex` → `install-agent-devbox.ps1`) | create + attach `data.vhdx`, initialize it (only when brand new; ext4 label `devbox-data` for stable / `devbox-data-beta` for beta), write `/etc/agent-devbox.conf` (6 keys), resolve the data-disk UUID by the channel's label before falling back to the old conf `DATA_UUID` (an identity hint only, never a password source; logs a swap, e.g. a copied same-channel variant disk), attach the disk itself and unregister legacy `agent-devbox*-mount-datadisk` tasks (no task is registered), copy the pure-batch `mount-datadisk.cmd` / `unmount-datadisk.cmd` helpers into the install dir |
 | Image boot (`wsl-boot.sh`) | attach the VHDX itself when the device is absent (one bounded `wsl.exe --mount --vhd --bare`), locate the device by UUID (`blkid -t UUID=`) then by the channel's label (`devbox-data` / `devbox-data-beta`), fail closed on a multi-match, `mount -t ext4` at `/mnt/<DATA_MNTNAME>`, **verify** the disk, bind `/home` `/root` `/workspace`, start the daemon |
 | Interactive session (`/etc/profile.d` hook) | on the first interactive root login, re-mount the data disk read-write inside the terminal's own mount namespace and bind `/home` `/root` `/workspace`; idempotent (a second terminal makes no mount calls). It **never** attaches, unmounts, formats, or calls any Windows interop; when the disk is missing it only warns and leaves the login shell usable |
 
@@ -272,7 +272,8 @@ installer's directory ownership valve refuses to put one channel over the other.
    `unmount-datadisk.cmd` to detach the extra disk, then reopen the distro. There
    is no "pick the first device" fallback.
 5. The installer resolves the data-disk UUID by the channel's label **before**
-   falling back to the old conf UUID, and logs
+   falling back to the old conf `DATA_UUID` (an identity hint only, never a
+   password source), and logs
    `数据盘 UUID 已变化（<old> -> <new>）：按标签 '<label>' 识别，可能是另一个变体的数据盘。`
    when it swaps — so an upgrade with a copied disk reads the password from the
    right disk.

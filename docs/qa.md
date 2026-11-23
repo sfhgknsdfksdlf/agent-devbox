@@ -2,16 +2,27 @@
 
 ## Versions & update policy
 
-| Thing | Policy |
-|---|---|
-| OpenCode | **latest V1** via `opencode-ai@^1` (npm resolves the max 1.x). V2 (`@opencode/cli`) is a *separate package* and is **never installed** (it would clobber the `opencode` bin). |
-| omo | `oh-my-openagent@latest` (plugin entry `"oh-my-openagent@latest"`). |
-| paseo | `@getpaseo/cli` latest. |
-| wrangler | latest 4.x. |
-| Fixed | Playwright, Go (pinned ARGs). |
+`versions.json` is schema v2 with four parts:
 
-A rebuild picks up new versions; `versions.json` + the CI diff-gate record what
-was resolved and skip a scheduled build when nothing upstream changed.
+| Part | Contents |
+|---|---|
+| `floating` | npm/PyPI packages the scheduled diff-gate tracks: OpenCode V1 (`opencode-ai@^1`; V2 `@opencode/cli` is a separate package and is never installed), omo, paseo, wrangler, create-cloudflare, the extra agent CLIs, and `aider-chat` from PyPI. |
+| `fixed` | Pinned tool/digest metadata: the Node base and core image OCI digests, Playwright, Go, uv, marksman, PowerShell. |
+| `tools` + `packages.dpkg` | The actual installed versions per architecture, written from each build/export artifact. |
+| `last_built` | When the recorded state was last refreshed. |
+
+The scheduled diff-gate compares upstream `floating` versions with the installed
+`tools` recorded in the state. It fails open (rebuilds) on a missing key, a query
+error, or a state older than 28 days; the publish job only merges the per-arch
+rootfs inventories and never queries npm/PyPI.
+
+Pins are not just Playwright and Go: `bump-pinned` updates the Playwright and Go
+build ARGs, while uv, marksman, PowerShell and the Node/core OCI digests are
+review-pinned. Not every tool floats.
+
+A rebuild picks up new floating versions. The state lives on `automation/versions`;
+main's `versions.json` is only the bootstrap seed. A scheduled build is skipped
+when nothing tracked changed.
 
 ## "Will frequent auto-builds get me banned?"
 
@@ -169,8 +180,8 @@ irm https://raw.githubusercontent.com/sfhgknsdfksdlf/agent-devbox/main/windows/i
 
 ## 为什么断点续传必须绑定「下载身份」（以及为什么不用 If-Range）
 
-真机事故：上一次安装（`beta-20261018.1958`）在 `part-00` 留下 9 MiB 残片；下一次安装
-（`beta-20261019.1512`）分片文件名相同，于是「旧 tag 的前 9 MiB + 新 tag 的其余字节」拼成一个
+真机事故：上一次安装（`beta-20261018.1958`，当时还是无后缀的日期标签）在 `part-00` 留下 9 MiB 残片；
+下一次安装（`beta-20261019.1512`）分片文件名相同，于是「旧 tag 的前 9 MiB + 新 tag 的其余字节」拼成一个
 **长度完全正确、内容却混合**的文件。三级导入因此全败：Tier 1 / Tier 2 返回 `-1`，Tier 3 的
 `zstd -d` 退出码 1；而旧代码把 `wsl.exe` / `zstd.exe` 的输出 `| Out-Null` 了，控制台只剩
 「zstd 解压失败（1）」。
@@ -268,11 +279,12 @@ paseo 密码都保留，`uname -m` 仍是 `aarch64`。
 保留，安装器在 `[7/10]` 按 UUID 把它挂载起来，先读这个文件；有就直接沿用，没有才询问/生成，生成后
 再写回数据盘。
 
-**不再读旧系统盘的 conf**（2026-10-21 起）：迁移窗口已过（改动之前的安装都已升级过，数据盘上
+**不再为密码去旧系统盘翻 conf**（2026-10-21 起）：迁移窗口已过（改动之前的安装都已升级过，数据盘上
 都有 `.paseo-password`）。删掉这一步是为了不再为 `cat` 一个文件把旧发行版整机拉起——`[boot]`
 会顺带挂载数据盘并启动 paseo，于是升级时多一次「刚起来又被 terminate」的无谓启停。因此也
-**不承诺从旧 `/etc/agent-devbox.conf` 迁移**：升级若读不到数据盘密码，安装器会明确警告「本次会按
-新密码处理（旧密码将失效）」，绝不静默换密码，也不会回退去读旧 conf。
+**不承诺从旧 `/etc/agent-devbox.conf` 迁移密码**：升级若读不到数据盘密码，安装器会明确警告「本次会按
+新密码处理（旧密码将失效）」，绝不静默换密码，也不会回退去读旧 conf 取密码（旧 conf 的
+`DATA_UUID` 只作设备身份提示，绝不是密码来源）。
 
 同一个思路也去掉了「是否重装 `[Y/n]`」：升级仍是默认动作，但只有在**交互式控制台**里且未指定
 `-Yes` / `-KeepExisting` 时才会问一行——**回车 = 覆盖升级**，`n` = 取消（不下载、不注销、不做
@@ -332,7 +344,8 @@ sh -lc 'if [ -x "$HOME/.opencode/bin/opencode" ]; then printf "%s\n" "$HOME/.ope
 - 仍然**不装 V2**（`@opencode/cli` 会抢 `opencode` 这个 bin），也不需要桌面版再跑它自带的安装器。
 
 实测（真机数据盘 + 桌面版同样的命令）：链接建好后探针输出
-`/root/.opencode/bin/opencode`；`opencode --version` 第一行 `1.19.3`，与桌面版 `1.19.3` 相同；
+`/root/.opencode/bin/opencode`；`opencode --version` 第一行 `1.19.3`，与当次核查的桌面版 `1.19.3` 相同
+（`1.19.3` 只是核查时的版本，以你实际安装的桌面版为准）；
 用完全相同的参数起 sidecar，`/api/health` 返回 **200**（不带认证 401）。探测、版本校验、
 sidecar 启动三关都过。
 

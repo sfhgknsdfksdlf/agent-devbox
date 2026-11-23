@@ -112,8 +112,10 @@ make_fake_launcher_env() {
   FAKE_BIN="$BATS_TEST_TMPDIR/bin"
   FAKE_LOG="$BATS_TEST_TMPDIR/fake-log"
   FAKE_HOME="$BATS_TEST_TMPDIR/fake-home"
-  rm -rf "$FAKE_BIN" "$FAKE_LOG" "$FAKE_HOME"
-  mkdir -p "$FAKE_BIN" "$FAKE_LOG" "$FAKE_HOME/.paseo"
+  FAKE_WORKSPACE="$BATS_TEST_TMPDIR/fake-workspace"
+  FAKE_GIT_CONFIG="$BATS_TEST_TMPDIR/gitconfig"
+  rm -rf "$FAKE_BIN" "$FAKE_LOG" "$FAKE_HOME" "$FAKE_WORKSPACE" "$FAKE_GIT_CONFIG"
+  mkdir -p "$FAKE_BIN" "$FAKE_LOG" "$FAKE_HOME/.paseo" "$FAKE_WORKSPACE"
 
   cat > "$FAKE_BIN/gosu" <<'SH'
 #!/usr/bin/env bash
@@ -155,7 +157,31 @@ set -u
 : > "$FAKE_LOG/seed.log"
 SH
 
-  chmod +x "$FAKE_BIN/gosu" "$FAKE_BIN/paseo" "$FAKE_BIN/seed-agent-config.sh"
+  cat > "$FAKE_BIN/git" <<'SH'
+#!/usr/bin/env bash
+set -u
+printf 'git HOME=%s argv=%s\n' "${HOME:-}" "$*" >> "$FAKE_LOG/git.log"
+if [ "${1:-}" = "config" ] && [ "${2:-}" = "--global" ]; then
+  case "${3:-}" in
+    --get-all)
+      [ "${4:-}" = "safe.directory" ] || exit 1
+      [ -f "$FAKE_GIT_CONFIG" ] || exit 1
+      cat "$FAKE_GIT_CONFIG"
+      exit 0
+      ;;
+    --add)
+      [ "${4:-}" = "safe.directory" ] || exit 1
+      [ -z "${FAKE_GIT_ADD_FAIL:-}" ] || exit 1
+      printf '%s\n' "${5:-}" >> "$FAKE_GIT_CONFIG"
+      exit 0
+      ;;
+    *) exit 0 ;;
+  esac
+fi
+exit 0
+SH
+
+  chmod +x "$FAKE_BIN/gosu" "$FAKE_BIN/paseo" "$FAKE_BIN/seed-agent-config.sh" "$FAKE_BIN/git"
 }
 
 launcher_env() {
@@ -165,11 +191,17 @@ launcher_env() {
     "HOME=$BATS_TEST_TMPDIR"
     "TMPDIR=$BATS_TEST_TMPDIR"
     "AGENT_DEVBOX_GOSU_BIN=$FAKE_BIN/gosu"
+    "AGENT_DEVBOX_GIT_BIN=$FAKE_BIN/git"
     "AGENT_DEVBOX_SEED_BIN=$FAKE_BIN/seed-agent-config.sh"
     "AGENT_DEVBOX_PASEO_HOME=$FAKE_HOME/.paseo"
+    "AGENT_DEVBOX_PASEO_HOME_DIR=$FAKE_HOME"
+    "AGENT_DEVBOX_WORKSPACE_DIR=$FAKE_WORKSPACE"
+    "AGENT_DEVBOX_PASEO_UID=$(id -u)"
+    "AGENT_DEVBOX_PASEO_GID=$(id -g)"
     "AGENT_DEVBOX_PASEO_LOCK_DIR=$BATS_TEST_TMPDIR"
     "EXPECTED_PASEO_HOME=$FAKE_HOME/.paseo"
     "FAKE_LOG=$FAKE_LOG"
+    "FAKE_GIT_CONFIG=$FAKE_GIT_CONFIG"
     "FAKE_PASEO=$FAKE_BIN/paseo"
   )
 }
@@ -285,6 +317,254 @@ launcher_env() {
     [ ! -e "$BATS_TEST_TMPDIR/agent-devbox-paseo.lock" ]
     [[ "$output" != *"$chosen"* ]]
   done
+}
+
+# ---------------------------------------------------------------------------
+# P2-B3: a held lock exits 0, any other flock failure is FATAL, and the
+# top-level home/workspace ownership is verified by numeric uid:gid. Home
+# failures stop before seed/daemon; workspace failures only warn.
+# ---------------------------------------------------------------------------
+
+make_fake_owner_tools() {
+  cat > "$FAKE_BIN/stat" <<'SH'
+#!/usr/bin/env bash
+set -u
+path="${!#}"
+if [ -n "${FAKE_STAT_MARKER:-}" ] && [ -e "$FAKE_STAT_MARKER" ]; then
+  printf '%s\n' "$FAKE_WANT"
+elif [ "${FAKE_STAT_WRONG_ALL:-}" = 1 ]; then
+  printf '%s\n' "$FAKE_WRONG_OWNER"
+elif [ "$path" = "${FAKE_WRONG_PATH:-}" ]; then
+  printf '%s\n' "$FAKE_WRONG_OWNER"
+else
+  printf '%s\n' "$FAKE_WANT"
+fi
+SH
+  cat > "$FAKE_BIN/chown" <<'SH'
+#!/usr/bin/env bash
+set -u
+printf '%s\n' "$@" >> "$FAKE_LOG/chown.log"
+path="${!#}"
+if [ -n "${FAKE_STAT_MARKER:-}" ]; then
+  : > "$FAKE_STAT_MARKER"
+fi
+if [ "$path" = "${FAKE_CHOWN_FAIL_PATH:-}" ]; then
+  exit 1
+fi
+exit 0
+SH
+  cat > "$FAKE_BIN/chown-fail" <<'SH'
+#!/usr/bin/env bash
+set -u
+printf '%s\n' "$@" >> "$FAKE_LOG/chown.log"
+: > "$FAKE_LOG/chown-called"
+exit 1
+SH
+  chmod +x "$FAKE_BIN/stat" "$FAKE_BIN/chown" "$FAKE_BIN/chown-fail"
+}
+
+@test "paseo-boot: a held launcher lock exits 0 without gosu/seed/daemon" {
+  launcher_env
+  local lock="$BATS_TEST_TMPDIR/agent-devbox-paseo.lock" holder i
+  ( flock -n 9 || exit 1; : > "$BATS_TEST_TMPDIR/lock-held"; /bin/sleep 30 ) 9>"$lock" &
+  holder=$!
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+    [ -e "$BATS_TEST_TMPDIR/lock-held" ] && break
+    /bin/sleep 0.05
+  done
+  run env -i "${LAUNCHER_ENV[@]}" PASEO_PASSWORD=lock-conflict-password \
+    bash "$repo/scripts/paseo-boot.sh"
+  kill "$holder" 2>/dev/null || true
+  wait "$holder" 2>/dev/null || true
+  [ -e "$BATS_TEST_TMPDIR/lock-held" ]
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"paseo launcher is already running; nothing to do."* ]]
+  [ ! -e "$FAKE_LOG/gosu.log" ]
+  [ ! -e "$FAKE_LOG/paseo.log" ]
+  [ ! -e "$FAKE_LOG/seed.log" ]
+  [[ "$output" != *"lock-conflict-password"* ]]
+}
+
+@test "paseo-boot: a non-conflict flock error is FATAL and starts nothing" {
+  launcher_env
+  cat > "$FAKE_BIN/flock" <<'SH'
+#!/usr/bin/env bash
+exit 1
+SH
+  chmod +x "$FAKE_BIN/flock"
+  run env -i "${LAUNCHER_ENV[@]}" PASEO_PASSWORD=lock-error-password \
+    AGENT_DEVBOX_FLOCK_BIN="$FAKE_BIN/flock" \
+    bash "$repo/scripts/paseo-boot.sh"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"FATAL: could not acquire the paseo launcher lock (rc=1)"* ]]
+  [ ! -e "$FAKE_LOG/gosu.log" ]
+  [ ! -e "$FAKE_LOG/paseo.log" ]
+  [ ! -e "$FAKE_LOG/seed.log" ]
+  [[ "$output" != *"lock-error-password"* ]]
+}
+
+@test "paseo-boot: an already-owned home is not chowned" {
+  launcher_env
+  make_fake_owner_tools
+  run env -i "${LAUNCHER_ENV[@]}" PASEO_PASSWORD=owned-password \
+    AGENT_DEVBOX_CHOWN_BIN="$FAKE_BIN/chown-fail" \
+    bash "$repo/scripts/paseo-boot.sh"
+  [ "$status" -eq 0 ]
+  [ ! -e "$FAKE_LOG/chown-called" ]
+  [[ "$output" == *"already owned by $(id -u):$(id -g)"* ]]
+  [ -f "$FAKE_LOG/seed.log" ]
+  [ -f "$FAKE_LOG/paseo.log" ]
+}
+
+@test "paseo-boot: a wrong home owner is chowned by numeric uid:gid and verified" {
+  launcher_env
+  make_fake_owner_tools
+  local want marker="$BATS_TEST_TMPDIR/chowned"
+  want="$(id -u):$(id -g)"
+  run env -i "${LAUNCHER_ENV[@]}" PASEO_PASSWORD=chown-ok-password \
+    AGENT_DEVBOX_STAT_BIN="$FAKE_BIN/stat" \
+    AGENT_DEVBOX_CHOWN_BIN="$FAKE_BIN/chown" \
+    FAKE_STAT_MARKER="$marker" FAKE_STAT_WRONG_ALL=1 \
+    FAKE_WANT="$want" FAKE_WRONG_OWNER="11111:11111" \
+    bash "$repo/scripts/paseo-boot.sh"
+  [ "$status" -eq 0 ]
+  [ "$(sed -n '1p' "$FAKE_LOG/chown.log")" = "$want" ]
+  [ "$(sed -n '2p' "$FAKE_LOG/chown.log")" = "--" ]
+  [ "$(sed -n '3p' "$FAKE_LOG/chown.log")" = "$FAKE_HOME" ]
+  [ "$(wc -l < "$FAKE_LOG/chown.log")" -eq 3 ]
+  [[ "$output" == *"chowned paseo home $FAKE_HOME to $want"* ]]
+  [ -f "$FAKE_LOG/seed.log" ]
+  [ -f "$FAKE_LOG/paseo.log" ]
+}
+
+@test "paseo-boot: a failed home chown stops before seed/daemon" {
+  launcher_env
+  make_fake_owner_tools
+  local chosen="home-chown-failure-password"
+  run env -i "${LAUNCHER_ENV[@]}" PASEO_PASSWORD="$chosen" \
+    AGENT_DEVBOX_STAT_BIN="$FAKE_BIN/stat" \
+    AGENT_DEVBOX_CHOWN_BIN="$FAKE_BIN/chown-fail" \
+    FAKE_STAT_WRONG_ALL=1 FAKE_WANT="$(id -u):$(id -g)" \
+    FAKE_WRONG_OWNER="54321:54321" \
+    bash "$repo/scripts/paseo-boot.sh"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"FATAL: could not chown paseo home"* ]]
+  [ -s "$FAKE_LOG/chown.log" ]
+  [ ! -e "$FAKE_LOG/seed.log" ]
+  [ ! -e "$FAKE_LOG/paseo.log" ]
+  [[ "$output" != *"$chosen"* ]]
+}
+
+@test "paseo-boot: a failed workspace chown warns and still starts" {
+  launcher_env
+  make_fake_owner_tools
+  run env -i "${LAUNCHER_ENV[@]}" PASEO_PASSWORD=workspace-warn-password \
+    AGENT_DEVBOX_STAT_BIN="$FAKE_BIN/stat" \
+    AGENT_DEVBOX_CHOWN_BIN="$FAKE_BIN/chown" \
+    FAKE_WANT="$(id -u):$(id -g)" FAKE_WRONG_OWNER="54321:54321" \
+    FAKE_WRONG_PATH="$FAKE_WORKSPACE" FAKE_CHOWN_FAIL_PATH="$FAKE_WORKSPACE" \
+    bash "$repo/scripts/paseo-boot.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"WARN: could not chown workspace $FAKE_WORKSPACE"* ]]
+  grep -Fxq "$FAKE_WORKSPACE" "$FAKE_LOG/chown.log"
+  [ -f "$FAKE_LOG/seed.log" ]
+  [ -f "$FAKE_LOG/paseo.log" ]
+}
+
+@test "paseo-boot: a missing workspace only warns and still starts" {
+  launcher_env
+  rm -rf "$FAKE_WORKSPACE"
+  run env -i "${LAUNCHER_ENV[@]}" PASEO_PASSWORD=workspace-missing-password \
+    bash "$repo/scripts/paseo-boot.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"WARN: workspace $FAKE_WORKSPACE is missing"* ]]
+  [ -f "$FAKE_LOG/seed.log" ]
+  [ -f "$FAKE_LOG/paseo.log" ]
+}
+
+@test "paseo-boot: a missing paseo home is FATAL before seed/daemon" {
+  launcher_env
+  rm -rf "$FAKE_HOME"
+  run env -i "${LAUNCHER_ENV[@]}" PASEO_PASSWORD=home-missing-password \
+    bash "$repo/scripts/paseo-boot.sh"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"FATAL: paseo home $FAKE_HOME is missing"* ]]
+  [ ! -e "$FAKE_LOG/seed.log" ]
+  [ ! -e "$FAKE_LOG/paseo.log" ]
+}
+
+# ---------------------------------------------------------------------------
+# P2-B4: /workspace is trusted for the service user's git, as paseo with its
+# own HOME, exactly once and without touching root's global config.
+# ---------------------------------------------------------------------------
+
+@test "paseo-boot: B4 adds /workspace safe.directory once with paseo HOME" {
+  launcher_env
+  run env -i "${LAUNCHER_ENV[@]}" PASEO_PASSWORD=b4-first-password \
+    bash "$repo/scripts/paseo-boot.sh"
+  [ "$status" -eq 0 ]
+  [ "$(grep -Fxc -- '/workspace' "$FAKE_GIT_CONFIG")" -eq 1 ]
+  grep -Fxq "git HOME=$FAKE_HOME argv=config --global --add safe.directory /workspace" \
+    "$FAKE_LOG/git.log"
+  [ -f "$FAKE_LOG/seed.log" ]
+  [ -f "$FAKE_LOG/paseo.log" ]
+  [[ "$output" != *"b4-first-password"* ]]
+}
+
+@test "paseo-boot: B4 second run keeps exactly one /workspace and adds only once" {
+  launcher_env
+  run env -i "${LAUNCHER_ENV[@]}" PASEO_PASSWORD=b4-idem-1 \
+    bash "$repo/scripts/paseo-boot.sh"
+  [ "$status" -eq 0 ]
+  run env -i "${LAUNCHER_ENV[@]}" PASEO_PASSWORD=b4-idem-2 \
+    bash "$repo/scripts/paseo-boot.sh"
+  [ "$status" -eq 0 ]
+  [ "$(grep -Fxc -- '/workspace' "$FAKE_GIT_CONFIG")" -eq 1 ]
+  [ "$(grep -Fc -- '--add safe.directory /workspace' "$FAKE_LOG/git.log")" -eq 1 ]
+}
+
+@test "paseo-boot: B4 preserves pre-existing safe.directory entries" {
+  launcher_env
+  printf '%s\n' '/other' > "$FAKE_GIT_CONFIG"
+  run env -i "${LAUNCHER_ENV[@]}" PASEO_PASSWORD=b4-preserve \
+    bash "$repo/scripts/paseo-boot.sh"
+  [ "$status" -eq 0 ]
+  grep -Fxq -- '/other' "$FAKE_GIT_CONFIG"
+  [ "$(grep -Fxc -- '/other' "$FAKE_GIT_CONFIG")" -eq 1 ]
+  [ "$(grep -Fxc -- '/workspace' "$FAKE_GIT_CONFIG")" -eq 1 ]
+}
+
+@test "paseo-boot: B4 a failed git add only warns and still starts" {
+  launcher_env
+  local chosen="b4-add-failure-password"
+  run env -i "${LAUNCHER_ENV[@]}" PASEO_PASSWORD="$chosen" FAKE_GIT_ADD_FAIL=1 \
+    bash "$repo/scripts/paseo-boot.sh"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"WARN: could not add /workspace to git safe.directory"* ]]
+  [ -f "$FAKE_LOG/seed.log" ]
+  [ -f "$FAKE_LOG/paseo.log" ]
+  [[ "$output" != *"$chosen"* ]]
+}
+
+@test "paseo-boot: B4 never uses root's HOME or global git config" {
+  launcher_env
+  local sentinel="$BATS_TEST_TMPDIR/root-gitconfig" before
+  printf '%s\n' '[safe]' '	directory = /sentinel' > "$sentinel"
+  before="$(cat "$sentinel")"
+  run env -i "${LAUNCHER_ENV[@]}" PASEO_PASSWORD=b4-root-untouched \
+    bash "$repo/scripts/paseo-boot.sh"
+  [ "$status" -eq 0 ]
+  [ "$(grep -Fc -- "HOME=$FAKE_HOME" "$FAKE_LOG/git.log")" -eq "$(wc -l < "$FAKE_LOG/git.log")" ]
+  ! grep -q "HOME=/root" "$FAKE_LOG/git.log"
+  ! grep -q "HOME=$BATS_TEST_TMPDIR" "$FAKE_LOG/git.log"
+  [ "$(cat "$sentinel")" = "$before" ]
+}
+
+@test "paseo-boot: B4 safe.directory logic lives only in paseo-boot.sh" {
+  grep -q 'safe.directory' "$repo/scripts/paseo-boot.sh"
+  ! grep -q 'safe.directory' "$repo/scripts/docker-entrypoint.sh"
+  ! grep -q 'git config' "$repo/scripts/docker-entrypoint.sh"
+  ! grep -q -- '--replace-all safe.directory' "$repo/scripts/paseo-boot.sh"
 }
 
 @test "paseo-env: wildcard and localhost canonicalize to concrete loopback" {

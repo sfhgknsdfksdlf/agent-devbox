@@ -354,6 +354,129 @@ data_source() {
   fi
 }
 
+# device_id(): kernel major:minor of a block device, via lsblk (util-linux).
+# `stat -c %t:%T` prints HEX without a 2-digit normalisation, so it is
+# deliberately not used here. Leading/trailing whitespace is trimmed; an empty
+# answer means the device cannot be identified and the caller must fail closed.
+device_id() {
+  local dev="${1:-}" id
+  [ -n "$dev" ] || return 1
+  id="$(lsblk -no MAJ:MIN -- "$dev" 2>/dev/null | awk 'NF { print $1; exit }')"
+  id="${id//[[:space:]]/}"
+  case "$id" in
+    '' | *[!0-9:]*) return 1 ;;
+    *:*:*) return 1 ;;
+    *:*) ;;
+    *) return 1 ;;
+  esac
+  printf '%s\n' "$id"
+}
+
+# pair_value(KEY, "KEY=..."): extract one value from `findmnt --pairs` output.
+# Values are quoted, so empty UUID/LABEL columns keep their boundaries (raw
+# `findmnt -r` collapses them, shifting MAJ:MIN into the wrong field).
+pair_value() {
+  local key="$1" line="$2" re
+  re="(^|[[:space:]])${key}=\"([^\"]*)\""
+  if [[ $line =~ $re ]]; then
+    printf '%s\n' "${BASH_REMATCH[2]}"
+    return 0
+  fi
+  return 1
+}
+
+# has_mount_option(OPT, OPTS): exact comma-separated option match. `ro` inside
+# e.g. `errors=remount-ro` must NOT count as read-only (nor `rw` as a substring).
+has_mount_option() {
+  printf '%s\n' "${2:-}" | tr ',' '\n' | grep -Fxq -- "$1"
+}
+
+# fail_closed_identity(): shared tail of an identity-verification failure.
+fail_closed_identity() {
+  log "boot failed: maintenance mode"
+  write_maintenance_motd
+}
+
+# verify_mounted_data_disk(DEV[, MAJ:MIN]): authoritative identity check for
+# $DATADIR. A live mountpoint is not enough: the filesystem must be ext4, mounted
+# read-write, on the SAME kernel device we resolved (major:minor), and carry the
+# configured identity (exact UUID when DATA_UUID is set, else the channel LABEL).
+# Used by BOTH the already-mounted fast path and the fresh-mount path, so a
+# stale/wrong/read-only mount can never seed or bind. Failures log the existing
+# `boot failed: maintenance mode`, write the repair banner and return 1.
+# Never formats, unmounts or remounts; it only inspects.
+verify_mounted_data_disk() {
+  local dev="${1:-}" want_id="${2:-}" out n src fstype opts uuid label majmin sid
+  if [ -z "$dev" ]; then
+    log "FATAL: 挂载校验缺少已解析的数据盘设备"
+    fail_closed_identity
+    return 1
+  fi
+  if [ -z "$want_id" ]; then
+    want_id="$(device_id "$dev")" || want_id=""
+  fi
+  if [ -z "$want_id" ]; then
+    log "FATAL: 无法获取数据盘 $dev 的 major:minor，拒绝信任该挂载"
+    fail_closed_identity
+    return 1
+  fi
+  # --pairs (not raw): empty UUID/LABEL columns keep their field boundaries.
+  out="$(findmnt -Pno SOURCE,FSTYPE,OPTIONS,UUID,LABEL,MAJ:MIN --mountpoint "$DATADIR" 2>/dev/null)"
+  n=0
+  if [ -n "$out" ]; then
+    n="$(printf '%s\n' "$out" | wc -l)"
+  fi
+  if [ "$n" -ne 1 ]; then
+    log "FATAL: 挂载校验失败：$DATADIR 的挂载记录不是恰好一条（found=$n）"
+    fail_closed_identity
+    return 1
+  fi
+  src="$(pair_value SOURCE "$out")" || src=""
+  fstype="$(pair_value FSTYPE "$out")" || fstype=""
+  opts="$(pair_value OPTIONS "$out")" || opts=""
+  uuid="$(pair_value UUID "$out")" || uuid=""
+  label="$(pair_value LABEL "$out")" || label=""
+  majmin="$(pair_value MAJ:MIN "$out")" || majmin=""
+  if [ "$fstype" != "ext4" ]; then
+    log "FATAL: 挂载校验失败：FSTYPE=$fstype，期望 ext4（$DATADIR）"
+    fail_closed_identity
+    return 1
+  fi
+  if ! has_mount_option rw "$opts" || has_mount_option ro "$opts"; then
+    log "FATAL: 挂载校验失败：OPTIONS=$opts，期望可写（rw 且无 ro）"
+    fail_closed_identity
+    return 1
+  fi
+  if [ "$majmin" != "$want_id" ]; then
+    log "FATAL: 挂载校验失败：MAJ:MIN=$majmin，期望 $want_id（$dev）（设备身份不匹配）"
+    fail_closed_identity
+    return 1
+  fi
+  if [ "$src" != "$dev" ]; then
+    sid="$(device_id "$src")" || sid=""
+    if [ -z "$sid" ] || [ "$sid" != "$want_id" ]; then
+      log "FATAL: 挂载校验失败：SOURCE=$src 不是已解析设备 $dev（major:minor=$want_id）"
+      fail_closed_identity
+      return 1
+    fi
+  fi
+  if [ -n "${DATA_UUID:-}" ]; then
+    if [ "$uuid" != "$DATA_UUID" ]; then
+      # Never accept a differing UUID via the shared label fallback.
+      log "FATAL: data disk UUID mismatch (mounted='$uuid' expected='$DATA_UUID')（数据盘 UUID 不匹配；不接受标签替代）"
+      fail_closed_identity
+      return 1
+    fi
+  else
+    if [ -z "${DATA_LABEL:-}" ] || [ "$label" != "$DATA_LABEL" ]; then
+      log "FATAL: 挂载校验失败：LABEL='$label'，期望 '$DATA_LABEL'（数据盘标签不匹配）"
+      fail_closed_identity
+      return 1
+    fi
+  fi
+  return 0
+}
+
 # fail_ambiguous_data_disk(): two attached devices share UUID/label, usually a
 # copied VHDX whose original is still attached. Never mount either one.
 fail_ambiguous_data_disk() {
@@ -448,11 +571,30 @@ attach_vhdx() {
 # mounted, else 1 after a `boot failed: maintenance mode` line. Every step is
 # logged; none is fatal by itself.
 ensure_mounted() {
-  local dev r w
+  local dev r w want_id redev reid
 
-  # 1) already mounted -> nothing to do.
+  # 1) already mounted -> verify ext4/rw/identity; a bare mountpoint is not enough.
   if is_mounted; then
-    log "数据盘已挂载于 $DATADIR，跳过挂载"
+    log "数据盘已挂载于 $DATADIR，正在校验挂载身份"
+    r=0
+    dev="$(data_dev 2>/dev/null)" || r=$?
+    if [ "$r" -ne 0 ]; then
+      if [ "$r" -eq 2 ]; then
+        fail_ambiguous_data_disk
+      else
+        log "FATAL: 数据盘已挂载，但无法唯一解析其设备（rc=$r），拒绝信任该挂载"
+        fail_closed_identity
+      fi
+      return 1
+    fi
+    want_id="$(device_id "$dev")" || want_id=""
+    if [ -z "$want_id" ]; then
+      log "FATAL: 数据盘已挂载，但无法获取 $dev 的 major:minor，拒绝信任该挂载"
+      fail_closed_identity
+      return 1
+    fi
+    verify_mounted_data_disk "$dev" "$want_id" || return 1
+    log "数据盘挂载身份校验通过（$dev, major:minor=$want_id）"
     return 0
   fi
 
@@ -471,13 +613,12 @@ ensure_mounted() {
   #    Two matches are ambiguous -> fail closed, never pick one.
   log "正在查找数据盘设备… (uuid=${DATA_UUID:-未配置}, label=$DATA_LABEL)"
   r=0
-  data_dev >/dev/null 2>&1 || r=$?
+  dev="$(data_dev 2>/dev/null)" || r=$?
   if [ "$r" -eq 2 ]; then
     fail_ambiguous_data_disk
     return 1
   fi
   if [ "$r" -eq 0 ]; then
-    dev="$(data_dev)"
     log "数据盘设备已存在：$dev（attach_source=preexisting, source=$(data_source)）"
   else
     # 4) missing -> attach, then the ONE device wait for this boot.
@@ -496,11 +637,39 @@ ensure_mounted() {
       log "boot failed: maintenance mode"
       return 1
     fi
-    dev="$(data_dev)"
+    dev="$(data_dev 2>/dev/null)"
     log "数据盘设备已出现：$dev（source=$(data_source)）"
   fi
 
-  # 5) mount the raw device at $DATADIR.
+  # 5) capture the identity of the resolved device, then re-resolve immediately
+  #    before mounting: it must still be the SAME single device with the SAME
+  #    kernel major:minor. A copied disk attached meanwhile (or a reused device
+  #    path) must never be mounted.
+  want_id="$(device_id "$dev")" || want_id=""
+  if [ -z "$want_id" ]; then
+    log "FATAL: 无法获取数据盘 $dev 的 major:minor，拒绝挂载"
+    fail_closed_identity
+    return 1
+  fi
+  r=0
+  redev="$(data_dev 2>/dev/null)" || r=$?
+  if [ "$r" -ne 0 ]; then
+    if [ "$r" -eq 2 ]; then
+      fail_ambiguous_data_disk
+    else
+      log "FATAL: 挂载前数据盘设备消失（此前解析为 $dev）"
+      fail_closed_identity
+    fi
+    return 1
+  fi
+  reid="$(device_id "$redev")" || reid=""
+  if [ "$redev" != "$dev" ] || [ "$reid" != "$want_id" ]; then
+    log "FATAL: 数据盘设备在解析后发生变化（$dev [$want_id] -> $redev [${reid:-未知}]），拒绝挂载"
+    fail_closed_identity
+    return 1
+  fi
+
+  # 6) mount the raw device at $DATADIR.
   mkdir -p "$DATADIR"
   if ! mount -t ext4 "$dev" "$DATADIR"; then
     log "挂载 $dev 到 $DATADIR 失败"
@@ -508,13 +677,10 @@ ensure_mounted() {
     return 1
   fi
 
-  # 6) confirm the mount actually took.
-  if is_mounted; then
-    return 0
-  fi
-  log "挂载后校验失败：$DATADIR 不是挂载点"
-  log "boot failed: maintenance mode"
-  return 1
+  # 7) verify the fresh mount is really the resolved device (ext4/rw/identity).
+  verify_mounted_data_disk "$dev" "$want_id" || return 1
+  log "数据盘挂载身份校验通过（$dev, major:minor=$want_id）"
+  return 0
 }
 
 # install_dir(): Windows install directory implied by DATA_VHDX (strip the last
@@ -1065,8 +1231,8 @@ ensure_services_ready() {
 # verify_data_uuid(): compare the mounted UUID(s) with DATA_UUID. `sort -u`
 # collapses the same device stacked twice by a boot race; two DIFFERENT UUIDs
 # still produce two lines and fail closed. Returns 1 after writing the
-# maintenance banner; main() exits 0 on that (boot must never propagate a
-# failure status).
+# maintenance banner. Kept as a small standalone check; boot itself relies on
+# the authoritative verify_mounted_data_disk() in ensure_mounted().
 verify_data_uuid() {
   [ -n "${DATA_UUID:-}" ] || return 0
   local cur
@@ -1097,10 +1263,9 @@ main() {
   fi
   log "数据盘挂载成功"
 
-  # --- verify identity; fail closed on UUID mismatch -------------------------
-  if [ -n "${DATA_UUID:-}" ]; then
-    verify_data_uuid || exit 0
-  fi
+  # ensure_mounted() already verified ext4/rw/UUID-or-LABEL and the kernel
+  # major:minor identity (both for an existing mount and a fresh one), so there
+  # is no second, weaker identity check here.
 
   # --- first-run seed (marker-based; only mark after a FULL successful copy) --
   if [ ! -e "$DATADIR/.initialized" ]; then

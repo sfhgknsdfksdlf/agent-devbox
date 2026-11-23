@@ -138,7 +138,8 @@ RUN set -eux; \
 # -----------------------------------------------------------------------------
 RUN set -eux; \
     npx -y playwright@${PLAYWRIGHT_VERSION} install chromium; \
-    chmod -R 777 /ms-playwright; \
+    chown -R root:root /ms-playwright; \
+    chmod -R a+rX,go-w /ms-playwright; \
     chrome="$(find /ms-playwright -type f -name chrome | head -n1 || true)"; \
     if [ -n "$chrome" ]; then ln -sf "$chrome" /usr/local/bin/chromium; ln -sf "$chrome" /usr/local/bin/chromium-browser; fi; \
     find /ms-playwright -maxdepth 3 -type f \( -name chrome -o -name headless_shell \) | sed 's/^/  browser: /'; \

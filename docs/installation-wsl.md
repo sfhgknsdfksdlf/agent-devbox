@@ -25,8 +25,8 @@ All installer output is Chinese, and it prints a **10-step progress banner**:
 [1/10] 检查运行环境…   [2/10] 检查磁盘空间…   [3/10] 下载镜像…
 [4/10] 导入镜像…   [5/10] 校验发行版注册…
 [6/10] 创建数据磁盘（32GB 动态）…   [7/10] 初始化数据磁盘…
-[8/10] 修复权限…   [9/10] 写入启动配置 /etc/agent-devbox.conf…
-[10/10] 附加数据磁盘 / 清理旧版任务…   [完成] 重启发行版…
+[8/10] 验证数据盘所有者与访问权限…   [9/10] 写入启动配置 /etc/agent-devbox.conf…
+[10/10] 附加数据磁盘并清理旧版计划任务…   [完成] 重启发行版…
 ```
 
 ## Channels (stable / beta)
@@ -392,10 +392,12 @@ cat /etc/agent-devbox.conf
 
 The data-disk copy used across upgrades lives at
 `/mnt/<DATA_MNTNAME>/.paseo-password`: `/mnt/devbox-data/.paseo-password` for
-stable, `/mnt/devbox-data-beta/.paseo-password` for beta. There is no migration
-from an old system-disk `/etc/agent-devbox.conf`: upgrades never read it. The
-data-disk file is the only upgrade source; if it cannot be read, the installer
-warns and treats the value as a new password (the old one stops working).
+stable, `/mnt/devbox-data-beta/.paseo-password` for beta. There is no password
+migration from an old system-disk `/etc/agent-devbox.conf`: the password is read
+only from the data disk, and an old conf `DATA_UUID` is used at most as an
+identity hint (never as a password source). The data-disk file is the only
+upgrade source; if it cannot be read, the installer warns and treats the value as
+a new password (the old one stops working).
 
 ## Antivirus prompt and the elevated window
 
@@ -532,10 +534,15 @@ creates/attaches the data disk and writes the boot config.
 This section is about the beta **release tag** (`beta-*`). The beta **channel** is
 a separate thing, selected by `-Ref` (see "Channels" above).
 
-Every `push` publishes a **dated** `beta-<YYYYMMDD.HHMM>` prerelease carrying the
-WSL rootfs parts + the 1Panel zip, and moves the **`:beta`** image alias to the
-newest push build. Older `beta-*` prereleases are pruned, so only the newest
-survives (each is ~4.7GB). Pushes never touch `latest`.
+Every `push` publishes a **dated** `beta-<YYYYMMDD.HHMM>-<run_id>.<attempt>`
+prerelease carrying the WSL rootfs parts + the 1Panel zip, and moves the
+**`:beta`** image alias to the newest push build. A push to `main` tags its image
+`<YYYYMMDD.HHMM>-<run_id>.<attempt>`; a push to another branch tags both the image
+and the prerelease `beta-<YYYYMMDD.HHMM>-<run_id>.<attempt>`. Scheduled and
+manual runs tag the image `<YYYYMMDD.HHMM>-<run_id>.<attempt>`, cut a formal
+`build-<YYYYMMDD.HHMM>-<run_id>.<attempt>` Release, and promote `latest` after
+verification. Older `beta-*` prereleases are pruned, so only the newest survives
+(each is ~4.7GB). Pushes never touch `latest`.
 
 When run interactively the installer **asks which release to install**:
 
@@ -544,9 +551,11 @@ When run interactively the installer **asks which release to install**:
 ```
 
 Press Enter for stable (`latest`), type `b` (or `beta`) for the newest `beta-*`
-prerelease (resolved through the GitHub API), or paste a specific release tag —
-`build-<YYYYMMDD.HHMM>` / `beta-<YYYYMMDD.HHMM>`; a bare `YYYYMMDD.HHMM` is
-resolved to `build-<YYYYMMDD.HHMM>`. The installer then asks which **code ref**
+prerelease (resolved through the GitHub API), or paste a specific release tag:
+`build-<YYYYMMDD.HHMM>-<run_id>.<attempt>` / `beta-<YYYYMMDD.HHMM>-<run_id>.<attempt>`.
+Explicit old or new tags are queried verbatim (the run suffix is never truncated);
+a bare `YYYYMMDD.HHMM` is still resolved to the legacy `build-<YYYYMMDD.HHMM>`.
+The installer then asks which **code ref**
 to fetch the installer scripts from (Enter = `main`; `?` lists the repository
 branches; a branch, tag, or commit can be typed):
 
@@ -582,7 +591,7 @@ hash mismatch, is fatal. For a reproducible **stable** install, keep the entry a
 the ref on `main` and pin only the rootfs release:
 
 ```powershell
-& ([scriptblock]::Create((irm https://raw.githubusercontent.com/sfhgknsdfksdlf/agent-devbox/main/windows/install.ps1))) -ReleaseTag build-20261020.1200
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/sfhgknsdfksdlf/agent-devbox/main/windows/install.ps1))) -ReleaseTag build-20261020.1200-1234567890.1
 ```
 
 Pinning the **code ref** to an immutable tag or commit is also possible
@@ -600,10 +609,11 @@ and the **paseo password is preserved**: the data disk at
 `/mnt/<DATA_MNTNAME>/.paseo-password` (`/mnt/devbox-data` for stable,
 `/mnt/devbox-data-beta` for beta; mode 600) is the ONLY upgrade source, read back
 during `[7/10]` and rewritten after the first install; the new
-`/etc/agent-devbox.conf` (also mode 600) is only the runtime copy. Upgrades never
-read an old system-disk `/etc/agent-devbox.conf` and offer no migration from it;
-if the data-disk password cannot be read, the installer warns and treats it as a
-new password (the old one will no longer apply). `-Reinstall` is still
+`/etc/agent-devbox.conf` (also mode 600) is only the runtime copy. Upgrades offer
+no password migration from an old system-disk `/etc/agent-devbox.conf` and do not
+read it for the password; an old conf `DATA_UUID` is only an identity hint. If the
+data-disk password cannot be read, the installer warns and treats it as a new
+password (the old one will no longer apply). `-Reinstall` is still
 accepted for compatibility (an upgrade is the default), and `-Yes` stays
 unattended (it now upgrades too).
 

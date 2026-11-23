@@ -23,6 +23,15 @@ setup() {
   REAL_PATH="$AGENT_DEVBOX_TEST_REAL_PATH"
   export TMP BINDIR CALL_LOG MARKDIR IDDIR REAL_PATH
 
+  # Real ownership/mode checks run through the stat shim; capture the real stat
+  # and this runner's real ids before any shim is prepended to PATH.
+  REAL_STAT="$(command -v stat)"
+  REAL_UID="$(id -u)"
+  REAL_GID="$(id -g)"
+  export REAL_STAT REAL_UID REAL_GID
+  export AGENT_DEVBOX_CONF_UID="$REAL_UID"
+  export AGENT_DEVBOX_CONF_GID="$REAL_GID"
+
   export SCRIPT="$BATS_TEST_DIRNAME/../../scripts/wsl-session-mount.sh"
   export HOOK="$BATS_TEST_DIRNAME/../../config/profile.d/zz-agent-devbox-session-mount.sh"
 
@@ -75,6 +84,14 @@ write_conf() {
     printf 'DATA_MNTNAME="%s"\n' "$mntname"
     printf 'DATA_DISTRO="agent-devbox"\n'
   } > "$AGENT_DEVBOX_CONF"
+  chmod 600 "$AGENT_DEVBOX_CONF"
+}
+
+# write_raw_conf <line>...: write the given lines verbatim (already quoted) with
+# production permissions, for the strict-reader cases.
+write_raw_conf() {
+  printf '%s\n' "$@" > "$AGENT_DEVBOX_CONF"
+  chmod 600 "$AGENT_DEVBOX_CONF"
 }
 
 # Every OS probe the helper is allowed to make is replaced here; each shim is documented inline.
@@ -234,25 +251,44 @@ esac
 exit 0
 SH
 
-  # stat -c %d:%i: a stable per-path identity map. A bind copies the source entry, so a
-  # correctly bound target reports exactly the source's id (H12).
+  # stat: `%d:%i` / `%s` use the stable per-path identity map (a bind copies the
+  # source entry, H12). Ownership/mode/type formats (`%u %g %a %F`) delegate to
+  # the real stat so the conf's root:0600 check sees the real filesystem.
   cat > "$BINDIR/stat" <<'SH'
 #!/bin/sh
 key() { printf '%s' "$1" | cksum | cut -d' ' -f1; }
+fmt=""
 last=""
+want_fmt=0
 for a in "$@"; do
-  last="$a"
+  if [ "$want_fmt" = 1 ]; then
+    fmt="$a"
+    want_fmt=0
+    continue
+  fi
+  case "$a" in
+    -c|--format) want_fmt=1 ;;
+    -*) ;;
+    *) last="$a" ;;
+  esac
 done
-if [ -z "$last" ]; then
-  printf '0:0\n'
-  exit 0
-fi
-f="$IDDIR/$(key "$last")"
-if [ -f "$f" ]; then
-  cat "$f"
-else
-  printf '1:%s\n' "$(key "$last")"
-fi
+case "$fmt" in
+  '%d:%i'|'%s'|'')
+    if [ -z "$last" ]; then
+      printf '0:0\n'
+      exit 0
+    fi
+    f="$IDDIR/$(key "$last")"
+    if [ -f "$f" ]; then
+      cat "$f"
+    else
+      printf '1:%s\n' "$(key "$last")"
+    fi
+    ;;
+  *)
+    exec "${REAL_STAT:-/usr/bin/stat}" -c "$fmt" "$last"
+    ;;
+esac
 SH
 
   chmod +x "$BINDIR"/*
@@ -555,6 +591,242 @@ SH
   [ "$status" -eq 0 ]
   [ "$(grep -c '^mount .*\-t ext4' "$CALL_LOG")" -eq 1 ]
   [ "$(bind_count)" -eq 3 ]
+}
+
+# ===========================================================================
+# Strict conf reader (P2-B2): never source/eval, only MNTNAME/LABEL/UUID,
+# root:0600 non-symlink, fail closed on malformed/duplicate/unsafe input.
+# ===========================================================================
+
+@test "test_conf_symlink_is_rejected" {
+  mv "$AGENT_DEVBOX_CONF" "$TMP/real-conf"
+  ln -s "$TMP/real-conf" "$AGENT_DEVBOX_CONF"
+  run "$SCRIPT" --force
+  [ "$status" -eq 4 ]
+  [[ "$output" == *"符号链接"* ]]
+  assert_no_mount_calls
+}
+
+@test "test_conf_mode_not_0600_is_rejected" {
+  chmod 0644 "$AGENT_DEVBOX_CONF"
+  run "$SCRIPT" --force
+  [ "$status" -eq 4 ]
+  [[ "$output" == *"0600"* ]]
+  assert_no_mount_calls
+}
+
+@test "test_conf_wrong_owner_override_is_rejected" {
+  export AGENT_DEVBOX_CONF_UID="$(( REAL_UID + 1 ))"
+  run "$SCRIPT" --force
+  [ "$status" -eq 4 ]
+  [[ "$output" == *"所有者"* ]]
+  assert_no_mount_calls
+}
+
+@test "test_conf_directory_is_rejected" {
+  rm -f "$AGENT_DEVBOX_CONF"
+  mkdir "$AGENT_DEVBOX_CONF"
+  run "$SCRIPT" --force
+  [ "$status" -eq 4 ]
+  [[ "$output" == *"普通文件"* ]]
+  assert_no_mount_calls
+}
+
+@test "test_malicious_ignored_values_are_never_executed" {
+  local t="$TMP"
+  write_raw_conf \
+    "DATA_UUID='test-uuid-1234'" \
+    "DATA_LABEL='devbox-data'" \
+    "DATA_MNTNAME='devbox-data'" \
+    "PASEO_PASSWORD='\$(touch $t/pwned-pw)'" \
+    "DATA_VHDX='\$(touch $t/pwned-vhdx)'" \
+    "DATA_DISTRO='\$(touch $t/pwned-distro)'"
+  run "$SCRIPT" --force
+  [ "$status" -eq 0 ]
+  [ ! -e "$TMP/pwned-pw" ]
+  [ ! -e "$TMP/pwned-vhdx" ]
+  [ ! -e "$TMP/pwned-distro" ]
+  [[ "$output" != *"s3cret"* ]]
+  [[ "$output" != *"PASEO_PASSWORD"* ]]
+  assert_log_has 'UUID=test-uuid-1234'
+  assert_log_has '-t ext4'
+}
+
+@test "test_malicious_mntname_fails_closed_without_executing" {
+  local t="$TMP"
+  write_raw_conf \
+    "DATA_UUID='test-uuid-1234'" \
+    "DATA_LABEL='devbox-data'" \
+    "DATA_MNTNAME='\$(touch $t/pwned-mnt)'"
+  run "$SCRIPT" --force
+  [ "$status" -eq 4 ]
+  [ ! -e "$TMP/pwned-mnt" ]
+  [[ "$output" == *"内容无效"* ]]
+  assert_no_mount_calls
+}
+
+@test "test_quote_bash_single_quoted_values_are_accepted" {
+  write_raw_conf \
+    "DATA_UUID='test-uuid-1234'" \
+    "DATA_LABEL='devbox-data'" \
+    "DATA_MNTNAME='devbox-data'"
+  run "$SCRIPT" --force
+  [ "$status" -eq 0 ]
+  assert_log_has 'UUID=test-uuid-1234'
+}
+
+@test "test_quote_bash_embedded_quote_is_accepted" {
+  write_raw_conf \
+    "DATA_UUID='test-uuid-1234'" \
+    "DATA_LABEL='devbox-data'" \
+    "DATA_MNTNAME='devbox-data'" \
+    "PASEO_PASSWORD='pa'\\''ss'"
+  run "$SCRIPT" --force
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"已把持久数据盘接入当前会话"* ]]
+}
+
+@test "test_legacy_bare_values_are_accepted" {
+  write_raw_conf \
+    "DATA_UUID=test-uuid-1234" \
+    "DATA_LABEL=devbox-data" \
+    "DATA_MNTNAME=devbox-data"
+  run "$SCRIPT" --force
+  [ "$status" -eq 0 ]
+  assert_log_has 'UUID=test-uuid-1234'
+}
+
+@test "test_double_quoted_escapes_are_accepted" {
+  write_raw_conf \
+    'DATA_UUID="test-uuid-1234"' \
+    'DATA_LABEL="devbox-data"' \
+    'DATA_MNTNAME="devbox-data"' \
+    'PASEO_PASSWORD="a\"b\\c\$d\`e"'
+  run "$SCRIPT" --force
+  [ "$status" -eq 0 ]
+  assert_log_has 'UUID=test-uuid-1234'
+}
+
+@test "test_duplicate_conf_key_is_rejected" {
+  write_raw_conf \
+    "DATA_UUID='test-uuid-1234'" \
+    "DATA_LABEL='devbox-data'" \
+    "DATA_LABEL='devbox-data'" \
+    "DATA_MNTNAME='devbox-data'"
+  run "$SCRIPT" --force
+  [ "$status" -eq 4 ]
+  assert_no_mount_calls
+}
+
+@test "test_unterminated_quote_is_rejected" {
+  write_raw_conf \
+    "DATA_UUID='test-uuid-1234" \
+    "DATA_LABEL='devbox-data'" \
+    "DATA_MNTNAME='devbox-data'"
+  run "$SCRIPT" --force
+  [ "$status" -eq 4 ]
+  assert_no_mount_calls
+}
+
+@test "test_trailing_garbage_after_quote_is_rejected" {
+  write_raw_conf \
+    "DATA_UUID='test-uuid-1234'x" \
+    "DATA_LABEL='devbox-data'" \
+    "DATA_MNTNAME='devbox-data'"
+  run "$SCRIPT" --force
+  [ "$status" -eq 4 ]
+  assert_no_mount_calls
+}
+
+@test "test_unknown_line_is_rejected" {
+  write_raw_conf \
+    "DATA_UUID='test-uuid-1234'" \
+    "DATA_LABEL='devbox-data'" \
+    "DATA_MNTNAME='devbox-data'" \
+    "not an assignment"
+  run "$SCRIPT" --force
+  [ "$status" -eq 4 ]
+  assert_no_mount_calls
+}
+
+@test "test_control_character_line_is_rejected" {
+  write_raw_conf \
+    "DATA_UUID='test-uuid-1234'" \
+    "DATA_LABEL='devbox-data'" \
+    "DATA_MNTNAME='devbox-data'"
+  printf 'PASEO_PASSWORD=x\001y\n' >> "$AGENT_DEVBOX_CONF"
+  run "$SCRIPT" --force
+  [ "$status" -eq 4 ]
+  assert_no_mount_calls
+}
+
+@test "test_present_empty_values_fail_closed" {
+  write_raw_conf "DATA_UUID=''" "DATA_LABEL='devbox-data'" "DATA_MNTNAME='devbox-data'"
+  run "$SCRIPT" --force
+  [ "$status" -eq 4 ]
+  write_raw_conf "DATA_UUID='test-uuid-1234'" "DATA_LABEL=''" "DATA_MNTNAME='devbox-data'"
+  run "$SCRIPT" --force
+  [ "$status" -eq 4 ]
+  write_raw_conf "DATA_UUID='test-uuid-1234'" "DATA_LABEL='devbox-data'" "DATA_MNTNAME=''"
+  run "$SCRIPT" --force
+  [ "$status" -eq 4 ]
+  assert_no_mount_calls
+}
+
+@test "test_missing_keys_use_defaults" {
+  write_raw_conf "DATA_UUID='test-uuid-1234'"
+  export LABEL_DEV=/dev/fakedisk-label
+  run env UUID_DEV= "$SCRIPT" --force
+  [ "$status" -eq 0 ]
+  assert_log_has 'LABEL=devbox-data'
+}
+
+@test "test_missing_uuid_uses_label_fallback" {
+  write_raw_conf "DATA_LABEL='devbox-data'" "DATA_MNTNAME='devbox-data'"
+  export LABEL_DEV=/dev/fakedisk-label
+  run "$SCRIPT" --force
+  [ "$status" -eq 0 ]
+  assert_log_has 'LABEL=devbox-data'
+  assert_log_lacks 'UUID='
+}
+
+@test "test_env_label_overrides_conf_label" {
+  write_conf devbox-data conf-label
+  export LABEL_DEV=/dev/fakedisk-label
+  export AGENT_DEVBOX_DATA_LABEL=env-label
+  run env UUID_DEV= "$SCRIPT" --force
+  [ "$status" -eq 0 ]
+  assert_log_has 'LABEL=env-label'
+  assert_log_lacks 'LABEL=conf-label'
+}
+
+@test "test_conf_label_used_when_env_unset" {
+  write_conf devbox-data conf-label
+  unset AGENT_DEVBOX_DATA_LABEL
+  export LABEL_DEV=/dev/fakedisk-label
+  run env UUID_DEV= "$SCRIPT" --force
+  [ "$status" -eq 0 ]
+  assert_log_has 'LABEL=conf-label'
+}
+
+@test "test_empty_env_label_falls_back_to_conf" {
+  write_conf devbox-data conf-label
+  export AGENT_DEVBOX_DATA_LABEL=""
+  export LABEL_DEV=/dev/fakedisk-label
+  run env UUID_DEV= "$SCRIPT" --force
+  [ "$status" -eq 0 ]
+  assert_log_has 'LABEL=conf-label'
+}
+
+@test "test_static_no_sourcing_or_eval_of_conf" {
+  run grep -Fq -- '. "$CONF"' "$SCRIPT"
+  [ "$status" -ne 0 ]
+  run grep -Fq -- 'source "$CONF"' "$SCRIPT"
+  [ "$status" -ne 0 ]
+  run grep -Fq -- 'parse_conf_file' "$SCRIPT"
+  [ "$status" -eq 0 ]
+  run grep -Fq -- 'AGENT_DEVBOX_CONF_UID' "$SCRIPT"
+  [ "$status" -eq 0 ]
 }
 
 # ===========================================================================

@@ -13,7 +13,7 @@ Claude Code 桌面版的 WSL 会话、Claude 的 VS Code/Cursor 扩展、Windows
 
 | 桌面客户端 | 在哪执行 / 怎么发现 | 固定路径要求 | core 变体 | agents 变体 | 备注 |
 |---|---|---|---|---|---|
-| OpenCode Desktop（Windows 1.19.3） | Windows 侧用一条 `wsl.exe -d <发行版> -- sh -lc '<探针>'` 找 CLI，再 exec 它打印的绝对路径起 sidecar；不查 PATH | **有**：`$HOME/.opencode/bin/opencode` 可执行、版本首行等于桌面版、发行版内有 `bash` 与 `curl` | 满足，开机 `ensure_opencode_shim` 建链接 | 满足，同一个链接 | 只探测 `opencode`；探测结果按发行版缓存在内存 |
+| OpenCode Desktop（Windows；本次核查 1.19.3） | Windows 侧用一条 `wsl.exe -d <发行版> -- sh -lc '<探针>'` 找 CLI，再 exec 它打印的绝对路径起 sidecar；不查 PATH | **有**：`$HOME/.opencode/bin/opencode` 可执行、版本首行等于桌面版、发行版内有 `bash` 与 `curl` | 满足，开机 `ensure_opencode_shim` 建链接 | 满足，同一个链接 | 只探测 `opencode`；探测结果按发行版缓存在内存 |
 | Paseo Desktop | 本次核查的 0.10.3 asar 里没有 WSL 相关代码；连 paseo 守护进程，由守护进程自己用 `which -a <name>` + `<path> --version` 解析 | 无固定路径；必须在**守护进程用户的 PATH** 上（`paseo-boot.sh` 钉死的前缀里含 `/usr/local/bin`） | `opencode` + `paseo` | 全部 agent CLI | 只装到 `~/.local/bin` 之类的目录就看不见 |
 | Claude Code Desktop（WSL 会话） | 会话在发行版**内部**运行，官方文档的说法是「Claude sets up inside it」，即它自己在发行版里装 CLI | 无；要求 WSL2 + 已安装的发行版 + 发行版内有 `git` | 满足（`git`/`bash`/`curl` 都在 core） | 满足 | 官方文档说它自己安装；本次未验证它是否会复用镜像里的 `claude` |
 | Claude Code 的 VS Code / Cursor 扩展 | 扩展「bundles its own copy of the CLI」，跑在编辑器一侧 | 无 | 不涉及 | 不涉及 | 与镜像内容无关 |
@@ -36,7 +36,7 @@ wsl.exe -d <发行版> -- sh -lc 'if [ -x "$HOME/.opencode/bin/opencode" ]; then
 | 关卡 | 桌面版检查什么 | 不满足时的后果 |
 |---|---|---|
 | 1. 路径与可执行位 | 探针里的 `[ -x "$HOME/.opencode/bin/opencode" ]`，输出为空就当作没装 | 列表里显示「未安装 OpenCode」，sidecar 起不来时报「{{distro}} 中未安装 OpenCode」，按钮变成「安装 OpenCode」 |
-| 2. 版本相等 | `<path> --version` 的**第一行**与桌面版自身版本完全相等（本次是 `1.19.3`） | 按钮变成「更新 OpenCode」，点击会装桌面版自己那一份 |
+| 2. 版本相等 | `<path> --version` 的**第一行**与桌面版自身版本完全相等（本次核查是 `1.19.3`，以你实际安装的桌面版为准） | 按钮变成「更新 OpenCode」，点击会装桌面版自己那一份 |
 | 3. 运行依赖 | 发行版内存在 `bash` 与 `curl`；WSL 版本必须是 2，桌面版这次探测的超时是 20 秒 | 表现为缺少 `bash`、`curl`：探针的 `sh -lc` 或安装器跑不起来，该发行版用不了 OpenCode（本次没有构造缺依赖的场景，只按代码里的硬依赖记录） |
 
 第 2 关是"相等"不是"大于等于"：CLI 比桌面版新也算不匹配。第 3 关里 WSL1 会被直接拒绝。

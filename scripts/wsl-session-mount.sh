@@ -22,21 +22,31 @@
 #   0  already attached, or attached successfully by this run
 #   2  usage error (unknown argument)
 #   3  skipped: Docker image, non-root, non-interactive without --force, or the
-#      config file is not readable
-#   4  attempted and failed: invalid mount name/path, shared propagation,
-#      device missing or ambiguous, mount failure, UUID/identity mismatch, data
-#      disk not initialized, or a bind/verification that did not stick
+#      config file is missing/unreadable
+#   4  attempted and failed: unsafe/invalid config (symlink, non-regular file,
+#      wrong owner/group, mode != 0600, malformed or disallowed content),
+#      invalid mount name/path, shared propagation, device missing or
+#      ambiguous, mount failure, UUID/identity mismatch, data disk not
+#      initialized, or a bind/verification that did not stick
 #
 # ENV OVERRIDES (internal/test)
 #   AGENT_DEVBOX_CONF             default /etc/agent-devbox.conf
+#   AGENT_DEVBOX_CONF_UID         expected conf owner uid (default 0 = root)
+#   AGENT_DEVBOX_CONF_GID         expected conf group gid (default 0 = root)
+#     The two owner overrides are TEST-ONLY: they let a non-root CI runner
+#     simulate the production root-owned file without chown. The 0600 mode is
+#     never overridable.
 #   AGENT_DEVBOX_DATADIR          default /mnt/$DATA_MNTNAME
 #   AGENT_DEVBOX_SESSION_WAIT     device wait in seconds (default 5)
 #   AGENT_DEVBOX_SESSION_TARGETS  default "/home /root /workspace"
 #   AGENT_DEVBOX_DATA_LABEL       overrides the conf DATA_LABEL (channel label)
 #
 # SAFETY
-#   No Windows interop, no formatting, no detaching, no remounting. The daemon
-#   password read from the conf is dropped before any other command runs.
+#   The conf is NEVER sourced or evaluated. A strict line parser reads only
+#   DATA_UUID / DATA_LABEL / DATA_MNTNAME; PASEO_PASSWORD, DATA_VHDX and
+#   DATA_DISTRO are recognised only to keep their line valid and are never
+#   assigned or exposed. No command substitution runs from any key.
+#   No Windows interop, no formatting, no detaching, no remounting.
 #   Diagnostics go to stderr; the success line is the only stdout output.
 #   Deliberately `set -uo pipefail` with NO `-e`: every failure must print its
 #   own warning before exiting.
@@ -86,22 +96,221 @@ if [ "$(id -u)" -ne 0 ]; then
   exit 3
 fi
 
-if [ ! -r "$CONF" ]; then
+# ---------------------------------------------------------------------------
+# Config file checks (contract order): missing/unreadable -> skip (3);
+# symlink / non-regular / wrong owner-group / wrong mode -> invalid (4).
+# Only the six-key file the Windows installer writes may be read, and it is
+# never sourced. The owner check uses AGENT_DEVBOX_CONF_UID/GID so a non-root
+# test runner can simulate the root-owned file; the 0600 mode is not
+# overridable.
+# ---------------------------------------------------------------------------
+if [ -L "$CONF" ]; then
+  warn "警告：会话挂载配置是符号链接（$CONF），拒绝读取。"
+  exit 4
+fi
+
+if [ ! -e "$CONF" ] || [ ! -r "$CONF" ]; then
   exit 3
 fi
 
+if [ ! -f "$CONF" ]; then
+  warn "警告：会话挂载配置不是普通文件（$CONF），拒绝读取。"
+  exit 4
+fi
+
+EXPECT_CONF_UID="${AGENT_DEVBOX_CONF_UID:-0}"
+EXPECT_CONF_GID="${AGENT_DEVBOX_CONF_GID:-0}"
+conf_stat="$(stat -c '%u %g %a' "$CONF" 2>/dev/null || true)"
+conf_uid=""
+conf_gid=""
+conf_mode=""
+if [ -n "$conf_stat" ]; then
+  read -r conf_uid conf_gid conf_mode <<< "$conf_stat"
+fi
+if [ "$conf_uid" != "$EXPECT_CONF_UID" ] || [ "$conf_gid" != "$EXPECT_CONF_GID" ]; then
+  warn "警告：会话挂载配置所有者不是预期用户（$CONF）。"
+  exit 4
+fi
+case "$conf_mode" in
+  600|0600) ;;
+  *)
+    warn "警告：会话挂载配置权限不是 0600（$CONF）。"
+    exit 4
+    ;;
+esac
+
 # ---------------------------------------------------------------------------
-# Conf: sourced in this process (root:root 0600) and immediately sanitized.
-# Pre-declared so `set -u` is safe even if a key is absent.
+# Strict conf reader: NO source, NO eval, NO command substitution.
+#
+# The installer writes Quote-Bash single-quoted values (a `'` around the value,
+# an embedded quote as `'\''`); older images may have bare values and the tests
+# use simple double-quoted ones. Only DATA_UUID / DATA_LABEL / DATA_MNTNAME are
+# kept; PASEO_PASSWORD / DATA_VHDX / DATA_DISTRO have their line validated but
+# are never assigned, so the daemon password never enters this process.
 # ---------------------------------------------------------------------------
-DATA_VHDX=""
 DATA_UUID=""
 DATA_LABEL=""
 DATA_MNTNAME=""
+CONF_VALUE=""
 
-# shellcheck source=/dev/null
-. "$CONF"
-# The daemon password is not needed here and must never linger in this process.
+# valid_conf_token: the six-key file only ever carries these characters for the
+# keys this helper consumes. Anything else (space, ;, $, backtick, quotes,
+# slashes, ...) fails closed.
+valid_conf_token() {
+  case "$1" in
+    ''|*[!A-Za-z0-9._-]*) return 1 ;;
+  esac
+  return 0
+}
+
+# parse_conf_value <raw>: decode one value without executing anything and store
+# it in CONF_VALUE. Returns 1 on malformed/unterminated quoting or on trailing
+# garbage after a closing quote.
+parse_conf_value() {
+  local raw="$1" out="" i=0 len c n
+  len=${#raw}
+  if [ "$len" -eq 0 ]; then
+    CONF_VALUE=""
+    return 0
+  fi
+  c="${raw:0:1}"
+  case "$c" in
+    "'")
+      i=1
+      while [ "$i" -lt "$len" ]; do
+        c="${raw:i:1}"
+        if [ "$c" = "'" ]; then
+          if [ "${raw:i+1:1}" = "\\" ] && [ "${raw:i+2:1}" = "'" ] && [ "${raw:i+3:1}" = "'" ]; then
+            out+="'"
+            i=$((i + 4))
+            continue
+          fi
+          if [ "$((i + 1))" -ne "$len" ]; then
+            return 1
+          fi
+          CONF_VALUE="$out"
+          return 0
+        fi
+        out+="$c"
+        i=$((i + 1))
+      done
+      return 1
+      ;;
+    '"')
+      i=1
+      while [ "$i" -lt "$len" ]; do
+        c="${raw:i:1}"
+        if [ "$c" = "\\" ]; then
+          n="${raw:i+1:1}"
+          case "$n" in
+            '"') out+='"' ;;
+            "\\") out+="\\" ;;
+            '$') out+='$' ;;
+            '`') out+='`' ;;
+            *) out+="\\$n" ;;
+          esac
+          i=$((i + 2))
+          continue
+        fi
+        if [ "$c" = '"' ]; then
+          if [ "$((i + 1))" -ne "$len" ]; then
+            return 1
+          fi
+          CONF_VALUE="$out"
+          return 0
+        fi
+        case "$c" in
+          '$'|'`') return 1 ;;
+        esac
+        out+="$c"
+        i=$((i + 1))
+      done
+      return 1
+      ;;
+    "\\")
+      return 1
+      ;;
+    *)
+      case "$raw" in
+        *[\'\"\\]*) return 1 ;;
+      esac
+      CONF_VALUE="$raw"
+      return 0
+      ;;
+  esac
+}
+
+# parse_conf_file <file>: line-by-line allowlist. Blank lines and `#` comments
+# are ignored; only the six installer keys are accepted; duplicates and any
+# other line fail closed. Values are parsed for every key but retained only for
+# the three this helper uses.
+parse_conf_file() {
+  local file="$1" line key raw
+  local have_uuid=0 have_label=0 have_mntname=0
+  while IFS= read -r line || [ -n "$line" ]; do
+    if [[ "$line" == *[[:cntrl:]]* ]]; then
+      return 1
+    fi
+    if [ -z "$line" ]; then
+      continue
+    fi
+    case "$line" in
+      '#'*) continue ;;
+    esac
+    case "$line" in
+      [A-Z_]*=*) ;;
+      *) return 1 ;;
+    esac
+    key="${line%%=*}"
+    raw="${line#*=}"
+    case "$key" in
+      DATA_UUID|DATA_LABEL|DATA_MNTNAME|DATA_VHDX|PASEO_PASSWORD|DATA_DISTRO) ;;
+      *) return 1 ;;
+    esac
+    case "$key" in
+      DATA_UUID)
+        [ "$have_uuid" -eq 0 ] || return 1
+        parse_conf_value "$raw" || return 1
+        DATA_UUID="$CONF_VALUE"
+        have_uuid=1
+        ;;
+      DATA_LABEL)
+        [ "$have_label" -eq 0 ] || return 1
+        parse_conf_value "$raw" || return 1
+        DATA_LABEL="$CONF_VALUE"
+        have_label=1
+        ;;
+      DATA_MNTNAME)
+        [ "$have_mntname" -eq 0 ] || return 1
+        parse_conf_value "$raw" || return 1
+        DATA_MNTNAME="$CONF_VALUE"
+        have_mntname=1
+        ;;
+      *)
+        parse_conf_value "$raw" || return 1
+        CONF_VALUE=""
+        ;;
+    esac
+  done < "$file"
+  # A missing key keeps its default; a present-but-empty used key fails closed.
+  if [ "$have_uuid" -eq 1 ] && ! valid_conf_token "$DATA_UUID"; then
+    return 1
+  fi
+  if [ "$have_label" -eq 1 ] && ! valid_conf_token "$DATA_LABEL"; then
+    return 1
+  fi
+  if [ "$have_mntname" -eq 1 ] && ! valid_conf_token "$DATA_MNTNAME"; then
+    return 1
+  fi
+  return 0
+}
+
+if ! parse_conf_file "$CONF"; then
+  warn "警告：会话挂载配置内容无效（$CONF），本次会话不挂载。"
+  exit 4
+fi
+
+# Defense in depth: the daemon password is never parsed, and must never linger.
 unset PASEO_PASSWORD
 
 MNTNAME="${DATA_MNTNAME:-devbox-data}"
@@ -242,12 +451,7 @@ while :; do
 done
 
 if [ -z "$DEVICE" ]; then
-  if [ -n "${DATA_VHDX:-}" ]; then
-    install_dir="${DATA_VHDX%\\*}"
-  else
-    install_dir='<安装目录>'
-  fi
-  warn "警告：持久数据盘未附加；本次会话的 /home /root /workspace 仍在系统盘。修复：cmd.exe /c \"$install_dir\\mount-datadisk.cmd\" 后重开终端，或稍后在 Windows 侧运行 wsl --terminate <发行版>。"
+  warn "警告：持久数据盘未附加；本次会话的 /home /root /workspace 仍在系统盘。修复：cmd.exe /c \"<安装目录>\\mount-datadisk.cmd\" 后重开终端，或稍后在 Windows 侧运行 wsl --terminate <发行版>。"
   exit 4
 fi
 

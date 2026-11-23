@@ -61,6 +61,16 @@ setup() {
   export BOUND="$TMP/bound"
   export DOCKERD_PIDFILE="$AGENT_DEVBOX_DOCKERD_PID"
   export PASEO_PIDFILE="$AGENT_DEVBOX_PASEO_PID"
+  # findmnt/lsblk identity fixtures (P2-B1): the already-mounted verifier and
+  # the fresh-mount verifier answer from these; a case overrides one at a time.
+  export FM_SOURCE=/dev/fakedev
+  export FM_FSTYPE=ext4
+  export FM_OPTIONS=rw,relatime
+  export FM_UUID=test-uuid-1234
+  export FM_LABEL=devbox-data
+  export FM_MAJMIN=8:1
+  export LSBLK_ID=8:1
+  export LSBLK_COUNT="$TMP/lsblk.count"
   mkdir -p "$BINDIR" "$AGENT_DEVBOX_DATADIR" "$AGENT_DEVBOX_PROC_FS/sys/kernel/random"
   printf 'boot-test\n' > "$AGENT_DEVBOX_PROC_FS/sys/kernel/random/boot_id"
   : > "$CALL_LOG"
@@ -71,16 +81,51 @@ setup() {
 
 teardown() { rm -rf "$TMP"; }
 
-# base_shims: findmnt reports "mounted" iff the marker exists; sleep is instant;
-# blkid resolves the UUID to a fake device; mount records its argv and "mounts";
-# mkdir is a no-op (the script only needs the mountpoint to appear in findmnt).
+# base_shims: findmnt reports "mounted" iff the marker exists and answers the
+# identity field query from the FM_* fixtures; sleep is instant; blkid resolves
+# the UUID to a fake device; mount records its argv and "mounts"; mkdir is a
+# no-op (the script only needs the mountpoint to appear in findmnt).
 base_shims() {
   cat > "$BINDIR/findmnt" <<'SH'
 #!/bin/sh
-if [ -e "$MOUNT_MARKER" ]; then
-  exit 0
-fi
+case "$*" in
+  *"--mountpoint"*)
+    [ -e "$MOUNT_MARKER" ] || exit 1
+    case "$*" in
+      *"SOURCE,FSTYPE,OPTIONS,UUID,LABEL,MAJ:MIN"*)
+        printf 'SOURCE="%s" FSTYPE="%s" OPTIONS="%s" UUID="%s" LABEL="%s" MAJ:MIN="%s"\n' \
+          "${FM_SOURCE-/dev/fakedev}" "${FM_FSTYPE-ext4}" \
+          "${FM_OPTIONS-rw,relatime}" "${FM_UUID-test-uuid-1234}" \
+          "${FM_LABEL-devbox-data}" "${FM_MAJMIN-8:1}"
+        exit 0 ;;
+      *"UUID"*)
+        printf '%s\n' "${FM_UUID-test-uuid-1234}"
+        exit 0 ;;
+    esac
+    exit 0 ;;
+  *"-t cgroup2"*)
+    [ -e "$MOUNT_MARKER" ] && exit 0
+    exit 1 ;;
+esac
+[ -e "$MOUNT_MARKER" ] && exit 0
 exit 1
+SH
+  # Kernel device id (major:minor). DEV change simulation: LSBLK_ID2 answers
+  # from the second call on; LSBLK_EMPTY models an unidentifiable device.
+  cat > "$BINDIR/lsblk" <<'SH'
+#!/bin/sh
+echo "lsblk $*" >> "$CALL_LOG"
+if [ -n "${LSBLK_EMPTY:-}" ]; then exit 0; fi
+n=0
+if [ -f "$LSBLK_COUNT" ]; then n=$(cat "$LSBLK_COUNT"); fi
+n=$((n + 1))
+echo "$n" > "$LSBLK_COUNT"
+if [ "$n" -ge 2 ] && [ -n "${LSBLK_ID2:-}" ]; then
+  printf '%s\n' "$LSBLK_ID2"
+else
+  printf '%s\n' "${LSBLK_ID:-8:1}"
+fi
+exit 0
 SH
   cat > "$BINDIR/sleep" <<'SH'
 #!/bin/sh
@@ -219,6 +264,12 @@ conf_with_mntname() {
 # installer writes them) plus the per-channel data-disk ext4 label.
 conf_with_label() {
   printf 'DATA_VHDX="%s"\nDATA_UUID="test-uuid-1234"\nDATA_LABEL="%s"\n' "$VHDX" "$1" > "$AGENT_DEVBOX_CONF"
+}
+
+# conf_label_only <label>: a conf with no DATA_UUID, so identity falls back to
+# the channel ext4 label exactly as a legacy/seed conf does.
+conf_label_only() {
+  printf 'DATA_VHDX="%s"\nDATA_LABEL="%s"\n' "$VHDX" "$1" > "$AGENT_DEVBOX_CONF"
 }
 
 # assert_log_has <substr>: the mount/blkid shims recorded this substring.
@@ -430,14 +481,152 @@ publish_paseo() {
   grep -Fq 'WARN: invalid PASEO_LISTEN' "$err"
 }
 
-@test "already mounted: rc 0 and no mount/blkid call" {
+@test "already mounted with valid ext4/rw/UUID+MAJ:MIN: rc 0 and no mount call" {
   : > "$MOUNT_MARKER"
   base_shims
   conf_with_vhdx
   run bash -c '. "$SCRIPT"; load_conf; ensure_mounted'
+  boot_out="$output"
   [ "$status" -eq 0 ]
   assert_log_lacks 'mount'
-  assert_log_lacks 'blkid'
+  printf '%s' "$boot_out" | grep -Fq '数据盘挂载身份校验通过'
+}
+
+@test "already mounted: errors=remount-ro is not mistaken for a read-only mount" {
+  : > "$MOUNT_MARKER"
+  base_shims
+  conf_with_vhdx
+  export FM_OPTIONS='rw,errors=remount-ro'
+  run bash -c '. "$SCRIPT"; load_conf; ensure_mounted'
+  [ "$status" -eq 0 ]
+  assert_log_lacks 'mount'
+}
+
+@test "already mounted: wrong FSTYPE fails closed (rc 1, no seed/bind)" {
+  : > "$MOUNT_MARKER"
+  base_shims
+  conf_with_vhdx
+  export FM_FSTYPE=xfs
+  run bash -c '. "$SCRIPT"; load_conf; ensure_mounted'
+  boot_out="$output"
+  [ "$status" -eq 1 ]
+  assert_log_lacks 'mount'
+  printf '%s' "$boot_out" | grep -Fq 'FSTYPE=xfs'
+  printf '%s' "$boot_out" | grep -Fq 'boot failed: maintenance mode'
+  [ -s "$AGENT_DEVBOX_MOTD" ]
+}
+
+@test "already mounted: read-only mount fails closed (rc 1, no seed/bind)" {
+  : > "$MOUNT_MARKER"
+  base_shims
+  conf_with_vhdx
+  export FM_OPTIONS='ro,relatime'
+  run bash -c '. "$SCRIPT"; load_conf; ensure_mounted'
+  boot_out="$output"
+  [ "$status" -eq 1 ]
+  assert_log_lacks 'mount'
+  printf '%s' "$boot_out" | grep -Fq '期望可写'
+  printf '%s' "$boot_out" | grep -Fq 'boot failed: maintenance mode'
+  [ -s "$AGENT_DEVBOX_MOTD" ]
+}
+
+@test "already mounted: wrong UUID fails closed even if the label matches" {
+  : > "$MOUNT_MARKER"
+  base_shims
+  conf_with_label 'devbox-data'
+  export FM_UUID=22222222-2222-2222-2222-222222222222 FM_LABEL=devbox-data
+  run bash -c '. "$SCRIPT"; load_conf; ensure_mounted'
+  boot_out="$output"
+  [ "$status" -eq 1 ]
+  assert_log_lacks 'mount'
+  printf '%s' "$boot_out" | grep -Fq 'UUID mismatch'
+  printf '%s' "$boot_out" | grep -Fq 'boot failed: maintenance mode'
+  [ -s "$AGENT_DEVBOX_MOTD" ]
+}
+
+@test "already mounted: missing UUID when DATA_UUID is set fails closed" {
+  : > "$MOUNT_MARKER"
+  base_shims
+  conf_with_vhdx
+  export FM_UUID=''
+  run bash -c '. "$SCRIPT"; load_conf; ensure_mounted'
+  [ "$status" -eq 1 ]
+  boot_out="$output"
+  assert_log_lacks 'mount'
+  printf '%s' "$boot_out" | grep -Fq 'UUID mismatch'
+  printf '%s' "$boot_out" | grep -Fq 'boot failed: maintenance mode'
+}
+
+@test "already mounted: more than one mount record fails closed" {
+  : > "$MOUNT_MARKER"
+  base_shims
+  conf_with_vhdx
+  cat > "$BINDIR/findmnt" <<'SH'
+#!/bin/sh
+case "$*" in
+  *"--mountpoint"*)
+    [ -e "$MOUNT_MARKER" ] || exit 1
+    case "$*" in
+      *"SOURCE,FSTYPE,OPTIONS,UUID,LABEL,MAJ:MIN"*)
+        printf 'SOURCE="%s" FSTYPE="%s" OPTIONS="%s" UUID="%s" LABEL="%s" MAJ:MIN="%s"\n' \
+          /dev/fakedev ext4 rw test-uuid-1234 devbox-data 8:1
+        printf 'SOURCE="%s" FSTYPE="%s" OPTIONS="%s" UUID="%s" LABEL="%s" MAJ:MIN="%s"\n' \
+          /dev/fakedev ext4 rw test-uuid-1234 devbox-data 8:1
+        exit 0 ;;
+    esac
+    exit 0 ;;
+esac
+[ -e "$MOUNT_MARKER" ] && exit 0
+exit 1
+SH
+  chmod +x "$BINDIR/findmnt"
+  run bash -c '. "$SCRIPT"; load_conf; ensure_mounted'
+  [ "$status" -eq 1 ]
+  boot_out="$output"
+  assert_log_lacks 'mount'
+  printf '%s' "$boot_out" | grep -Fq '不是恰好一条'
+  printf '%s' "$boot_out" | grep -Fq 'boot failed: maintenance mode'
+}
+
+@test "already mounted: wrong LABEL (UUID absent) fails closed" {
+  : > "$MOUNT_MARKER"
+  base_shims
+  conf_label_only 'devbox-data'
+  export FM_UUID='' FM_LABEL='wrong-label'
+  run bash -c '. "$SCRIPT"; load_conf; ensure_mounted'
+  boot_out="$output"
+  [ "$status" -eq 1 ]
+  assert_log_lacks 'mount'
+  printf '%s' "$boot_out" | grep -Fq "LABEL='wrong-label'"
+  printf '%s' "$boot_out" | grep -Fq 'boot failed: maintenance mode'
+  [ -s "$AGENT_DEVBOX_MOTD" ]
+}
+
+@test "already mounted: wrong MAJ:MIN fails closed" {
+  : > "$MOUNT_MARKER"
+  base_shims
+  conf_with_vhdx
+  export FM_MAJMIN=8:2
+  run bash -c '. "$SCRIPT"; load_conf; ensure_mounted'
+  boot_out="$output"
+  [ "$status" -eq 1 ]
+  assert_log_lacks 'mount'
+  printf '%s' "$boot_out" | grep -Fq 'MAJ:MIN=8:2'
+  printf '%s' "$boot_out" | grep -Fq 'boot failed: maintenance mode'
+  [ -s "$AGENT_DEVBOX_MOTD" ]
+}
+
+@test "already mounted but the device cannot be resolved: fail closed" {
+  : > "$MOUNT_MARKER"
+  base_shims
+  fail_blkid
+  conf_with_vhdx
+  run bash -c '. "$SCRIPT"; load_conf; ensure_mounted'
+  boot_out="$output"
+  [ "$status" -eq 1 ]
+  assert_log_lacks 'mount'
+  printf '%s' "$boot_out" | grep -Fq '无法唯一解析其设备'
+  printf '%s' "$boot_out" | grep -Fq 'boot failed: maintenance mode'
 }
 
 @test "empty DATA_VHDX: rc 1 and no mount call" {
@@ -520,9 +709,101 @@ publish_paseo() {
   base_shims
   conf_with_vhdx
   run bash -c '. "$SCRIPT"; load_conf; ensure_mounted'
+  boot_out="$output"
   [ "$status" -eq 0 ]
   assert_log_has 'mount -t ext4 /dev/fakedev'
   assert_log_has "$AGENT_DEVBOX_DATADIR"
+  printf '%s' "$boot_out" | grep -Fq '数据盘挂载身份校验通过'
+}
+
+@test "label-only disk with the matching label mounts" {
+  base_shims
+  conf_label_only 'devbox-data'
+  export FM_UUID='' FM_LABEL='devbox-data'
+  run bash -c '. "$SCRIPT"; load_conf; ensure_mounted'
+  [ "$status" -eq 0 ]
+  assert_log_has 'mount -t ext4 /dev/fakedev'
+}
+
+@test "label-only disk with the wrong label fails closed (no seed/bind)" {
+  base_shims
+  conf_label_only 'devbox-data'
+  export FM_UUID='' FM_LABEL='wrong-label'
+  run bash -c '. "$SCRIPT"; load_conf; ensure_mounted'
+  [ "$status" -eq 1 ]
+  boot_out="$output"
+  # The device was resolved through the label, so the mount is attempted; the
+  # post-mount verifier is what rejects the mismatching label (never seeds/binds).
+  assert_log_has 'mount -t ext4 /dev/fakedev'
+  printf '%s' "$boot_out" | grep -Fq "LABEL='wrong-label'"
+  printf '%s' "$boot_out" | grep -Fq 'boot failed: maintenance mode'
+  [ -s "$AGENT_DEVBOX_MOTD" ]
+}
+
+@test "unidentifiable device (empty lsblk): no mount, fail closed" {
+  base_shims
+  conf_with_vhdx
+  export LSBLK_EMPTY=1
+  run bash -c '. "$SCRIPT"; load_conf; ensure_mounted'
+  boot_out="$output"
+  [ "$status" -eq 1 ]
+  assert_log_lacks 'mount'
+  printf '%s' "$boot_out" | grep -Fq '无法获取数据盘'
+  printf '%s' "$boot_out" | grep -Fq 'boot failed: maintenance mode'
+}
+
+@test "device identity changes between resolve and mount: no mount" {
+  base_shims
+  conf_with_vhdx
+  export LSBLK_ID2=8:2
+  run bash -c '. "$SCRIPT"; load_conf; ensure_mounted'
+  boot_out="$output"
+  [ "$status" -eq 1 ]
+  assert_log_lacks 'mount'
+  printf '%s' "$boot_out" | grep -Fq '设备在解析后发生变化'
+  printf '%s' "$boot_out" | grep -Fq 'boot failed: maintenance mode'
+  [ -s "$AGENT_DEVBOX_MOTD" ]
+}
+
+@test "re-resolve becomes ambiguous before mount: no mount" {
+  base_shims
+  conf_with_vhdx
+  cat > "$BINDIR/blkid" <<'SH'
+#!/bin/sh
+case "$*" in
+  *"UUID="*)
+    n=0
+    if [ -f "$TMP/blkid.count" ]; then n=$(cat "$TMP/blkid.count"); fi
+    n=$((n + 1))
+    echo "$n" > "$TMP/blkid.count"
+    if [ "$n" -ge 3 ]; then
+      printf '%s\n%s\n' /dev/one /dev/two
+    else
+      printf '%s\n' /dev/fakedev
+    fi
+    exit 0 ;;
+esac
+exit 1
+SH
+  chmod +x "$BINDIR/blkid"
+  run bash -c '. "$SCRIPT"; load_conf; ensure_mounted'
+  boot_out="$output"
+  [ "$status" -eq 1 ]
+  assert_log_lacks 'mount'
+  printf '%s' "$boot_out" | grep -Fq 'boot failed: maintenance mode'
+}
+
+@test "post-mount MAJ:MIN mismatch: rc 1, maintenance banner, no seed/bind" {
+  base_shims
+  conf_with_vhdx
+  export FM_MAJMIN=8:2
+  run bash -c '. "$SCRIPT"; load_conf; ensure_mounted'
+  boot_out="$output"
+  [ "$status" -eq 1 ]
+  assert_log_has 'mount -t ext4 /dev/fakedev'
+  printf '%s' "$boot_out" | grep -Fq 'MAJ:MIN=8:2'
+  printf '%s' "$boot_out" | grep -Fq 'boot failed: maintenance mode'
+  [ -s "$AGENT_DEVBOX_MOTD" ]
 }
 
 @test "blkid never resolves the UUID: rc 1 and no mount call" {
@@ -952,27 +1233,38 @@ SH
 @test "main: a UUID mismatch writes the maintenance banner and exits 0" {
   base_shims
   # Device present, mount marker set, but the UUID read from the mounted disk differs.
-  : > "$DEVICE_FLAG"
   : > "$MOUNT_MARKER"
   cat > "$AGENT_DEVBOX_CONF" <<'SH'
 DATA_UUID='11111111-1111-1111-1111-111111111111'
 DATA_MNTNAME='devbox-data'
 SH
-  cat > "$BINDIR/findmnt" <<'SH'
-#!/bin/sh
-case " $* " in
-  *" UUID "*) printf '%s\n' '22222222-2222-2222-2222-222222222222'; exit 0 ;;
-esac
-if [ -e "$MOUNT_MARKER" ]; then exit 0; fi
-exit 1
-SH
-  chmod +x "$BINDIR/findmnt"
+  export FM_UUID=22222222-2222-2222-2222-222222222222
   run bash -c '. "$SCRIPT"; main'
   [ "$status" -eq 0 ]
   printf '%s' "$output" | grep -Fq 'UUID mismatch'
   printf '%s' "$output" | grep -Fq 'boot failed: maintenance mode'
   ! printf '%s' "$output" | grep -Fq 'boot complete'
   ! printf '%s' "$output" | grep -Fq '启动 paseo 服务'
+  grep -Fq 'mount-datadisk.cmd' "$AGENT_DEVBOX_MOTD"
+}
+
+@test "main: failed mount identity never seeds, binds or starts services" {
+  base_shims
+  : > "$MOUNT_MARKER"
+  conf_with_vhdx
+  export FM_FSTYPE=xfs
+  run bash -c '. "$SCRIPT"; main'
+  [ "$status" -eq 0 ]
+  printf '%s' "$output" | grep -Fq 'boot failed: maintenance mode'
+  printf '%s' "$output" | grep -Fq 'FATAL: data disk not mounted'
+  ! printf '%s' "$output" | grep -Fq '首次运行'
+  ! printf '%s' "$output" | grep -Fq '绑定 /home'
+  ! printf '%s' "$output" | grep -Fq 'boot complete'
+  assert_log_lacks 'mount'
+  assert_log_lacks 'tar'
+  assert_log_lacks 'setsid'
+  assert_log_lacks 'docker '
+  [ ! -e "$AGENT_DEVBOX_DATADIR/.initialized" ]
   grep -Fq 'mount-datadisk.cmd' "$AGENT_DEVBOX_MOTD"
 }
 

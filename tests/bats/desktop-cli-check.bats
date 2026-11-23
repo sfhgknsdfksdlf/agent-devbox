@@ -259,3 +259,139 @@ SH
   [ "$status" -eq 2 ]
   [[ "$output" == *"--home 缺少参数"* ]]
 }
+
+# fake_opencode_marker <home> <version>: a desktop-style shim that records that
+# it ran, so a test can prove the executable was NOT invoked.
+fake_opencode_marker() {
+  mkdir -p "$1/.opencode/bin"
+  cat > "$1/.opencode/bin/opencode" <<SH
+#!/bin/sh
+: > "$TMP/executed.marker"
+echo "$2"
+SH
+  chmod +x "$1/.opencode/bin/opencode"
+}
+
+@test "invalid AGENT_DEVBOX_VERSION_TIMEOUT values exit 2 before any probe or CLI" {
+  fake_opencode_marker "$HOME_DIR" "1.19.3"
+  printf '#!/bin/sh\n: > "$TMP/cli.marker"\necho 9.9.9\n' > "$BINDIR/fakecli"
+  chmod +x "$BINDIR/fakecli"
+
+  for bad in "" "0" "61" "-1" "abc" "1.5"; do
+    run env AGENT_DEVBOX_VERSION_TIMEOUT="$bad" \
+      AGENT_DEVBOX_DESKTOP_CLIS="fakecli" "$SCRIPT" --home "$HOME_DIR"
+    [ "$status" -eq 2 ]
+    [[ "$output" == *"AGENT_DEVBOX_VERSION_TIMEOUT"* ]]
+    [ ! -e "$TMP/executed.marker" ]
+    [ ! -e "$TMP/cli.marker" ]
+  done
+}
+
+@test "missing or non-executable timeout never runs the target and fails closed" {
+  fake_opencode_marker "$HOME_DIR" "1.19.3"
+  printf '#!/bin/sh\n: > "$TMP/cli.marker"\necho 9.9.9\n' > "$BINDIR/fakecli"
+  chmod +x "$BINDIR/fakecli"
+  mkdir -p "$TMP/notexec"
+  printf '#!/bin/sh\n' > "$TMP/notexec/no-timeout"
+  chmod -x "$TMP/notexec/no-timeout"
+
+  for bad_timeout in "$TMP/absent-timeout" "$TMP/notexec/no-timeout"; do
+    run env AGENT_DEVBOX_TIMEOUT_BIN="$bad_timeout" \
+      AGENT_DEVBOX_DESKTOP_CLIS="fakecli" "$SCRIPT" --home "$HOME_DIR"
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"缺少可执行的 timeout"* ]]
+    [[ "$output" == *"结论: FAIL"* ]]
+    [ ! -e "$TMP/executed.marker" ]
+    [ ! -e "$TMP/cli.marker" ]
+  done
+}
+
+@test "invalid CLI names exit 2 before any probe or CLI execution" {
+  fake_opencode_marker "$HOME_DIR" "1.19.3"
+  printf '#!/bin/sh\n: > "$TMP/cli.marker"\necho 9.9.9\n' > "$BINDIR/fakecli"
+  chmod +x "$BINDIR/fakecli"
+
+  for bad in '../evil' '-rf' 'a;b' '$x'; do
+    run env AGENT_DEVBOX_DESKTOP_CLIS="$bad" "$SCRIPT" --home "$HOME_DIR"
+    [ "$status" -eq 2 ]
+    [[ "$output" == *"CLI 名称不合法"* ]]
+    [ ! -e "$TMP/executed.marker" ]
+    [ ! -e "$TMP/cli.marker" ]
+  done
+}
+
+@test "AGENT_DEVBOX_DESKTOP_CLIS is space-separated: 'a b' is two names" {
+  fake_opencode "$HOME_DIR" "1.19.3"
+
+  run env AGENT_DEVBOX_DESKTOP_CLIS="a b" "$SCRIPT" --home "$HOME_DIR"
+
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"未安装"* ]]
+  [[ "$output" == *"结论: PASS"* ]]
+}
+
+@test "a non-absolute builtin resolution is never executed as --version" {
+  fake_opencode "$HOME_DIR" "1.19.3"
+
+  run env AGENT_DEVBOX_DESKTOP_CLIS="echo" "$SCRIPT" --home "$HOME_DIR"
+
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"不是绝对路径"* ]]
+  [[ "$output" == *"不会执行 --version"* ]]
+  [[ "$output" == *"PASS（有警告"* ]]
+  [[ "$output" != *"GNU coreutils"* ]]
+}
+
+@test "a relative PATH resolution is reported, not executed" {
+  fake_opencode "$HOME_DIR" "1.19.3"
+  mkdir -p "$TMP/rel"
+  printf '#!/bin/sh\n: > "$TMP/executed.marker"\necho 9.9.9\n' > "$TMP/rel/relcli"
+  chmod +x "$TMP/rel/relcli"
+
+  ( cd "$TMP" && PATH="rel:$PATH" AGENT_DEVBOX_DESKTOP_CLIS="relcli" \
+      AGENT_DEVBOX_DESKTOP_CURRENT_HOME="$HOME_DIR" \
+      "$SCRIPT" --home "$HOME_DIR" ) > "$TMP/out" 2>&1
+  rc=$?
+
+  [ "$rc" -eq 0 ]
+  grep -q "不是绝对路径" "$TMP/out"
+  [ ! -e "$TMP/executed.marker" ]
+}
+
+@test "an optional CLI with a failing --version is a warning, not PASS-silent" {
+  fake_opencode "$HOME_DIR" "1.19.3"
+  printf '#!/bin/sh\necho 9.9.9\nexit 3\n' > "$BINDIR/failingcli"
+  chmod +x "$BINDIR/failingcli"
+
+  run env AGENT_DEVBOX_DESKTOP_CLIS="failingcli" "$SCRIPT" --home "$HOME_DIR"
+
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"警告"* ]]
+  [[ "$output" == *"退出码 3"* ]]
+  [[ "$output" == *"PASS（有警告"* ]]
+}
+
+@test "opencode on PATH with a failing --version is app-critical" {
+  fake_opencode "$HOME_DIR" "1.19.3"
+  printf '#!/bin/sh\necho 1.19.3\nexit 3\n' > "$BINDIR/opencode"
+  chmod +x "$BINDIR/opencode"
+
+  run env AGENT_DEVBOX_DESKTOP_CLIS="opencode" "$SCRIPT" --home "$HOME_DIR"
+
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"opencode 版本命令失败"* ]]
+  [[ "$output" == *"结论: FAIL"* ]]
+}
+
+@test "a path with spaces is shell-quoted and fix hints use --" {
+  SPACED="$TMP/home with space"
+  mkdir -p "$SPACED"
+
+  run env AGENT_DEVBOX_DESKTOP_CURRENT_HOME="$SPACED" \
+    AGENT_DEVBOX_DESKTOP_CLIS="fakecli" "$SCRIPT" --home "$SPACED"
+
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"mkdir -p --"* ]]
+  [[ "$output" == *"ln -sfn --"* ]]
+  [[ "$output" == *'home\ with\ space'* ]]
+}

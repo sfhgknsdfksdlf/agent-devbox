@@ -14,7 +14,7 @@ The default image `agent-devbox` adds these on top of `agent-devbox-core`.
 | DeepSeek Harness | `@deepseek-ai/dsh` | `dsh` | Node >=24.9 | **pnpm** (plugins), git |
 | Grok Build | `@xai-official/grok` | `grok` | native binary | git, `config.toml`, API key |
 | zcode | `zcode-app-cli` | `zcode` | Node >=22.19 | git (community client of Z.ai ZCode) |
-| Aider | `pipx install aider-chat` | `aider` | Python | git, OpenAI/Anthropic keys |
+| Aider | `uv tool install --python 3.12 aider-chat` | `aider` | Python 3.12 (uv tool) | git, OpenAI/Anthropic keys |
 
 Common baseline already present: `git`, `ripgrep`, `gh` (install via apt or the
 GitHub CLI), Node 24.x (satisfies the >=24.9 dsh floor and the >=22.19
@@ -28,6 +28,10 @@ requirements of Pi/zcode), `patch`, `rsync`.
   ZCode is build-from-source. Treat the community package's trust accordingly.
 - **DeepSeek Harness** is a public preview (`@deepseek-ai/dsh`); the CLI needs
   `pnpm` at runtime for `dsh plugin` operations.
+- **Aider** comes from the `aider-chat` package on a uv-managed Python 3.12
+  (`uv tool install --python 3.12 aider-chat`). `UV_TOOL_BIN_DIR=/usr/local/bin`
+  puts the `aider` shim there. It is part of the `agents` image; `core` has no
+  Aider.
 - Credentials live under the user's home (`~/.claude`, `~/.codex`, `~/.gemini`,
   `~/.grok`, etc.) and therefore persist via the mounted/writable home.
 

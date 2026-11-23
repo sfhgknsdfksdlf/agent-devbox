@@ -10,4 +10,10 @@ data
 *.tar.zst
 *.zst
 .env
+# Local-only artefacts: unit-test output, the env template, planning notes and
+# the progress notepad must never ship inside the image or leak to the builder.
+testResults.xml
+.env.example
+.omo
+PROGRESS.md
 **/*.md
