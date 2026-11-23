@@ -1387,6 +1387,131 @@ function Format-NativeOutput {
   return $text
 }
 
+# SYSTEM / LOCAL SERVICE / NETWORK SERVICE 不是明确的交互式用户：它们没有
+# 用户会话，拿它们给数据盘设所有者只会让非提权终端打不开盘。任何一处解析出
+# 这三个 SID 都必须先停下，绝不进入 icacls。
+function Test-AgentDevboxNonInteractiveSid {
+  [CmdletBinding()]
+  param([AllowEmptyString()][string] $Sid)
+  return (@('S-1-5-18', 'S-1-5-19', 'S-1-5-20') -contains ("$Sid").ToUpperInvariant())
+}
+
+# 把“交互式用户名或 SID”固定成一个数字 SID。icacls 只接受 *<SID>：本地化
+# 账户名（Administrator/Administrateur…）会让所有者验证在不同语言的 Windows
+# 上失效。只解析 SID 字符串时用正则，不调用 Windows 专属的 Principal API，
+# 这样 Linux 上的 Pester 也能覆盖同一段逻辑。
+function Get-AgentDevboxSid {
+  [CmdletBinding()]
+  param([Parameter(Mandatory)][AllowEmptyString()][string] $Identity)
+  $text = "$Identity".Trim()
+  if (-not $text) {
+    throw '未指定交互式用户：数据盘所有者不能为空（拒绝以 SYSTEM 或服务账户继续）。'
+  }
+  if ($text -match '^[Ss]-1(?:-\d+)+$') {
+    $sid = $text.ToUpperInvariant()
+  } else {
+    try {
+      $account = New-Object -TypeName System.Security.Principal.NTAccount -ArgumentList $text
+      $sid = $account.Translate([System.Security.Principal.SecurityIdentifier]).Value
+    } catch {
+      throw "无法把交互式用户 $text 解析为 SID：$($_.Exception.Message)"
+    }
+  }
+  if (Test-AgentDevboxNonInteractiveSid -Sid $sid) {
+    throw "交互式用户解析为 $sid（SYSTEM/LOCAL SERVICE/NETWORK SERVICE）：没有明确的交互式用户，已停止，未修改数据盘 ACL。"
+  }
+  return $sid
+}
+
+# ACL 里的其他条目（SYSTEM/Administrators…）只是用来跳过，不是目标用户；
+# 它们可能本身是服务 SID，所以这里只做纯翻译，不套用上面的交互用户门禁。
+# 解析不了就返回空串，绝不把它误当成目标 SID。
+function ConvertTo-AgentDevboxIdentitySid {
+  [CmdletBinding()]
+  param([AllowNull()] $IdentityReference)
+  if ($null -eq $IdentityReference) { return '' }
+  if ($IdentityReference -is [System.Security.Principal.SecurityIdentifier]) {
+    return $IdentityReference.Value
+  }
+  $text = "$IdentityReference".Trim()
+  if (-not $text) { return '' }
+  if ($text -match '^[Ss]-1(?:-\d+)+$') { return $text.ToUpperInvariant() }
+  try {
+    $account = New-Object -TypeName System.Security.Principal.NTAccount -ArgumentList $text
+    return $account.Translate([System.Security.Principal.SecurityIdentifier]).Value
+  } catch { return '' }
+}
+
+# 数据盘必须归“当前交互用户”所有，并且有一条显式的 Allow FullControl。
+# 两次 icacls 的退出码都立即检查；随后 Get-Acl 复核所有者与权限，任何一项
+# 不满足都抛错 —— 安装器会因此停在 [8/10]，绝不会继续写 conf 或密码。
+function Set-AgentDevboxVhdAcl {
+  [CmdletBinding()]
+  param(
+    [Parameter(Mandatory)][string] $Path,
+    [Parameter(Mandatory)][AllowEmptyString()][string] $InteractiveUser
+  )
+  if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+    throw "数据盘文件不存在，无法设置所有者/ACL：$Path"
+  }
+  $targetSid = Get-AgentDevboxSid -Identity $InteractiveUser
+  # Get-AgentDevboxSid 已拒绝服务 SID；这里再挡一次，防止调用方/测试绕过。
+  if (Test-AgentDevboxNonInteractiveSid -Sid $targetSid) {
+    throw "交互式用户是 $targetSid（SYSTEM/LOCAL SERVICE/NETWORK SERVICE），已停止，未调用 icacls。"
+  }
+
+  $setOwnerOut = Invoke-Native 'icacls.exe' @($Path, '/setowner', "*$targetSid")
+  if ($script:NativeExit -ne 0) {
+    throw ("设置数据盘所有者失败（icacls 退出码 {0}）：{1}" -f $script:NativeExit, (Format-NativeOutput $setOwnerOut))
+  }
+
+  $grantOut = Invoke-Native 'icacls.exe' @($Path, '/grant', "*${targetSid}:(F)")
+  if ($script:NativeExit -ne 0) {
+    throw ("授予数据盘完全控制权限失败（icacls 退出码 {0}）：{1}" -f $script:NativeExit, (Format-NativeOutput $grantOut))
+  }
+
+  try {
+    $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop
+  } catch {
+    throw "读取数据盘 ACL 失败：$($_.Exception.Message)"
+  }
+  if ($null -eq $acl) { throw "读取数据盘 ACL 失败：$Path" }
+
+  $ownerText = "$($acl.Owner)".Trim()
+  if (-not $ownerText) { throw "数据盘 ACL 缺少所有者信息：$Path" }
+  $ownerSid = Get-AgentDevboxSid -Identity $ownerText
+  if (Test-AgentDevboxNonInteractiveSid -Sid $ownerSid) {
+    throw "数据盘所有者是 $ownerSid（SYSTEM/LOCAL SERVICE/NETWORK SERVICE），没有明确的交互式用户；已停止。"
+  }
+  if ($ownerSid -ne $targetSid) {
+    throw "数据盘所有者不是交互式用户：所有者 $ownerSid，期望 $targetSid。"
+  }
+
+  $explicitFullAllow = $false
+  $denyFull = $false
+  foreach ($rule in @($acl.Access)) {
+    if ($null -eq $rule) { continue }
+    $ruleSid = ConvertTo-AgentDevboxIdentitySid -IdentityReference $rule.IdentityReference
+    if ($ruleSid -ne $targetSid) { continue }
+    $rights = [System.Security.AccessControl.FileSystemRights]$rule.FileSystemRights
+    $hasFull = (($rights -band [System.Security.AccessControl.FileSystemRights]::FullControl) -eq
+      [System.Security.AccessControl.FileSystemRights]::FullControl)
+    if (-not $hasFull) { continue }
+    if ($rule.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Deny) {
+      $denyFull = $true
+    } elseif (-not $rule.IsInherited) {
+      $explicitFullAllow = $true
+    }
+  }
+  if ($denyFull) {
+    throw "数据盘存在针对交互式用户的显式拒绝（Deny/完全控制），已停止：$Path"
+  }
+  if (-not $explicitFullAllow) {
+    throw "数据盘缺少针对交互式用户的显式完全控制许可（Allow/FullControl），已停止：$Path"
+  }
+  return $targetSid
+}
+
 # 下载失败的人类可读原因：.NET 会把 Wait()/await 的底层异常包成
 # MethodInvocationException -> AggregateException（"发生一个或多个错误"），
 # 直接打印 $_.Exception.Message 只能得到那句套话（2026-10-20 安装日志里就是这样）。

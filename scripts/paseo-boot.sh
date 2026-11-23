@@ -9,6 +9,16 @@
 # =============================================================================
 set -euo pipefail
 
+# Shared, pure parsers for PASEO_LISTEN / PASEO_WEB_UI_ENABLED. Resolve the
+# sibling file without external tools so this also works when the whole
+# scripts/ directory is copied to /usr/local/bin.
+case "${BASH_SOURCE[0]}" in
+  */*) _paseo_boot_dir="${BASH_SOURCE[0]%/*}" ;;
+  *) _paseo_boot_dir="." ;;
+esac
+# shellcheck source=scripts/paseo-env.sh
+. "$_paseo_boot_dir/paseo-env.sh"
+
 # The Supervisor writes /home/paseo/.paseo/paseo.pid itself (compact JSON,
 # no trailing newline) and the file survives a WSL/container restart. Only a
 # lock proven dead, from an earlier boot, or held by a reused PID is dropped;
@@ -130,6 +140,18 @@ clear_stale_pidfile() {
 # Sourced by tests: define functions only (no side effects).
 if [ "${BASH_SOURCE[0]}" != "$0" ]; then return 0; fi
 
+# Parse the deployment env ONCE, before any lock/seed/config/daemon side effect.
+if ! paseo_parse_listen "${PASEO_LISTEN:-0.0.0.0:6767}"; then
+  echo "FATAL: invalid PASEO_LISTEN; expected host:port such as 0.0.0.0:6767 or [::1]:6767." >&2
+  exit 1
+fi
+if ! paseo_parse_web_ui "${PASEO_WEB_UI_ENABLED:-true}"; then
+  echo "FATAL: invalid PASEO_WEB_UI_ENABLED; expected true|false|1|0." >&2
+  exit 1
+fi
+export PASEO_LISTEN="$PASEO_LISTEN_CANONICAL"
+export PASEO_WEB_UI_ENABLED="$PASEO_WEB_UI_CANONICAL"
+
 # The WSL `/etc/wsl.conf [boot]` command runs with a minimal PATH (often without
 # /usr/bin), so `gosu` cannot resolve `env` and the daemon never starts. Pin a
 # sane PATH and resolve the tools once; this is a no-op in Docker, where PATH is
@@ -143,8 +165,6 @@ PASEO_USER=paseo
 PASEO_HOME_DIR=/home/paseo
 export PASEO_HOME="${AGENT_DEVBOX_PASEO_HOME:-$PASEO_HOME_DIR/.paseo}"
 PASEO_LOCK_DIR="${AGENT_DEVBOX_PASEO_LOCK_DIR:-/run}"
-export PASEO_LISTEN="${PASEO_LISTEN:-0.0.0.0:6767}"
-export PASEO_WEB_UI_ENABLED="${PASEO_WEB_UI_ENABLED:-true}"
 
 if [ -z "${PASEO_PASSWORD:-}" ]; then
   echo "FATAL: PASEO_PASSWORD is not set. Refusing to expose paseo without a password." >&2
@@ -171,12 +191,12 @@ if [ -d /workspace ]; then chown "$PASEO_USER:$PASEO_USER" /workspace 2>/dev/nul
 
 # Idempotent persisted settings (best-effort: daemon run also gets the env below).
 if ! "$GOSU_BIN" "$PASEO_USER" "$ENV_BIN" HOME="$PASEO_HOME_DIR" PASEO_HOME="$PASEO_HOME" \
-  paseo daemon config set daemon.listen 0.0.0.0:6767 >/dev/null 2>&1; then
-  echo "WARN: could not persist daemon.listen; PASEO_LISTEN=0.0.0.0:6767 still applies to this run."
+  paseo daemon config set daemon.listen "$PASEO_LISTEN" >/dev/null 2>&1; then
+  echo "WARN: could not persist daemon.listen; PASEO_LISTEN=$PASEO_LISTEN still applies to this run."
 fi
 if ! "$GOSU_BIN" "$PASEO_USER" "$ENV_BIN" HOME="$PASEO_HOME_DIR" PASEO_HOME="$PASEO_HOME" \
-  paseo daemon config set features.webUi.enabled true >/dev/null 2>&1; then
-  echo "WARN: could not persist features.webUi.enabled; PASEO_WEB_UI_ENABLED=true still applies to this run."
+  paseo daemon config set features.webUi.enabled "$PASEO_WEB_UI_ENABLED" >/dev/null 2>&1; then
+  echo "WARN: could not persist features.webUi.enabled; PASEO_WEB_UI_ENABLED=$PASEO_WEB_UI_ENABLED still applies to this run."
 fi
 
 # A dead/reused PID in the persisted pidfile must not block the daemon.
@@ -186,7 +206,7 @@ clear_stale_pidfile
 exec "$GOSU_BIN" "$PASEO_USER" "$ENV_BIN" \
   HOME="$PASEO_HOME_DIR" \
   PASEO_HOME="$PASEO_HOME" \
-  PASEO_LISTEN="0.0.0.0:6767" \
-  PASEO_WEB_UI_ENABLED="true" \
+  PASEO_LISTEN="$PASEO_LISTEN" \
+  PASEO_WEB_UI_ENABLED="$PASEO_WEB_UI_ENABLED" \
   PASEO_PASSWORD="$PASEO_PASSWORD" \
   paseo daemon run

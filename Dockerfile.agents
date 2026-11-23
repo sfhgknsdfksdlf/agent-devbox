@@ -8,11 +8,12 @@
 # It is derived from the already-built core image so the two images stay in
 # lock-step (same base digest, same UID/GID, same paths and startup protocol).
 #
-# CI passes CORE_IMAGE=<core image at the same datetime tag>.
+# CI passes CORE_IMAGE=<core image at the same datetime tag, pinned by digest>.
 # =============================================================================
-ARG CORE_IMAGE=ghcr.io/sfhgknsdfksdlf/agent-devbox-core:latest
-# CI passes CORE_IMAGE pinned to the same-run core digest; the :latest default
-# is only a local fallback, so hadolint's DL3006 does not apply here.
+ARG CORE_IMAGE=ghcr.io/sfhgknsdfksdlf/agent-devbox-core:latest@sha256:6c295e41755ead3667779650473515bf70ddd8096e8ad8a4af4d488026c127b9
+# CI always overrides CORE_IMAGE with the same-run core *index* digest. The
+# readable :latest tag + digest default exists only so a local build is
+# reproducible and never silently floats; update it by review, never by a bot.
 # hadolint ignore=DL3006
 FROM ${CORE_IMAGE}
 

@@ -96,6 +96,28 @@ wsl -d agent-devbox-core -u root -e desktop-cli-check.sh --home /root --also-hom
 4. 完全退出桌面版（包括托盘图标，不是关窗口），重新打开，再「添加」该发行版。之前从未添加成功
    过的，这里是**添加**而不是重新添加；缓存只活在进程里，退出就清空。
 
+> 以 root 运行时，只有 `--home /root` 会真正执行探测；`--home /home/paseo` 或
+> `--also-home /home/paseo` 都只检查文件存在性（见下一节）。
+
+## 跨账户：只有当前账户的 HOME 会被执行
+
+`--home` 表示「要验证哪个账户的桌面版」，但脚本**只允许执行当前账户**的探测：
+
+- 当前账户 HOME 由 `getent passwd "$EUID"` 的第 6 字段取得，再用 `realpath -m` 规范化
+  （没有 `realpath` 时退回 `readlink -f`）；**不会**拿 `$HOME` 猜。解析失败直接报错并以 1 退出。
+- 每个 `--home` / `--also-home` 都用同一套规则规范化。规范化后**等于**当前账户 HOME 的
+  `--home` 才运行桌面版那条 `sh -lc` 探针和 `<path> --version`；其余 `--home` 与所有
+  `--also-home` 只检查 `DIR/.opencode/bin/opencode` 是否存在/可执行，**绝不执行**里面的任何程序。
+- 不给 `--home` 时默认探测当前账户 HOME。
+- `--home` 全是其他账户目录时：不做任何探测，只做存在性检查，结论为「未完整验证」并以
+  **1** 退出（表示没有验证当前账户，不代表检测到故障）；其他检查（bash/curl、PATH 上的 CLI）照常执行。
+- 当前账户 HOME 的探针只要不能真正跑出结果（路径不可执行、缺 `sh`、版本命令失败或无输出）就是
+  关键项失败，**不能算 PASS**。
+- `--also-home /home/paseo` 仍然有效：它只报告 paseo 的 CLI 是否存在，不执行。
+
+测试专用环境变量 `AGENT_DEVBOX_DESKTOP_CURRENT_HOME` 可以覆盖「当前账户 HOME」，只用于 bats
+模拟，不要在真机上设置（生产始终走 getent）。
+
 开机日志在 `/var/log/agent-devbox-boot.log`，搜 `桌面版` 就能看到每个 home 的处理结果（补执行位那条
 不含「桌面版」，要搜 `补充可执行位`），四种形态：
 `桌面版 OpenCode 探测路径已就绪：<path> -> <target>`（软链）、

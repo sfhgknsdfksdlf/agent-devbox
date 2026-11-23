@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 2,
+  "floating": {
+    "npm:opencode-ai": {"ecosystem": "npm", "package": "opencode-ai", "track": true},
+    "pypi:aider-chat": {"ecosystem": "pypi", "package": "aider-chat", "track": true}
+  },
+  "fixed": {
+    "tool:playwright": {"kind": "release", "version": "1.64.1"}
+  },
+  "tools": {
+    "opencode-ai": {"amd64": "1.19.5", "arm64": "1.19.5"},
+    "aider-chat": {"amd64": "0.86.2", "arm64": "0.86.2"}
+  },
+  "packages": {"dpkg": {}},
+  "last_built": "2026-11-20T00:00:00Z"
+}

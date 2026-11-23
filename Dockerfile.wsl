@@ -15,8 +15,11 @@ ARG BASE_IMAGE
 # hadolint ignore=DL3006
 FROM ${BASE_IMAGE}
 
-# PowerShell has no Debian package; pin the upstream release so the .deb URL is
-# stable. `dpkg --print-architecture` (amd64|arm64) is also the asset suffix.
+# Use bash with pipefail so a failed stage in a RUN pipeline fails the build.
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+# PowerShell has no Debian package; pin the upstream release so the .deb URL and
+# the asset name (image-assets asset-name powershell) stay fixed.
 ARG POWERSHELL_VERSION=7.6.7
 
 # policy-rc.d: stop docker.io's postinst from starting dockerd inside the build
@@ -41,13 +44,31 @@ RUN set -eux; \
 # it while the published ghcr agents/core images never do.
 RUN install -o root -g root -m 0444 /dev/null /etc/agent-devbox-wsl-overlay
 
+# The upstream hashes.sha256 is UTF-16 (BOM) + CRLF and also lists the LTS and
+# non-Debian assets, so it is decoded explicitly and the exact .deb basename is
+# matched. Two independent gates must pass before apt installs the package:
+#   1. the official hashes.sha256 shipped with this exact release tag;
+#   2. the inherited config/image-assets.sha256 from the base image.
 RUN set -eux; \
+    if ! command -v image-assets >/dev/null 2>&1; then \
+      echo "ERROR: base image is missing /usr/local/bin/image-assets (rebuild core first)" >&2; \
+      exit 1; \
+    fi; \
     arch="$(dpkg --print-architecture)"; \
+    deb="$(image-assets asset-name powershell "$arch" "$POWERSHELL_VERSION")"; \
     apt-get update; \
+    base="https://github.com/PowerShell/PowerShell/releases/download/v${POWERSHELL_VERSION}"; \
     curl -fsSL --retry 5 --retry-all-errors --retry-delay 3 \
-      -o /tmp/powershell.deb \
-      "https://github.com/PowerShell/PowerShell/releases/download/v${POWERSHELL_VERSION}/powershell_${POWERSHELL_VERSION}-1.deb_${arch}.deb"; \
+      -o /tmp/powershell.hashes.sha256 "$base/hashes.sha256"; \
+    curl -fsSL --retry 5 --retry-all-errors --retry-delay 3 \
+      -o /tmp/powershell.deb "$base/$deb"; \
+    iconv -f UTF-16 -t UTF-8 /tmp/powershell.hashes.sha256 | tr -d '\r' > /tmp/powershell.hashes.txt; \
+    expected="$(image-assets sha-from-sums /tmp/powershell.hashes.txt "$deb")"; \
+    printf '%s  %s\n' "$expected" /tmp/powershell.deb | sha256sum -c -; \
+    image-assets verify-file \
+      /usr/local/share/agent-devbox/image-assets.sha256 \
+      "$POWERSHELL_VERSION" "$deb" "$arch" /tmp/powershell.deb; \
     apt-get install -y --no-install-recommends /tmp/powershell.deb; \
-    rm -f /tmp/powershell.deb; \
+    rm -f /tmp/powershell.deb /tmp/powershell.hashes.sha256 /tmp/powershell.hashes.txt; \
     rm -rf /var/lib/apt/lists/*; \
     pwsh -NoProfile -Command "\$PSVersionTable.PSVersion.ToString()"

@@ -25,8 +25,12 @@ Updating the image never touches these directories; the entrypoint only seeds
 
 ## Ports
 
-Only **6767** is published. To also expose the OpenCode server, see
-`opencode-expose.md`.
+Only **6767** is published, and compose maps `6767:6767`. `PASEO_LISTEN` sets
+the daemon's bind address (default `0.0.0.0:6767`; IPv6 uses the bracketed form
+`[::1]:6767`), and `PASEO_WEB_UI_ENABLED` (`true` / `false`) turns the bundled
+Web UI on or off. If you change the internal listen port, update the compose
+mapping to match (for example `7777:7777`). To also expose the OpenCode server,
+see `opencode-expose.md`.
 
 ## Upgrade
 

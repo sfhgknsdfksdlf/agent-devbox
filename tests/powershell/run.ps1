@@ -1675,6 +1675,55 @@ Assert-True ($stateIdx -gt $promoteIdx) 'ci: recovery state follows the alias tr
 Assert-True ($pruneIdx -gt $promoteIdx) 'ci: prune runs after alias promotion'
 Assert-True ($recordIdx -gt $promoteIdx) 'ci: state update runs after alias promotion'
 
+# --- CI/P1-2: build state is maintained from the versions actually installed --
+# The scheduled gate compares upstream against tools.<package> in the merged
+# state; only version-state.sh may query upstream, and only the exported rootfs
+# inventory may feed the merge. These assertions pin that wiring, so reverting to
+# the old npm-view loop or renaming an artifact makes them fail.
+$versionsBlock = Get-CiJobBlock 'versions'
+Assert-True ($versionsBlock -match '(?m)^  versions:') 'ci: versions job text is found'
+Assert-True ($versionsBlock -match 'version-state\.sh\s+--emit\s+changed') 'ci: versions gate delegates to version-state.sh --emit changed'
+Assert-True ($versionsBlock -match '--manifest\s+"\$state"') 'ci: versions gate reads the resolved-state manifest'
+Assert-True ($versionsBlock -match '--now\s+"\$now"') 'ci: versions gate passes the current UTC time'
+Assert-True ($versionsBlock -match 'changed="\$\(printf') 'ci: versions gate parses the changed verdict from the helper'
+Assert-True ($versionsBlock -match 'reason:\s*\$\{\{\s*steps\.diff\.outputs\.reason') 'ci: versions job exposes the gate reason'
+Assert-True ($versionsBlock -match 'reason=forced') 'ci: workflow_dispatch force still forces changed=true'
+Assert-True ($versionsBlock -notmatch 'npm view') 'ci: versions job never queries npm directly'
+Assert-Equal 0 ([regex]::Matches($ciText, 'npm view').Count) 'ci: no workflow step queries npm view (version-state.sh owns upstream)'
+Assert-Equal 0 ([regex]::Matches($ciText, 'pypi\.org').Count) 'ci: no workflow step queries PyPI directly'
+Assert-True ($ciText -match '(?m)^\s+- "\.github/scripts/version-state\.sh"\r?$') 'ci: the state helper is in the build push paths'
+
+Assert-True ($buildBlock -match '--entrypoint\s+/usr/local/bin/version-inventory\.sh') 'ci: build records installed versions with the in-image inventory'
+Assert-True ($buildBlock -match '--variant\s+agents') 'ci: build inventories the agents image'
+Assert-True ($buildBlock -match 'AGENTS_IMAGE@\$digest') 'ci: build inventories the pushed per-arch agents digest'
+Assert-True ($buildBlock -match 'installed-build-\$\{\{\s*matrix\.arch\s*\}\}\.json') 'ci: build writes one inventory per arch'
+Assert-True ($buildBlock -match 'name:\s+version-inventory-build-\$\{\{\s*matrix\.arch\s*\}\}') 'ci: build uploads a non-rootfs inventory artifact'
+Assert-True ($buildBlock -notmatch 'name:\s+rootfs-') 'ci: the build inventory artifact never starts with rootfs-'
+
+Assert-True ($exportBlock -match '--entrypoint\s+/usr/local/bin/version-inventory\.sh') 'ci: export records installed versions with the in-image inventory'
+Assert-True ($exportBlock -match 'installed-rootfs-\$arch\.json') 'ci: export writes one inventory per arch'
+Assert-True ($exportBlock -match 'name:\s+version-inventory-rootfs-\$\{\{\s*matrix\.arch\s*\}\}') 'ci: export uploads a non-rootfs inventory artifact'
+Assert-True ($exportBlock -notmatch 'version-inventory-core') 'ci: export inventories only the final agents overlay, not core'
+
+Assert-True ($publishBlock -match 'pattern:\s+version-inventory-build-\*') 'ci: publish downloads the build inventories'
+Assert-True ($publishBlock -match 'pattern:\s+version-inventory-rootfs-\*') 'ci: publish downloads the rootfs inventories'
+Assert-True ($publishBlock -match '(?m)^\s*path:\s+version-inventory-build\r?$') 'ci: build inventories land in their own dir'
+Assert-True ($publishBlock -match '(?m)^\s*path:\s+version-inventory-rootfs\r?$') 'ci: rootfs inventories land in their own dir'
+Assert-True ($publishBlock -match 'Verify version inventories') 'ci: publish validates the inventories before merging'
+Assert-True ($publishBlock -match 'version-state\.sh.*merge') 'ci: publish delegates the state merge to version-state.sh'
+Assert-True ($publishBlock -match '--build-dir\s+version-inventory-rootfs') 'ci: merge uses the authoritative rootfs inventories'
+Assert-True ($publishBlock -match '--out\s+versions\.json') 'ci: merge writes the state manifest'
+Assert-True ($publishBlock -match '\.last_built') 'ci: publish fails closed unless last_built is recorded'
+Assert-True ($publishBlock -notmatch 'npm view') 'ci: publish never queries npm'
+Assert-True ($publishBlock -notmatch 'pypi\.org') 'ci: publish never queries PyPI'
+Assert-True ($publishBlock -match 'cp versions\.json "\$RUNNER_TEMP/versions-seed\.json"') 'ci: publish saves the build-commit v2 seed before checkout'
+Assert-True ($publishBlock -match 'jq -e ''\.schemaVersion == 2'' versions\.json') 'ci: publish checks the checked-out state is v2 before choosing the merge base'
+Assert-True ($publishBlock -match 'base="\$RUNNER_TEMP/versions-seed\.json"') 'ci: a legacy flat state falls back to the v2 seed'
+Assert-True ($publishBlock -match '--manifest\s+"\$base"') 'ci: merge uses the selected merge base'
+$seedIdx = $publishBlock.IndexOf('cp versions.json "$RUNNER_TEMP/versions-seed.json"')
+$stateCheckoutIdx = $publishBlock.IndexOf('git checkout -B automation/versions')
+Assert-True ($seedIdx -ge 0 -and $stateCheckoutIdx -gt $seedIdx) 'ci: the v2 seed is captured before the state checkout'
+
 # --- CI: per-channel serialization ------------------------------------------
 Assert-True ($ciText -match "'build-beta'") 'ci: push runs share the build-beta group'
 Assert-True ($ciText -match "'build-stable'") 'ci: schedule/dispatch runs share the build-stable group'
@@ -1688,7 +1737,11 @@ Assert-True ($ociDockerfile -match '(?m)^# L1b\)') 'layers: L1b exists in the OC
 foreach ($pkg in @('bats','shellcheck','gh','man-db','manpages','libicu76','bind9-dnsutils','netcat-openbsd','ethtool','sysstat','bridge-utils','iproute2','iptables','nftables','zstd','parallel')) {
   Assert-True ($ociDockerfile -match "(?m)^\s+[^\r\n]*\b$([regex]::Escape($pkg))\b") "layers: L1b installs $pkg"
 }
-Assert-True ($ociDockerfile -match 'marksman-linux-\$\{marksman_arch\}') 'layers: marksman is arch-mapped'
+Assert-True ($ociDockerfile -match 'image-assets asset-name marksman "\$arch"') 'layers: marksman asset is arch-mapped by image-assets'
+Assert-True ($ociDockerfile -notmatch 'marksman/releases/latest') 'layers: marksman uses the fixed release tag'
+Assert-True ($ociDockerfile -match 'FROM node:24-trixie-slim@sha256:[0-9a-f]{64}') 'layers: base image is pinned by OCI index digest'
+Assert-True ($ociDockerfile -notmatch 'GOSUMDB=off') 'layers: Go checksum DB is never disabled'
+Assert-True ($ociDockerfile -match 'go env GOSUMDB') 'layers: the build checks GOSUMDB'
 Assert-True ($ociDockerfile -match 'dpkg --print-architecture') 'layers: arch comes from dpkg'
 Assert-True ($ociDockerfile -notmatch 'docker\.io') 'layers: OCI image never installs docker.io'
 Assert-True ($ociDockerfile -notmatch 'docker-compose') 'layers: OCI image never installs docker-compose'
@@ -1707,7 +1760,9 @@ Assert-True ($wslDockerfile -match 'policy-rc\.d') 'wsl: overlay blocks postinst
 Assert-True ($wslDockerfile -match 'test ! -e /var/lib/docker') 'wsl: build proves no docker state was baked in'
 Assert-True ($wslDockerfile -match 'docker --version') 'wsl: build proves the docker CLI exists (Debian splits it out of docker.io)'
 Assert-True ($wslDockerfile -match 'ARG POWERSHELL_VERSION=7\.6\.7') 'wsl: PowerShell is pinned'
-Assert-True ($wslDockerfile -match 'powershell_\$\{POWERSHELL_VERSION\}-1\.deb_\$\{arch\}\.deb') 'wsl: PowerShell .deb is arch-mapped'
+Assert-True ($wslDockerfile -match 'image-assets asset-name powershell "\$arch" "\$POWERSHELL_VERSION"') 'wsl: PowerShell .deb is arch-mapped by image-assets'
+Assert-True ($wslDockerfile -match 'iconv -f UTF-16 -t UTF-8') 'wsl: PowerShell hashes.sha256 is decoded from UTF-16'
+Assert-True ($wslDockerfile -match 'sha256sum -c -') 'wsl: the .deb is verified against the official sums'
 Assert-True ($wslDockerfile -match 'pwsh -NoProfile') 'wsl: overlay smoke-runs pwsh'
 Assert-True ($exportBlock -match 'actions/checkout@[0-9a-f]{40}') 'ci: export checks out the overlay Dockerfile'
 Assert-True ($exportBlock -match 'Dockerfile\.wsl') 'ci: export builds the WSL overlay'

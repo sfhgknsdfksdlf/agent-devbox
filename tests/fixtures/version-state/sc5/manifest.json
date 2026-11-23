@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 2,
+  "floating": {
+    "foo": {
+      "ecosystem": "npm",
+      "package": "foo",
+      "track": true
+    }
+  },
+  "fixed": {
+    "tool:playwright": {
+      "kind": "release",
+      "version": "1.64.1"
+    }
+  },
+  "tools": {},
+  "packages": {
+    "dpkg": {}
+  },
+  "last_built": null
+}

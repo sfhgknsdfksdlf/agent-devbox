@@ -1,0 +1,5 @@
+{
+  "npm:opencode-ai": "1.19.5",
+  "pypi:aider-chat": "0.86.2",
+  "errors": ["npm:opencode-ai"]
+}

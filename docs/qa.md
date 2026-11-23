@@ -96,8 +96,12 @@ user; the other tools are CLIs that run as whoever invokes them.
 ## Password
 
 `PASEO_PASSWORD` is **required**. The launcher refuses to start without it. The
-Windows installer generates one (or prompts) and stores it in the distro's
-`/etc/agent-devbox.conf` (0600).
+Windows installer generates one (or prompts) and keeps two mode-600 copies: the
+runtime `/etc/agent-devbox.conf` on the new system disk, and the upgrade source
+`/mnt/<DATA_MNTNAME>/.paseo-password` on the data disk (stable `devbox-data` /
+beta `devbox-data-beta`). It is never printed; interactive entry uses
+`Read-Host -AsSecureString`, read-back is base64 decoded as UTF-8, and printed
+failures are redacted first.
 
 ## Why PowerShell, not a Go rewrite?
 
@@ -173,7 +177,10 @@ irm https://raw.githubusercontent.com/sfhgknsdfksdlf/agent-devbox/main/windows/i
 
 现在每个分片下载前先看旁车 `<dir>\.agent-devbox-download\<part>.meta`（URL / 强 ETag / 长度 /
 SHA256）。没有旁车或对不上就**整块丢弃重下**；Release 提供 `SHA256SUMS` 时，下载完再校验摘要。
-失败路径（`trap` / 导入失败）会删掉本次下载的分片和旁车，下一次运行是干净重下。
+清理规则是三条分支：合并出的 `.zst` / `.tar` 只要尝试过导入就删除；本次运行新下载的分片在导入
+成功或内容被证明可疑（`ContentSuspect`）时删除，导入失败且内容不可疑时连同旁车保留（下次运行
+按旁车身份重新校验后续传）；运行前就已存在的分片不由清理删除。`trap` 路径也不会顺手删掉已下载
+的分片。
 
 **为什么不用 `If-Range`**：实测（2026-10-20，GitHub Releases 背后的 Azure 存储）：
 
@@ -215,7 +222,8 @@ Tier 3 的唯一作用是下载 `zstd.exe` 再把分片解成 `.tar`，而 faceb
 文件导入）：WSL2 自带的 bsdtar 本来就能解 zstd，前两级已经覆盖真实场景。
 
 跳过 Tier 3 时**不设置** `ContentSuspect`：内容并未被证明损坏，设置它会让安装器把分片当成
-坏文件删掉。分片与旁车保留在安装目录，重跑安装器会先校验 SHA256 再续传。若两级都失败，
+坏文件删掉。分片与旁车保留在安装目录（合并出的 `.zst` / `.tar` 仍会删除；运行前就已存在的
+分片也不由清理删除），重跑安装器会先校验 SHA256 再续传。若两级都失败，
 错误信息会提示先执行 `wsl --update` 再重装（旧版 WSL 的解压支持可能不足）。
 
 ## 主机架构是如何判断的？
@@ -254,16 +262,17 @@ paseo 密码都保留，`uname -m` 仍是 `aarch64`。
 
 ## 为什么升级镜像不会重设 paseo 密码？
 
-`/etc/agent-devbox.conf` 在**系统盘**上，而升级 = 注销 + 重新导入系统盘，配置文件会跟着没。
-所以密码的权威位置放在**数据盘**：`/mnt/<DATA_MNTNAME>/.paseo-password`（stable 为 `devbox-data`，
-beta 为 `devbox-data-beta`；mode 600）。数据盘跨升级保留，安装器在 `[7/10]` 按 UUID 把它挂载起来，
-先读这个文件；有就直接沿用，没有才询问/生成，生成后再写回数据盘。
-`/etc/agent-devbox.conf` 只是运行期配置（paseo-boot 读它）。
+`/etc/agent-devbox.conf` 在**系统盘**上（运行期副本，mode 600），而升级 = 注销 + 重新导入系统盘，
+配置文件会跟着没。所以密码的权威位置放在**数据盘**：`/mnt/<DATA_MNTNAME>/.paseo-password`（stable
+为 `devbox-data`，beta 为 `devbox-data-beta`；也是 mode 600），它是**升级的唯一来源**。数据盘跨升级
+保留，安装器在 `[7/10]` 按 UUID 把它挂载起来，先读这个文件；有就直接沿用，没有才询问/生成，生成后
+再写回数据盘。
 
 **不再读旧系统盘的 conf**（2026-10-21 起）：迁移窗口已过（改动之前的安装都已升级过，数据盘上
 都有 `.paseo-password`）。删掉这一步是为了不再为 `cat` 一个文件把旧发行版整机拉起——`[boot]`
-会顺带挂载数据盘并启动 paseo，于是升级时多一次「刚起来又被 terminate」的无谓启停。
-升级若读不到数据盘密码，安装器会明确警告「本次会按新密码处理」，绝不静默换密码。
+会顺带挂载数据盘并启动 paseo，于是升级时多一次「刚起来又被 terminate」的无谓启停。因此也
+**不承诺从旧 `/etc/agent-devbox.conf` 迁移**：升级若读不到数据盘密码，安装器会明确警告「本次会按
+新密码处理（旧密码将失效）」，绝不静默换密码，也不会回退去读旧 conf。
 
 同一个思路也去掉了「是否重装 `[Y/n]`」：升级仍是默认动作，但只有在**交互式控制台**里且未指定
 `-Yes` / `-KeepExisting` 时才会问一行——**回车 = 覆盖升级**，`n` = 取消（不下载、不注销、不做

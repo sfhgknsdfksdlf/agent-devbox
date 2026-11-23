@@ -387,6 +387,49 @@ publish_paseo() {
   [ "$output" = "SOURCED_OK" ]
 }
 
+# ---------------------------------------------------------------------------
+# P1-3: the readiness probe URL follows the SAME PASEO_LISTEN parse as
+# paseo-boot, while an explicit AGENT_DEVBOX_PASEO_HEALTH_URL still wins.
+# ---------------------------------------------------------------------------
+
+@test "PASEO_HEALTH_URL derives from a custom PASEO_LISTEN" {
+  run env -u AGENT_DEVBOX_PASEO_HEALTH_URL PASEO_LISTEN=127.0.0.1:7777 \
+    bash -c '. "$SCRIPT"; printf "%s" "$PASEO_HEALTH_URL"'
+  [ "$status" -eq 0 ]
+  [ "$output" = "http://127.0.0.1:7777/api/health" ]
+}
+
+@test "PASEO_HEALTH_URL maps a wildcard bind to loopback" {
+  run env -u AGENT_DEVBOX_PASEO_HEALTH_URL PASEO_LISTEN=0.0.0.0:7777 \
+    bash -c '. "$SCRIPT"; printf "%s" "$PASEO_HEALTH_URL"'
+  [ "$status" -eq 0 ]
+  [ "$output" = "http://127.0.0.1:7777/api/health" ]
+}
+
+@test "PASEO_HEALTH_URL brackets a custom IPv6 bind" {
+  run env -u AGENT_DEVBOX_PASEO_HEALTH_URL 'PASEO_LISTEN=[::1]:7777' \
+    bash -c '. "$SCRIPT"; printf "%s" "$PASEO_HEALTH_URL"'
+  [ "$status" -eq 0 ]
+  [ "$output" = "http://[::1]:7777/api/health" ]
+}
+
+@test "an explicit AGENT_DEVBOX_PASEO_HEALTH_URL still wins" {
+  run env AGENT_DEVBOX_PASEO_HEALTH_URL=http://127.0.0.1:9999/health \
+    PASEO_LISTEN=127.0.0.1:7777 \
+    bash -c '. "$SCRIPT"; printf "%s" "$PASEO_HEALTH_URL"'
+  [ "$status" -eq 0 ]
+  [ "$output" = "http://127.0.0.1:9999/health" ]
+}
+
+@test "an invalid PASEO_LISTEN keeps the safe default health URL and warns" {
+  local err="$BATS_TEST_TMPDIR/health.err"
+  run env -u AGENT_DEVBOX_PASEO_HEALTH_URL PASEO_LISTEN=bogus \
+    bash -c '. "$SCRIPT" 2>"$1"; printf "%s" "$PASEO_HEALTH_URL"' _ "$err"
+  [ "$status" -eq 0 ]
+  [ "$output" = "http://127.0.0.1:6767/api/health" ]
+  grep -Fq 'WARN: invalid PASEO_LISTEN' "$err"
+}
+
 @test "already mounted: rc 0 and no mount/blkid call" {
   : > "$MOUNT_MARKER"
   base_shims

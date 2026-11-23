@@ -137,6 +137,8 @@ set -u
 printf 'paseo argv=%s\n' "$*" >> "$FAKE_LOG/paseo.log"
 printf '%s\n' "$*" > "$FAKE_LOG/paseo-argv"
 if [ "$*" = "daemon run" ]; then
+  printf '%s\n' "${PASEO_LISTEN:-}" > "$FAKE_LOG/daemon-listen"
+  printf '%s\n' "${PASEO_WEB_UI_ENABLED:-}" > "$FAKE_LOG/daemon-webui"
   if [ "${PASEO_PASSWORD:-}" = "${EXPECTED_PASEO_PASSWORD:-}" ]; then
     : > "$FAKE_LOG/daemon-env-ok"
   fi
@@ -227,4 +229,127 @@ launcher_env() {
     echo "the launcher must not log the password"
     return 1
   fi
+}
+
+# ---------------------------------------------------------------------------
+# P1-3: PASEO_LISTEN / PASEO_WEB_UI_ENABLED are parsed ONCE, and the canonical
+# values drive `daemon config set` and the final `daemon run` environment.
+# ---------------------------------------------------------------------------
+
+@test "paseo-boot: default listen/web-ui values reach config set and the daemon" {
+  launcher_env
+  local chosen="default-env-password"
+  run env -i "${LAUNCHER_ENV[@]}" PASEO_PASSWORD="$chosen" \
+    bash "$repo/scripts/paseo-boot.sh"
+  [ "$status" -eq 0 ]
+  grep -Fxq 'paseo argv=daemon config set daemon.listen 0.0.0.0:6767' "$FAKE_LOG/paseo.log"
+  grep -Fxq 'paseo argv=daemon config set features.webUi.enabled true' "$FAKE_LOG/paseo.log"
+  [ "$(cat "$FAKE_LOG/daemon-listen")" = "0.0.0.0:6767" ]
+  [ "$(cat "$FAKE_LOG/daemon-webui")" = "true" ]
+  [[ "$output" != *"$chosen"* ]]
+}
+
+@test "paseo-boot: a custom listen/web-ui pair reaches config set and the daemon" {
+  launcher_env
+  run env -i "${LAUNCHER_ENV[@]}" PASEO_PASSWORD=custom-env-password \
+    PASEO_LISTEN=127.0.0.1:7777 PASEO_WEB_UI_ENABLED=false \
+    bash "$repo/scripts/paseo-boot.sh"
+  [ "$status" -eq 0 ]
+  grep -Fxq 'paseo argv=daemon config set daemon.listen 127.0.0.1:7777' "$FAKE_LOG/paseo.log"
+  grep -Fxq 'paseo argv=daemon config set features.webUi.enabled false' "$FAKE_LOG/paseo.log"
+  [ "$(cat "$FAKE_LOG/daemon-listen")" = "127.0.0.1:7777" ]
+  [ "$(cat "$FAKE_LOG/daemon-webui")" = "false" ]
+}
+
+@test "paseo-boot: a bracketed IPv6 listen reaches config set and the daemon" {
+  launcher_env
+  run env -i "${LAUNCHER_ENV[@]}" PASEO_PASSWORD=ipv6-env-password \
+    'PASEO_LISTEN=[::1]:7777' \
+    bash "$repo/scripts/paseo-boot.sh"
+  [ "$status" -eq 0 ]
+  grep -Fxq 'paseo argv=daemon config set daemon.listen [::1]:7777' "$FAKE_LOG/paseo.log"
+  [ "$(cat "$FAKE_LOG/daemon-listen")" = "[::1]:7777" ]
+}
+
+@test "paseo-boot: invalid listen/web-ui values fail before gosu/seed/daemon/lock" {
+  local bad chosen="invalid-env-password"
+  for bad in 'PASEO_LISTEN=127.0.0.1' 'PASEO_LISTEN=0.0.0.0:70000' \
+    'PASEO_LISTEN=::1:6767' 'PASEO_WEB_UI_ENABLED=maybe'; do
+    launcher_env
+    run env -i "${LAUNCHER_ENV[@]}" PASEO_PASSWORD="$chosen" "$bad" \
+      bash "$repo/scripts/paseo-boot.sh"
+    [ "$status" -ne 0 ]
+    [ ! -e "$FAKE_LOG/gosu.log" ]
+    [ ! -e "$FAKE_LOG/paseo.log" ]
+    [ ! -e "$FAKE_LOG/seed.log" ]
+    [ ! -e "$BATS_TEST_TMPDIR/agent-devbox-paseo.lock" ]
+    [[ "$output" != *"$chosen"* ]]
+  done
+}
+
+@test "paseo-env: wildcard and localhost canonicalize to concrete loopback" {
+  paseo_parse_listen '0.0.0.0:6767'
+  [ "$PASEO_LISTEN_CANONICAL" = '0.0.0.0:6767' ]
+  [ "$PASEO_PROBE_HOST" = '127.0.0.1' ]
+  [ "$PASEO_PORT" = '6767' ]
+
+  paseo_parse_listen '*:6768'
+  [ "$PASEO_LISTEN_CANONICAL" = '0.0.0.0:6768' ]
+  [ "$PASEO_PROBE_HOST" = '127.0.0.1' ]
+
+  paseo_parse_listen 'localhost:6769'
+  [ "$PASEO_LISTEN_CANONICAL" = '127.0.0.1:6769' ]
+  [ "$PASEO_PROBE_HOST" = '127.0.0.1' ]
+}
+
+@test "paseo-env: bracketed IPv6 keeps brackets and wildcard probes [::1]" {
+  paseo_parse_listen '[::1]:7777'
+  [ "$PASEO_LISTEN_CANONICAL" = '[::1]:7777' ]
+  [ "$PASEO_PROBE_HOST" = '[::1]' ]
+  [ "$PASEO_PORT" = '7777' ]
+
+  paseo_parse_listen '[::]:7778'
+  [ "$PASEO_LISTEN_CANONICAL" = '[::]:7778' ]
+  [ "$PASEO_PROBE_HOST" = '[::1]' ]
+}
+
+@test "paseo-env: concrete hosts are preserved and ports normalized" {
+  paseo_parse_listen '10.1.2.3:06767'
+  [ "$PASEO_LISTEN_CANONICAL" = '10.1.2.3:6767' ]
+  [ "$PASEO_PROBE_HOST" = '10.1.2.3' ]
+  [ "$PASEO_PORT" = '6767' ]
+
+  paseo_parse_listen '127.0.0.1:6767'
+  [ "$PASEO_LISTEN_CANONICAL" = '127.0.0.1:6767' ]
+  [ "$PASEO_PROBE_HOST" = '127.0.0.1' ]
+}
+
+@test "paseo-env: malformed listen values are rejected" {
+  local bad
+  for bad in '127.0.0.1' '0.0.0.0:70000' '0.0.0.0:0' '::1:6767' ':6767' \
+    '0.0.0.0:' '0.0.0.0:12x7' 'a b:6767' '0.0.0.0:67/67' 'user@host:6767' \
+    '[::1:6767' '[::1]:' '[127.0.0.1]:6767'; do
+    run paseo_parse_listen "$bad"
+    [ "$status" -ne 0 ]
+  done
+}
+
+@test "paseo-env: web-ui accepts true/false and 1/0 case-insensitively" {
+  local value
+  for value in true TRUE True 1; do
+    paseo_parse_web_ui "$value"
+    [ "$PASEO_WEB_UI_CANONICAL" = "true" ]
+  done
+  for value in false FALSE False 0; do
+    paseo_parse_web_ui "$value"
+    [ "$PASEO_WEB_UI_CANONICAL" = "false" ]
+  done
+}
+
+@test "paseo-env: invalid web-ui values are rejected" {
+  local bad
+  for bad in maybe yes ' true' 2 ''; do
+    run paseo_parse_web_ui "$bad"
+    [ "$status" -ne 0 ]
+  done
 }

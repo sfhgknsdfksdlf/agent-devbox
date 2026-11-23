@@ -72,8 +72,10 @@ wsl --set-default $Distro
 `wsl --import <发行版> <目录> -`（WSL2 自带的 bsdtar 直接解 zstd，**不下载 `zstd.exe`**、
 不合并分片、不产生中间 `.tar`），失败才合并分片后按文件导入，最后才下载 `zstd.exe` 解压为
 `.tar`；因此**正常路径在 Windows 11 和 Windows 10 上都不会下载 `zstd.exe`**。装完会校验
-发行版确实注册成功，失败则注销这次残缺的注册并给出可操作的中文提示；临时文件（分片 /
-合并出的 `.zst` / 解压出的 `.tar`）：**成功导入后清理本次下载的分片**；导入失败时保留分片和 sidecar（内容被证明可疑时除外），重跑会重新校验 SHA256 后续传。重复运行也没问题。
+发行版确实注册成功，失败则注销这次残缺的注册并给出可操作的中文提示。临时文件按三条规则处理：
+合并出的 `.zst` / 解压出的 `.tar` 只要**尝试过导入**就总是删除；**本次运行新下载的分片**在导入成功
+或内容被证明可疑（`ContentSuspect`）时删除，导入失败且内容不可疑时连同 sidecar 保留（重跑会重新
+校验 SHA256 后续传）；**运行前就已存在**的分片不由这一步删除。重复运行也没问题。
 **ARM64 例外**：Windows 11 ARM64 上只有 **Tier 1 / Tier 2**；Tier 3 依赖的 `zstd.exe` 只有
 x64 版本，因此会跳过 Tier 3。两级都失败时安装器提示先 `wsl --update` 再重装，已下载的分片会
 保留供重试（详见 [docs/installation-wsl.md](docs/installation-wsl.md) 的 ARM64 一节）。
@@ -115,8 +117,8 @@ UAC）：`mount-datadisk.cmd`（不带参数＝附加本目录的 `data.vhdx`，
 正常使用不用管这些：**发行版每次启动，boot 脚本都会自己重新附加并挂载**。只有 boot attach
 失败（进了维护模式）时才需要手动修复：先跑 `<安装目录>\mount-datadisk.cmd`，再
 `wsl --terminate <发行版>`，然后重新打开发行版。已装的旧版本建议重跑一次安装器：它会注销
-旧版本残留的挂载任务，并写入新的 6 键配置（旧配置也能用：会继续按它旧的 `DATA_MNTNAME`
-挂载）。
+旧版本残留的挂载任务，并写入新的 6 键配置（挂载名按本通道写入 `DATA_MNTNAME`，不沿用旧系统盘
+conf 里的旧值，也不提供旧配置迁移）。
 
 **同一通道内**的两个变体（agents / core）数据盘可以互换：它们用同一个 ext4 卷标（也是挂载名），
 正式通道是 `devbox-data`、beta 通道是 `devbox-data-beta`；把一个变体的 `data.vhdx` 复制到**同通道**
@@ -217,7 +219,17 @@ fragment（beta 是 `agent-devbox-beta.json` / `agent-devbox-core-beta.json`）�
 
 ## 日志与密码（WSL）
 
-为降低杀软误报，安装脚本**不会把 paseo 密码打印到控制台或安装日志**；交互输入密码时也**不回显**（`Read-Host -AsSecureString`）。安装后这样取：
+为降低杀软误报，安装脚本**不会把 paseo 密码打印到控制台或安装日志**；交互输入时**不回显**
+（`Read-Host -AsSecureString`），从 guest 回读时走 base64（按 UTF-8 解码），打印失败输出前先用
+`Hide-SecretText` 脱敏。密码有两份，都是 mode 600：
+
+- `/etc/agent-devbox.conf`：**运行期副本**，写在新系统盘上，`paseo-boot` 启动时读它；
+- `/mnt/<DATA_MNTNAME>/.paseo-password`：**升级来源**，存在数据盘上（stable `devbox-data` /
+  beta `devbox-data-beta`），跨升级保留。
+
+升级只从数据盘读密码；读不到时会**明确警告并当作新密码处理（旧密码失效）**，不会去读旧系统盘的
+`/etc/agent-devbox.conf`，也没有旧 conf 迁移。每个通道的密码各自独立，互不沿用。安装后这样取
+（读的是运行期副本）：
 
 ```powershell
 # Windows 侧（先跑上面那段定义 $Distro；也可直接把 $Distro 换成
@@ -230,8 +242,8 @@ wsl -d $Distro -u root -e cat /etc/agent-devbox.conf
 cat /etc/agent-devbox.conf
 ```
 
-每个通道的 `PASEO_PASSWORD` 各自独立，互不沿用；数据盘上的副本也在各自的挂载点：
-`/mnt/devbox-data/.paseo-password`（stable）或 `/mnt/devbox-data-beta/.paseo-password`（beta）。
+数据盘上的那份（升级来源）在各自的挂载点：`/mnt/devbox-data/.paseo-password`（stable）或
+`/mnt/devbox-data-beta/.paseo-password`（beta）；它和 `/etc/agent-devbox.conf` 都是 mode 600。
 
 安装日志**持久保存**在安装目录（正式通道 agents 为 `D:\WSL\agent-devbox`、core 为
 `D:\WSL\agent-devbox-core`；beta 通道为 `D:\WSL\agent-devbox-beta` /
@@ -318,6 +330,12 @@ profile 缓存在进程里，所以注销/重装/换通道后仍可能命中旧�
 ## 端口
 
 - **6767** —— paseo 后台服务 + 网页界面（Docker 模式下只对外开这一个端口）。
+  - `PASEO_LISTEN` 控制守护进程的监听地址，默认 `0.0.0.0:6767`；IPv6 用
+    `[::1]:6767` 这种带方括号的写法。
+  - `PASEO_WEB_UI_ENABLED` 控制是否启用自带网页界面（`true` / `false`）。
+  - Docker 的端口映射保持 `6767:6767`；如果改了内部监听端口，必须同步改映射
+    （例如内部 `7777` 就写 `7777:7777`）。
+  - WSL 下 Windows 的 `netsh portproxy` 也要指向实际使用的端口。
 - **4096** —— `opencode serve`（默认只监听 `127.0.0.1`），见
   [docs/opencode-expose.md](docs/opencode-expose.md)。
 
@@ -381,8 +399,9 @@ profile 缓存在进程里，所以注销/重装/换通道后仍可能命中旧�
 > ＝最新的 `beta-*` 预发布（脚本经 GitHub API 解析），或直接输入某个版本号
 > （`build-YYYYMMDD.HHMM`／`beta-YYYYMMDD.HHMM`，裸日期如 `20261018.0731` 会自动补 `build-` 前缀）。
 > **已装过时，交互式运行会问一行：回车 = 覆盖升级，`n` = 取消** —— 换系统盘，但数据盘
-> （`/home`、`/root`、`/workspace`）和 **paseo 密码都保留**（密码存在数据盘
-> `/mnt/<DATA_MNTNAME>/.paseo-password`：正式通道 `devbox-data`，beta 通道 `devbox-data-beta`）。一键命令会在 UAC 提权之后、改动镜像网络之前提问；
+> （`/home`、`/root`、`/workspace`）和 **paseo 密码都保留**（升级来源是数据盘上的
+> `/mnt/<DATA_MNTNAME>/.paseo-password`：正式通道 `devbox-data`，beta 通道 `devbox-data-beta`；
+> 新系统盘上的 `/etc/agent-devbox.conf` 只是运行期副本，两份都是 mode 600）。一键命令会在 UAC 提权之后、改动镜像网络之前提问；
 > 取消就什么都不做（不下载、不注销、不改 `.wslconfig`，退出码 0）。想保留现有安装不动就加
 > `-KeepExisting`；`-Yes` 或重定向/无人值守运行不提问，直接升级；无人值守还可用
 > `-ReleaseTag <版本>`。稳定版仍是定时的 `latest` / Release。

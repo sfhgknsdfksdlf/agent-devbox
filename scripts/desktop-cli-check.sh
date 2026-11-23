@@ -17,10 +17,19 @@
 #   + `<path> --version`, so they must be on the daemon user's PATH (where
 #   /usr/local/bin comes first). Section [3]/[4] cover that side.
 #
+# CROSS-ACCOUNT SAFETY (verified requirement, do not "simplify"):
+#   Only the CURRENT account's home may be probed/EXECUTED. It is resolved with
+#   `getent passwd "$EUID"` (field 6) + `realpath -m` (fallback `readlink -f`),
+#   never from an unrelated `$HOME`. Every other --home / --also-home value is
+#   EXISTENCE-ONLY: checking `DIR/.opencode/bin/opencode` with `-x` (and never
+#   running anything inside it), because executing another user's CLI as this
+#   user would be unsafe and proves nothing about this account's desktop setup.
+#
 # READ-ONLY: this script never creates, links, chmods or removes anything. It is
 # safe to run at any time; every fix it suggests is printed, never executed.
 #
-# Exit: 0 = app-critical checks pass, 1 = app-critical failure, 2 = usage error.
+# Exit: 0 = app-critical checks pass, 1 = app-critical failure OR the current
+#       account home was not requested (limited run, not a pass), 2 = usage.
 # =============================================================================
 set -uo pipefail
 
@@ -38,7 +47,9 @@ VERSION_TIMEOUT="${AGENT_DEVBOX_VERSION_TIMEOUT:-10}"
 
 HOMES=()
 ALSO_HOMES=()
+EXISTENCE_HOMES=()
 EXPECTED_VERSION=""
+CURRENT_HOME=""
 MISSING=()
 probe_missing=0
 missing_home=""
@@ -51,16 +62,83 @@ usage() {
   cat <<'EOF'
 用法: desktop-cli-check.sh [--home DIR] [--also-home DIR]... [--expected-opencode-version VER]
 
-  --home DIR                       要探测的身份（默认：当前 $HOME；可重复）
-  --also-home DIR                  只检查 DIR/.opencode/bin/opencode 是否存在（可重复）
+  --home DIR                       要探测的身份（默认：当前账户 HOME；可重复）
+                                   仅当 DIR 解析后等于当前账户 HOME 时才真正执行探测；
+                                   其他目录只检查存在性，绝不执行其中任何程序
+  --also-home DIR                  只检查 DIR/.opencode/bin/opencode 是否存在（可重复，不执行）
   --expected-opencode-version V    桌面版版本；CLI 首行版本必须与之完全相等
+
+当前账户 HOME 由 getent passwd $EUID（第 6 字段）+ realpath 解析，不使用 $HOME。
+--home 全是其他账户目录时：只做存在性检查，结论为「未完整验证」，退出码 1（不代表故障）。
 
 环境变量:
   AGENT_DEVBOX_DESKTOP_CLIS        要检查的 CLI 名称列表（空格分隔）
   AGENT_DEVBOX_VERSION_TIMEOUT     --version 的超时秒数（默认 10）
+  AGENT_DEVBOX_DESKTOP_CURRENT_HOME 仅供测试：覆盖当前账户 HOME（生产不要设置）
 
-退出码: 0 = 关键项通过 · 1 = 关键项失败 · 2 = 用法错误
+退出码: 0 = 关键项通过 · 1 = 关键项失败/未完整验证 · 2 = 用法错误
 EOF
+}
+
+# canonical_path <path>: realpath -m, then readlink -f, then the raw value.
+canonical_path() {
+  local path out
+  path="$1"
+
+  if command -v realpath >/dev/null 2>&1; then
+    out="$(realpath -m -- "$path" 2>/dev/null)"
+    if [ -n "$out" ]; then
+      printf '%s\n' "$out"
+      return 0
+    fi
+  fi
+
+  if command -v readlink >/dev/null 2>&1; then
+    out="$(readlink -f -- "$path" 2>/dev/null)"
+    if [ -n "$out" ]; then
+      printf '%s\n' "$out"
+      return 0
+    fi
+  fi
+
+  printf '%s\n' "$path"
+}
+
+# resolve_current_home(): field 6 of getent passwd "$EUID", canonicalized.
+# The test-only override is the ONLY way to bypass getent; production never
+# substitutes an unrelated $HOME when the account lookup fails.
+resolve_current_home() {
+  local override entry rest home
+  override="${AGENT_DEVBOX_DESKTOP_CURRENT_HOME:-}"
+
+  if [ -n "$override" ]; then
+    canonical_path "$override"
+    return 0
+  fi
+
+  if ! command -v getent >/dev/null 2>&1; then
+    return 1
+  fi
+
+  if ! entry="$(getent passwd "$EUID" 2>/dev/null)"; then
+    return 1
+  fi
+  if [ -z "$entry" ]; then
+    return 1
+  fi
+
+  rest="$entry"
+  rest="${rest#*:}"
+  rest="${rest#*:}"
+  rest="${rest#*:}"
+  rest="${rest#*:}"
+  rest="${rest#*:}"
+  home="${rest%%:*}"
+  if [ -z "$home" ]; then
+    return 1
+  fi
+
+  canonical_path "$home"
 }
 
 # capture <cmd> [args...]: run with a timeout when available, stdout only.
@@ -74,12 +152,19 @@ capture() {
 }
 
 # probe_home <home> <expected-version>: the desktop app's exact probe + version.
+# Defence-in-depth: this is the ONLY place that executes a CLI from a home, so
+# it refuses anything that is not the resolved current-account home.
 probe_home() {
-  local home_dir expected out path ver
+  local home_dir expected out path ver ver_status
   home_dir="$1"
   expected="$2"
 
-  printf '\n[1] OpenCode 桌面版探测  HOME=%s\n' "$home_dir"
+  if [ "$home_dir" != "$CURRENT_HOME" ]; then
+    printf '  ✗ 拒绝在非当前账户 HOME 执行探测: %s\n' "$home_dir"
+    return 1
+  fi
+
+  printf '\n[1] 当前账户 HOME 桌面版探测  HOME=%s\n' "$home_dir"
   printf "  探测命令（桌面版只用这一条，不查 PATH）:\n"
   printf "    wsl.exe -d <发行版> -- sh -lc '%s'\n" "$PROBE_SCRIPT"
 
@@ -100,6 +185,12 @@ probe_home() {
   # Capture, then cut the FIRST line in-shell. Never pipe into `head`: under
   # pipefail that can die on SIGPIPE when the CLI writes more than one line.
   ver="$(capture env HOME="$home_dir" "$path" --version)"
+  ver_status=$?
+  if [ "$ver_status" -ne 0 ]; then
+    printf '  ✗ 版本命令失败（退出码 %s）: %s --version\n' "$ver_status" "$path"
+    version_fail=1
+    return 1
+  fi
   ver="${ver%%$'\n'*}"
   if [ -z "$ver" ]; then
     printf '  版本: (无输出)\n'
@@ -210,28 +301,32 @@ check_misplaced() {
   fi
 }
 
-# check_also_home(): existence-only. Nothing inside another home is ever run.
-check_also_home() {
+# check_existence_homes(): existence-only for foreign --home and every
+# --also-home. Nothing inside another home is ever executed.
+check_existence_homes() {
   local home_dir path
 
-  printf '\n[5] --also-home（只查存在性，不执行）\n'
-  if [ "${#ALSO_HOMES[@]}" -eq 0 ]; then
+  printf '\n[5] 其他 HOME（只查存在性，不执行；外来 --home / --also-home）\n'
+  if [ "${#EXISTENCE_HOMES[@]}" -eq 0 ]; then
     printf '  （未指定）\n'
     return 0
   fi
 
-  for home_dir in "${ALSO_HOMES[@]}"; do
+  for home_dir in "${EXISTENCE_HOMES[@]}"; do
     path="$home_dir/.opencode/bin/opencode"
     if [ -x "$path" ]; then
-      printf '  存在/可执行: %s\n' "$path"
+      printf '  存在/可执行: %s（仅存在性，未执行）\n' "$path"
     else
-      printf '  缺失: %s\n' "$path"
+      printf '  缺失: %s（不存在或不可执行；仅存在性检查，未执行）\n' "$path"
     fi
   done
 }
 
 main() {
   local home_dir
+  local -a probe_homes=()
+  local -a foreign_homes=()
+  local limited=0
 
   while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -240,7 +335,7 @@ main() {
           printf '错误: --home 缺少参数\n' >&2
           exit 2
         fi
-        HOMES+=("$2")
+        HOMES+=("$(canonical_path "$2")")
         shift 2
         ;;
       --also-home)
@@ -248,7 +343,7 @@ main() {
           printf '错误: --also-home 缺少参数\n' >&2
           exit 2
         fi
-        ALSO_HOMES+=("$2")
+        ALSO_HOMES+=("$(canonical_path "$2")")
         shift 2
         ;;
       --expected-opencode-version)
@@ -271,19 +366,42 @@ main() {
     esac
   done
 
-  # Default identity: the current login. Repeating --home probes each one.
-  if [ "${#HOMES[@]}" -eq 0 ]; then
-    HOMES=("$HOME")
+  if ! CURRENT_HOME="$(resolve_current_home)"; then
+    printf '错误: 无法解析当前账户（EUID=%s）的主目录；不会改用环境变量 HOME 猜测。请检查 getent passwd（或测试用 AGENT_DEVBOX_DESKTOP_CURRENT_HOME）。\n' "$EUID" >&2
+    exit 1
   fi
 
-  printf '== agent-devbox 桌面版 CLI 自查 ==\n'
-  printf '身份: %s  HOME=%s\n' "$(id -un)" "$HOME"
-
+  # Default identity: the current account home. A requested --home is probed
+  # ONLY when it canonicalizes to that same path; everything else is foreign.
+  if [ "${#HOMES[@]}" -eq 0 ]; then
+    HOMES=("$CURRENT_HOME")
+  fi
   for home_dir in "${HOMES[@]}"; do
-    if ! probe_home "$home_dir" "$EXPECTED_VERSION"; then
-      fail=1
+    if [ "$home_dir" = "$CURRENT_HOME" ]; then
+      probe_homes+=("$home_dir")
+    else
+      foreign_homes+=("$home_dir")
     fi
   done
+  if [ "${#probe_homes[@]}" -eq 0 ]; then
+    limited=1
+  fi
+  EXISTENCE_HOMES=("${foreign_homes[@]}" "${ALSO_HOMES[@]}")
+
+  printf '== agent-devbox 桌面版 CLI 自查 ==\n'
+  printf '身份: %s  EUID=%s\n' "$(id -un 2>/dev/null || printf '%s' "$EUID")" "$EUID"
+  printf '当前账户 HOME: %s（getent/realpath）\n' "$CURRENT_HOME"
+
+  if [ "${#probe_homes[@]}" -eq 0 ]; then
+    printf '\n[1] 当前账户 HOME 桌面版探测\n'
+    printf '  （当前账户 HOME=%s 未被 --home 请求，跳过探测；其他 --home 只做存在性检查）\n' "$CURRENT_HOME"
+  else
+    for home_dir in "${probe_homes[@]}"; do
+      if ! probe_home "$home_dir" "$EXPECTED_VERSION"; then
+        fail=1
+      fi
+    done
+  fi
 
   if ! check_hard_deps; then
     deps_fail=1
@@ -294,9 +412,15 @@ main() {
   fi
 
   check_misplaced
-  check_also_home
+  check_existence_homes
 
   printf '\n[6] 结论\n'
+  if [ "$fail" -eq 0 ] && [ "$limited" -ne 0 ]; then
+    printf '  结论: 未完整验证（当前账户 HOME=%s 未被 --home 请求）\n' "$CURRENT_HOME"
+    printf '  只对请求的其他账户目录做了存在性检查（未执行其中任何 CLI），不能证明桌面版可用。\n'
+    printf '  需要完整结论: 请加 --home %s\n' "$CURRENT_HOME"
+    exit 1
+  fi
   if [ "$fail" -eq 0 ]; then
     if [ "$warn" -ne 0 ]; then
       printf '  结论: PASS（有警告，见 [4]：这些 CLI 桌面版看不到）\n'
@@ -309,14 +433,17 @@ main() {
   printf '  结论: FAIL\n'
   printf '  修复（手动，脚本不会执行）:\n'
   if [ "$probe_missing" -ne 0 ]; then
-    printf '    - 探测路径缺失（%s）：\n' "${missing_home:-$HOME}"
-    printf '      mkdir -p "%s/.opencode/bin" && ln -sfn /usr/local/bin/opencode "%s/.opencode/bin/opencode"\n' "${missing_home:-$HOME}" "${missing_home:-$HOME}"
+    printf '    - 探测路径缺失（%s）：\n' "${missing_home:-$CURRENT_HOME}"
+    printf '      mkdir -p "%s/.opencode/bin" && ln -sfn /usr/local/bin/opencode "%s/.opencode/bin/opencode"\n' "${missing_home:-$CURRENT_HOME}" "${missing_home:-$CURRENT_HOME}"
   fi
   if [ "$version_fail" -ne 0 ]; then
     printf '    - 版本不一致/无法取版本：把桌面版升级到与 CLI 相同版本，或用桌面版的「更新 OpenCode」让它自己装一份\n'
   fi
   if [ "$deps_fail" -ne 0 ]; then
     printf '    - 缺少运行依赖：发行版内必须有 bash 与 curl\n'
+  fi
+  if [ "$limited" -ne 0 ]; then
+    printf '  注意: 当前账户 HOME=%s 未被 --home 请求，本次未做桌面版探测。\n' "$CURRENT_HOME"
   fi
   printf '  如果刚添加/重装过发行版仍不生效: 完全退出桌面版（含托盘）后重开，再添加发行版\n'
   exit 1

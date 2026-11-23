@@ -103,6 +103,11 @@ docs/                            # user-facing guides
 - ARM64 绝不下载 `zstd.exe`（只有 win64）；跳过 Tier 3 时不得设 `ContentSuspect`，分片保留供重试；资产名不得写死 `rootfs-$Variant-amd64`。
 - 架构检测不可识别即 throw（fail closed）；CI 不变量只在 `run.ps1`，build.yml 不放重复 grep。
 
+**P1-2 版本状态（`version-inventory.sh` / publish merge）**
+- 采集坑：`wails3 version` 只写 **stderr**（exit 0）；`oh-my-openagent` **不是 npm 全局包**（`bunx` 安装，版本只在 `/opt/agent-seed/.bun/install/cache/oh-my-openagent@*/package.json`）。二者都必须采集，否则 publish 的「每个 floating 包都要两架构」校验失败、changed 门禁永远 `missing-key`。
+- `npm ls -g --json` 可能 exit 1 但 JSON 仍有效（extraneous 条目），只能以解析失败判错。
+- publish 合并前 `.github/scripts/version-state.sh` 只存在于构建提交，切到 `automation/versions` 后会消失 → 先 `cp` 到 `$RUNNER_TEMP` 再 checkout。
+
 ## ANTI-PATTERNS
 - NEVER set `HOME` globally in the image (root shell needs `HOME=/root`; the daemon's HOME is set in `paseo-boot` only).
 - NEVER install `@opencode/cli`; NEVER `docker build` locally — CI is the only builder and it runs for every branch.

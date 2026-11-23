@@ -1,0 +1,8 @@
+{
+  "schemaVersion": 1,
+  "arch": "amd64",
+  "variant": "agents",
+  "built_at": "2026-11-20T00:10:00Z",
+  "tools": {"foo": "1.2.3"},
+  "packages": {"dpkg": {"libc6": "2.41-12"}}
+}

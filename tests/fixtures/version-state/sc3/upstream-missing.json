@@ -1,0 +1,4 @@
+{
+  "pypi:aider-chat": "0.86.2",
+  "missing": ["npm:opencode-ai"]
+}

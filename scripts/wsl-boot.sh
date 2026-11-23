@@ -65,6 +65,14 @@
 # =============================================================================
 set -uo pipefail
 
+# Shared, pure parser (no external dirname: the [boot] env has no PATH yet).
+case "${BASH_SOURCE[0]}" in
+  */*) _wsl_boot_dir="${BASH_SOURCE[0]%/*}" ;;
+  *) _wsl_boot_dir="." ;;
+esac
+# shellcheck source=scripts/paseo-env.sh
+. "$_wsl_boot_dir/paseo-env.sh"
+
 # --- env-overridable constants (overridable so tests can point them at tmp) ---
 CONF="${AGENT_DEVBOX_CONF:-/etc/agent-devbox.conf}"
 MOTD_FILE="${AGENT_DEVBOX_MOTD:-/etc/motd}"
@@ -97,7 +105,19 @@ DOCKERD_BIN="${AGENT_DEVBOX_DOCKERD_BIN-dockerd}"
 PASEO_PID="${AGENT_DEVBOX_PASEO_PID:-/home/paseo/.paseo/paseo.pid}"
 PASEO_USER="${AGENT_DEVBOX_PASEO_USER:-paseo}"
 PASEO_BOOT_BIN="${AGENT_DEVBOX_PASEO_BOOT_BIN:-/usr/local/bin/paseo-boot.sh}"
-PASEO_HEALTH_URL="${AGENT_DEVBOX_PASEO_HEALTH_URL:-http://127.0.0.1:6767/api/health}"
+# The readiness probe follows the SAME PASEO_LISTEN paseo-boot parses; an
+# explicit override still wins (tests use it). An invalid value keeps the safe
+# default here while paseo-boot fails closed on that value.
+PASEO_HEALTH_URL="${AGENT_DEVBOX_PASEO_HEALTH_URL:-}"
+if [ -z "$PASEO_HEALTH_URL" ]; then
+  if paseo_parse_listen "${PASEO_LISTEN:-0.0.0.0:6767}"; then
+    PASEO_HEALTH_URL="http://$PASEO_PROBE_HOST:$PASEO_PORT/api/health"
+  else
+    PASEO_HEALTH_URL="http://127.0.0.1:6767/api/health"
+    printf 'WARN: invalid PASEO_LISTEN=%s; health probe falls back to %s\n' \
+      "${PASEO_LISTEN:-}" "$PASEO_HEALTH_URL" >&2
+  fi
+fi
 DOCKER_SOCK="${AGENT_DEVBOX_DOCKER_SOCK:-/var/run/docker.sock}"
 DOCKER_BIN="${AGENT_DEVBOX_DOCKER_BIN:-/usr/bin/docker}"
 CURL_BIN="${AGENT_DEVBOX_CURL_BIN:-/usr/bin/curl}"

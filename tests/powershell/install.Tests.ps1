@@ -1,6 +1,6 @@
 # Pester coverage for pure helpers that the dependency-free runner does not
-# touch. These three are the last line of defence for Tier 2 merging, argv
-# quoting, and partial-download cleanup.
+# touch (Tier 2 merging, argv quoting, partial-download cleanup, and the
+# data-disk ACL owner/grant verification).
 #
 #   Invoke-Pester -Path tests/powershell/install.Tests.ps1 -CI
 
@@ -16,6 +16,17 @@ BeforeAll {
     param([Parameter(Mandatory)][string] $Path, [Parameter(Mandatory)][int64] $Length)
     $fs = [System.IO.File]::Open($Path, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write)
     try { $fs.SetLength($Length) } finally { $fs.Dispose() }
+  }
+
+  # Non-Windows PowerShell has no Get-Acl command. Keep the production seam
+  # (Set-AgentDevboxVhdAcl calls Get-Acl) mockable on every host: the stub only
+  # exists where the real cmdlet is absent, and every ACL test mocks it.
+  if (-not (Get-Command Get-Acl -ErrorAction SilentlyContinue)) {
+    function Get-Acl {
+      [CmdletBinding()]
+      param([Parameter(Mandatory)][string] $LiteralPath)
+      throw 'Get-Acl is unavailable on this platform; tests must mock it.'
+    }
   }
 }
 
@@ -374,5 +385,257 @@ Describe 'Get-ZstdExeFromRelease: pinned zip/exe and cache reverification' {
     { Get-ZstdExeFromRelease -InstallDir $script:p05Install -Arch 'arm64' } | Should -Throw '*ARM64*'
     Should -Invoke Invoke-WebRequest -Times 0 -Exactly
     Should -Invoke Expand-Archive -Times 0 -Exactly
+  }
+}
+
+Describe 'Get-AgentDevboxSid' {
+  It 'rejects an empty or whitespace identity' {
+    { Get-AgentDevboxSid -Identity '' } | Should -Throw
+    { Get-AgentDevboxSid -Identity '   ' } | Should -Throw
+  }
+
+  It 'returns an existing numeric SID unchanged' {
+    (Get-AgentDevboxSid -Identity 'S-1-5-21-111-222-333-1001') | Should -Be 'S-1-5-21-111-222-333-1001'
+    (Get-AgentDevboxSid -Identity 's-1-5-21-111-222-333-1001') | Should -Be 'S-1-5-21-111-222-333-1001'
+  }
+
+  It 'rejects SYSTEM / LOCAL SERVICE / NETWORK SERVICE SIDs' {
+    foreach ($sid in @('S-1-5-18', 'S-1-5-19', 'S-1-5-20')) {
+      { Get-AgentDevboxSid -Identity $sid } | Should -Throw '*SYSTEM*'
+    }
+  }
+
+  It 'throws a clear error for an unresolvable account name' {
+    $name = 'agent-devbox-no-such-user-' + [guid]::NewGuid().ToString('N')
+    { Get-AgentDevboxSid -Identity $name } | Should -Throw '*无法*'
+  }
+}
+
+Describe 'Set-AgentDevboxVhdAcl' {
+  BeforeEach {
+    $script:aclPath = Join-Path $TestDrive ('data-' + [guid]::NewGuid().ToString('N') + '.vhdx')
+    [System.IO.File]::WriteAllText($script:aclPath, 'vhdx')
+    $script:aclUser = 'CONTOSO\alice'
+    $script:aclSid = 'S-1-5-21-111-222-333-1001'
+    $script:aclOtherSid = 'S-1-5-21-111-222-333-9999'
+    $script:aclCalls = New-Object System.Collections.Generic.List[object]
+
+    Mock Get-AgentDevboxSid {
+      param($Identity)
+      $text = "$Identity".Trim()
+      if (-not $text) { throw '未指定交互式用户。' }
+      if ($text -match '^[Ss]-1(?:-\d+)+$') {
+        $sid = $text.ToUpperInvariant()
+        if (@('S-1-5-18', 'S-1-5-19', 'S-1-5-20') -contains $sid) {
+          throw "交互式用户解析为 $sid（SYSTEM/LOCAL SERVICE/NETWORK SERVICE）。"
+        }
+        return $sid
+      }
+      if ($text -eq $script:aclUser) { return $script:aclSid }
+      throw "无法把交互式用户 $text 解析为 SID。"
+    }
+
+    Mock Invoke-Native {
+      param($FilePath, $Arguments, $InputText)
+      $script:aclCalls.Add([pscustomobject]@{ FilePath = $FilePath; Arguments = @($Arguments) })
+      $script:NativeExit = 0
+      return @('已处理 1 个文件')
+    }
+
+    Mock Get-Acl {
+      [pscustomobject]@{
+        Owner = $script:aclSid
+        Access = @(
+          [pscustomobject]@{
+            IdentityReference = $script:aclSid
+            FileSystemRights = [System.Security.AccessControl.FileSystemRights]::FullControl
+            AccessControlType = [System.Security.AccessControl.AccessControlType]::Allow
+            IsInherited = $false
+          }
+        )
+      }
+    }
+  }
+
+  It 'sets the owner and grants explicit FullControl, then verifies the ACL' {
+    $result = Set-AgentDevboxVhdAcl -Path $script:aclPath -InteractiveUser $script:aclUser
+
+    $result | Should -Be $script:aclSid
+    $script:aclCalls.Count | Should -Be 2
+    $script:aclCalls[0].FilePath | Should -Be 'icacls.exe'
+    $script:aclCalls[0].Arguments[0] | Should -Be $script:aclPath
+    $script:aclCalls[0].Arguments[1] | Should -Be '/setowner'
+    $script:aclCalls[0].Arguments[2] | Should -Be ('*' + $script:aclSid)
+    $script:aclCalls[1].FilePath | Should -Be 'icacls.exe'
+    $script:aclCalls[1].Arguments[0] | Should -Be $script:aclPath
+    $script:aclCalls[1].Arguments[1] | Should -Be '/grant'
+    $script:aclCalls[1].Arguments[2] | Should -Be ('*' + $script:aclSid + ':(F)')
+    Should -Invoke Get-Acl -Times 1 -Exactly
+  }
+
+  It 'stops after a failed setowner: no grant, no Get-Acl' {
+    Mock Invoke-Native {
+      param($FilePath, $Arguments, $InputText)
+      $script:aclCalls.Add([pscustomobject]@{ FilePath = $FilePath; Arguments = @($Arguments) })
+      $script:NativeExit = 5
+      return @('拒绝访问。')
+    }
+
+    { Set-AgentDevboxVhdAcl -Path $script:aclPath -InteractiveUser $script:aclUser } |
+      Should -Throw '*退出码 5*'
+
+    $script:aclCalls.Count | Should -Be 1
+    $script:aclCalls[0].Arguments[1] | Should -Be '/setowner'
+    Should -Invoke Get-Acl -Times 0 -Exactly
+  }
+
+  It 'stops after a failed grant: no Get-Acl' {
+    $script:aclNativeCall = 0
+    Mock Invoke-Native {
+      param($FilePath, $Arguments, $InputText)
+      $script:aclCalls.Add([pscustomobject]@{ FilePath = $FilePath; Arguments = @($Arguments) })
+      $script:aclNativeCall++
+      if ($script:aclNativeCall -eq 1) { $script:NativeExit = 0 } else { $script:NativeExit = 7 }
+      return @('拒绝访问。')
+    }
+
+    { Set-AgentDevboxVhdAcl -Path $script:aclPath -InteractiveUser $script:aclUser } |
+      Should -Throw '*退出码 7*'
+
+    $script:aclCalls.Count | Should -Be 2
+    $script:aclCalls[1].Arguments[1] | Should -Be '/grant'
+    Should -Invoke Get-Acl -Times 0 -Exactly
+  }
+
+  It 'rejects an owner that is not the interactive user' {
+    Mock Get-Acl {
+      [pscustomobject]@{
+        Owner = $script:aclOtherSid
+        Access = @(
+          [pscustomobject]@{
+            IdentityReference = $script:aclSid
+            FileSystemRights = [System.Security.AccessControl.FileSystemRights]::FullControl
+            AccessControlType = [System.Security.AccessControl.AccessControlType]::Allow
+            IsInherited = $false
+          }
+        )
+      }
+    }
+
+    { Set-AgentDevboxVhdAcl -Path $script:aclPath -InteractiveUser $script:aclUser } |
+      Should -Throw '*所有者*'
+  }
+
+  It 'rejects a SYSTEM owner' {
+    Mock Get-Acl {
+      [pscustomobject]@{
+        Owner = 'S-1-5-18'
+        Access = @(
+          [pscustomobject]@{
+            IdentityReference = $script:aclSid
+            FileSystemRights = [System.Security.AccessControl.FileSystemRights]::FullControl
+            AccessControlType = [System.Security.AccessControl.AccessControlType]::Allow
+            IsInherited = $false
+          }
+        )
+      }
+    }
+
+    { Set-AgentDevboxVhdAcl -Path $script:aclPath -InteractiveUser $script:aclUser } |
+      Should -Throw '*SYSTEM*'
+  }
+
+  It 'rejects an inherited-only FullControl allow (no explicit grant)' {
+    Mock Get-Acl {
+      [pscustomobject]@{
+        Owner = $script:aclSid
+        Access = @(
+          [pscustomobject]@{
+            IdentityReference = $script:aclSid
+            FileSystemRights = [System.Security.AccessControl.FileSystemRights]::FullControl
+            AccessControlType = [System.Security.AccessControl.AccessControlType]::Allow
+            IsInherited = $true
+          }
+        )
+      }
+    }
+
+    { Set-AgentDevboxVhdAcl -Path $script:aclPath -InteractiveUser $script:aclUser } |
+      Should -Throw '*完全控制*'
+  }
+
+  It 'rejects an explicit Allow without FullControl' {
+    Mock Get-Acl {
+      [pscustomobject]@{
+        Owner = $script:aclSid
+        Access = @(
+          [pscustomobject]@{
+            IdentityReference = $script:aclSid
+            FileSystemRights = [System.Security.AccessControl.FileSystemRights]::Modify
+            AccessControlType = [System.Security.AccessControl.AccessControlType]::Allow
+            IsInherited = $false
+          }
+        )
+      }
+    }
+
+    { Set-AgentDevboxVhdAcl -Path $script:aclPath -InteractiveUser $script:aclUser } |
+      Should -Throw '*完全控制*'
+  }
+
+  It 'rejects an explicit Deny FullControl conflict' {
+    Mock Get-Acl {
+      [pscustomobject]@{
+        Owner = $script:aclSid
+        Access = @(
+          [pscustomobject]@{
+            IdentityReference = $script:aclSid
+            FileSystemRights = [System.Security.AccessControl.FileSystemRights]::FullControl
+            AccessControlType = [System.Security.AccessControl.AccessControlType]::Allow
+            IsInherited = $false
+          },
+          [pscustomobject]@{
+            IdentityReference = $script:aclSid
+            FileSystemRights = [System.Security.AccessControl.FileSystemRights]::FullControl
+            AccessControlType = [System.Security.AccessControl.AccessControlType]::Deny
+            IsInherited = $false
+          }
+        )
+      }
+    }
+
+    { Set-AgentDevboxVhdAcl -Path $script:aclPath -InteractiveUser $script:aclUser } |
+      Should -Throw '*拒绝*'
+  }
+
+  It 'rejects a SYSTEM / service target before any icacls call' {
+    { Set-AgentDevboxVhdAcl -Path $script:aclPath -InteractiveUser 'S-1-5-18' } |
+      Should -Throw '*SYSTEM*'
+
+    Should -Invoke Invoke-Native -Times 0 -Exactly
+    Should -Invoke Get-Acl -Times 0 -Exactly
+  }
+
+  It 'rejects an unresolvable account before any icacls call' {
+    { Set-AgentDevboxVhdAcl -Path $script:aclPath -InteractiveUser 'no-such-user' } |
+      Should -Throw '*无法*'
+
+    Should -Invoke Invoke-Native -Times 0 -Exactly
+    Should -Invoke Get-Acl -Times 0 -Exactly
+  }
+
+  It 'rejects a missing VHDX path before any icacls call' {
+    $missing = Join-Path $TestDrive ('missing-' + [guid]::NewGuid().ToString('N') + '.vhdx')
+    { Set-AgentDevboxVhdAcl -Path $missing -InteractiveUser $script:aclUser } |
+      Should -Throw '*不存在*'
+
+    Should -Invoke Invoke-Native -Times 0 -Exactly
+    Should -Invoke Get-Acl -Times 0 -Exactly
+  }
+
+  It 'rejects an unreadable ACL' {
+    Mock Get-Acl { throw '拒绝访问。' }
+    { Set-AgentDevboxVhdAcl -Path $script:aclPath -InteractiveUser $script:aclUser } |
+      Should -Throw '*ACL*'
   }
 }

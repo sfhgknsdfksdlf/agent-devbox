@@ -42,6 +42,7 @@ on:
       - "windows/**"
       - "1panel/**"
       - "versions.json"
+      - ".github/scripts/version-state.sh"
       - ".github/workflows/build.yml"
       - ".github/workflows/keepalive.yml"
   workflow_dispatch:
@@ -81,6 +82,7 @@ jobs:
       contents: read
     outputs:
       changed: ${{ steps.diff.outputs.changed }}
+      reason: ${{ steps.diff.outputs.reason }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -101,38 +103,27 @@ jobs:
       - id: diff
         run: |
           set -euo pipefail
-          changed=false
           state="${{ steps.state.outputs.file }}"
           echo "state: $state"
-          pkgs="
-          opencode-ai
-          oh-my-openagent
-          @getpaseo/cli
-          wrangler
-          create-cloudflare
-          @anthropic-ai/claude-code
-          @openai/codex
-          @google/gemini-cli
-          @qwen-code/qwen-code
-          @charmland/crush
-          @github/copilot
-          @earendil-works/pi-coding-agent
-          @deepseek-ai/dsh
-          @xai-official/grok
-          zcode-app-cli
-          "
-          for pkg in $pkgs; do
-            latest="$(npm view "$pkg" version 2>/dev/null || echo ERR)"
-            have="$(jq -r --arg k "$pkg" '.[$k] // "MISSING"' "$state")"
-            echo "$pkg  have=$have  latest=$latest"
-            if [ "$latest" != "ERR" ] && [ "$latest" != "$have" ]; then changed=true; fi
-          done
-          aider_latest="$(curl -fsSL https://pypi.org/pypi/aider-chat/json 2>/dev/null | jq -r '.info.version' 2>/dev/null || echo ERR)"
-          aider_have="$(jq -r '."aider-chat" // "MISSING"' "$state")"
-          echo "aider-chat  have=$aider_have  latest=$aider_latest"
-          if [ "$aider_latest" != "ERR" ] && [ "$aider_latest" != "$aider_have" ]; then changed=true; fi
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.force }}" = "true" ]; then changed=true; fi
+          now="$(date -u +%FT%TZ)"
+          # version-state.sh owns every upstream query (npm/PyPI). It compares
+          # the tracked floating packages against the versions actually
+          # installed in the last merged inventory and fails open (changed=true)
+          # on a query error, a missing tools key or stale state.
+          result="$(.github/scripts/version-state.sh --emit changed --manifest "$state" --now "$now")"
+          printf '%s\n' "$result"
+          changed="$(printf '%s\n' "$result" | sed -n 's/^changed=//p')"
+          reason="$(printf '%s\n' "$result" | sed -n 's/^reason=//p')"
+          if [ -z "$changed" ] || [ -z "$reason" ]; then
+            echo "ERROR: version-state.sh did not report changed/reason" >&2
+            exit 1
+          fi
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.force }}" = "true" ]; then
+            changed=true
+            reason=forced
+          fi
           echo "changed=$changed" >> "$GITHUB_OUTPUT"
+          echo "reason=$reason" >> "$GITHUB_OUTPUT"
 
   # ---------------------------------------------------------------------------
   # Static verification (no image build needed).
@@ -412,6 +403,34 @@ jobs:
           retention-days: 1
           compression-level: 0
 
+      # The scheduled diff-gate compares upstream with what the previous build
+      # actually INSTALLED, so record this arch's versions from the agents image.
+      # This is the build-time proof; the exported rootfs inventory is the
+      # authority `publish` merges (publish only reads version-inventory-rootfs).
+      - name: Capture installed versions (${{ matrix.arch }})
+        run: |
+          set -euo pipefail
+          arch="${{ matrix.arch }}"
+          digest="${{ steps.agents.outputs.digest }}"
+          docker pull --platform "linux/$arch" "$AGENTS_IMAGE@$digest"
+          tmp="$(mktemp)"
+          docker run --rm --platform "linux/$arch" \
+            --entrypoint /usr/local/bin/version-inventory.sh \
+            "$AGENTS_IMAGE@$digest" --arch "$arch" --variant agents > "$tmp"
+          mv "$tmp" "installed-build-$arch.json"
+          jq -e --arg a "$arch" \
+            '.schemaVersion == 1 and .arch == $a and .variant == "agents"' \
+            "installed-build-$arch.json" >/dev/null
+          jq -r '"tools=\(.tools | length) dpkg=\(.packages.dpkg | length)"' "installed-build-$arch.json"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: version-inventory-build-${{ matrix.arch }}
+          path: installed-build-${{ matrix.arch }}.json
+          if-no-files-found: error
+          retention-days: 3
+          compression-level: 0
+
   # ---------------------------------------------------------------------------
   # Merge the per-arch images into one multi-arch manifest per image.
   # ---------------------------------------------------------------------------
@@ -637,6 +656,18 @@ jobs:
             docker run --rm --platform "$plat" --entrypoint pwsh "$img:$TAG-wsl" \
               -NoProfile -Command '$PSVersionTable.PSVersion.ToString()'
             docker run --rm --platform "$plat" --entrypoint docker "$img:$TAG-wsl" compose version
+            # The final agents overlay is exactly what WSL users import, so its
+            # installed versions are the authoritative state `publish` merges.
+            if [ "$v" = agents ]; then
+              tmp="$(mktemp)"
+              docker run --rm --platform "$plat" \
+                --entrypoint /usr/local/bin/version-inventory.sh \
+                "$img:$TAG-wsl" --arch "$arch" --variant agents > "$tmp"
+              mv "$tmp" "installed-rootfs-$arch.json"
+              jq -e --arg a "$arch" \
+                '.schemaVersion == 1 and .arch == $a and .variant == "agents"' \
+                "installed-rootfs-$arch.json" >/dev/null
+            fi
             cid=$(docker create --platform "$plat" "$img:$TAG-wsl")
             docker export "$cid" -o "rootfs-$v-${{ matrix.arch }}.tar"
             docker rm -f "$cid"
@@ -666,6 +697,14 @@ jobs:
         with:
           name: rootfs-${{ matrix.arch }}
           path: rootfs-*-${{ matrix.arch }}.tar.zst.part-*
+          retention-days: 3
+          if-no-files-found: error
+          compression-level: 0
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: version-inventory-rootfs-${{ matrix.arch }}
+          path: installed-rootfs-${{ matrix.arch }}.json
           retention-days: 3
           if-no-files-found: error
           compression-level: 0
@@ -706,6 +745,16 @@ jobs:
           path: artifacts
           merge-multiple: true
           pattern: rootfs-*
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: version-inventory-build
+          merge-multiple: true
+          pattern: version-inventory-build-*
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: version-inventory-rootfs
+          merge-multiple: true
+          pattern: version-inventory-rootfs-*
       - name: Verify both arches and contiguous parts
         run: |
           set -euo pipefail
@@ -729,6 +778,25 @@ jobs:
                 [ "$p" = "$want" ] || { echo "ERROR: gap in $v/$arch: expected $want, got $p"; exit 1; }
                 i=$((i+1))
               done
+            done
+          done
+      - name: Verify version inventories
+        run: |
+          set -euo pipefail
+          # One JSON per arch per group. The build inventories prove the agents
+          # image the build produced; the rootfs inventories are authoritative
+          # because they describe the overlay WSL actually imports.
+          for group in build rootfs; do
+            dir="version-inventory-$group"
+            count="$(find "$dir" -maxdepth 1 -type f -name '*.json' | wc -l)"
+            [ "$count" -eq 2 ] || { echo "ERROR: expected 2 inventories in $dir, found $count"; exit 1; }
+            for arch in amd64 arm64; do
+              f="$dir/installed-$group-$arch.json"
+              [ -f "$f" ] || { echo "ERROR: missing $f"; exit 1; }
+              jq -e --arg a "$arch" \
+                '.schemaVersion == 1 and .arch == $a and .variant == "agents"' \
+                "$f" >/dev/null
+              echo "ok: $f tools=$(jq '.tools | length' "$f") dpkg=$(jq '.packages.dpkg | length' "$f")"
             done
           done
       - name: Stage rootfs parts
@@ -896,11 +964,13 @@ jobs:
           fi
 
       # -------------------------------------------------------------------------
-      # The build above ran with no-cache for scheduled/manual runs, so record the
-      # upstream versions this image actually resolved on the dedicated state
-      # branch. main stays free of bot commits, so feature branches do not drift
-      # every time the scheduled build runs. `[skip actions]` is belt-and-braces:
-      # the automation/versions branch is already excluded from on.push.
+      # The build above ran with no-cache for scheduled/manual runs. Record what
+      # this image ACTUALLY installed on the dedicated state branch: `merge`
+      # combines the authoritative per-arch rootfs inventories with the state
+      # manifest. No upstream query happens here. main stays free of bot commits,
+      # so feature branches do not drift every time the scheduled build runs.
+      # `[skip actions]` is belt-and-braces: the automation/versions branch is
+      # already excluded from on.push.
       # -------------------------------------------------------------------------
       - name: Record resolved upstream versions
         if: github.event_name != 'push'
@@ -922,6 +992,12 @@ jobs:
           if [ "$rc" -ne 0 ]; then
             echo "ERROR: cannot compare $REL with $latest"; exit 1
           fi
+          # The helper lives on the build commit; the state branch may predate
+          # it, so keep a copy before switching the worktree. The build commit's
+          # v2 versions.json is also kept as the seed for a legacy (v1 flat)
+          # state, so the first P1-2 migration cannot drop the fixed metadata.
+          cp .github/scripts/version-state.sh "$RUNNER_TEMP/version-state.sh"
+          cp versions.json "$RUNNER_TEMP/versions-seed.json"
           if git ls-remote --exit-code --heads origin automation/versions >/dev/null 2>&1; then
             git fetch --depth=1 origin automation/versions
             git checkout -B automation/versions FETCH_HEAD
@@ -929,42 +1005,37 @@ jobs:
             git fetch --depth=1 origin main
             git checkout -b automation/versions FETCH_HEAD
           fi
-          pkgs="
-          opencode-ai
-          oh-my-openagent
-          @getpaseo/cli
-          wrangler
-          create-cloudflare
-          @anthropic-ai/claude-code
-          @openai/codex
-          @google/gemini-cli
-          @qwen-code/qwen-code
-          @charmland/crush
-          @github/copilot
-          @earendil-works/pi-coding-agent
-          @deepseek-ai/dsh
-          @xai-official/grok
-          zcode-app-cli
-          "
-          tmp="$(mktemp)"
-          cp versions.json "$tmp"
-          for pkg in $pkgs; do
-            v="$(npm view "$pkg" version 2>/dev/null || true)"
-            if [ -n "$v" ]; then
-              jq --arg k "$pkg" --arg v "$v" '.[$k] = $v' "$tmp" > "$tmp.new"
-              mv "$tmp.new" "$tmp"
-            fi
-          done
-          aider="$(curl -fsSL https://pypi.org/pypi/aider-chat/json 2>/dev/null | jq -r '.info.version' 2>/dev/null || true)"
-          if [ -n "$aider" ] && [ "$aider" != "null" ]; then
-            jq --arg v "$aider" '."aider-chat" = $v' "$tmp" > "$tmp.new"
-            mv "$tmp.new" "$tmp"
+          # A v2 state manifest is authoritative (keep its floating/fixed). A
+          # legacy v1 flat state is migrated from the build commit's v2 seed;
+          # only the merge output replaces versions.json, nothing else changes.
+          if jq -e '.schemaVersion == 2' versions.json >/dev/null 2>&1; then
+            base=versions.json
+          else
+            base="$RUNNER_TEMP/versions-seed.json"
           fi
-          if cmp -s "$tmp" versions.json; then
+          bash "$RUNNER_TEMP/version-state.sh" merge \
+            --build-dir version-inventory-rootfs \
+            --manifest "$base" \
+            --out versions.json
+          # Fail closed: every floating package must carry both arches (the
+          # scheduled gate compares tools.<package>.amd64/arm64) and the build
+          # must be dated. The rootfs inventories supply all of that.
+          jq -e '
+            ((.last_built | type) == "string")
+            and (
+              [ .floating | to_entries[] | .value.package ] as $pkgs
+              | [ $pkgs[] as $p
+                  | (.tools[$p] // null) as $t
+                  | (($t | type) == "object")
+                    and (($t.amd64 | type) == "string") and (($t.amd64) != "")
+                    and (($t.arm64 | type) == "string") and (($t.arm64) != "")
+                ] | all
+            )
+          ' versions.json >/dev/null
+          if git diff --quiet -- versions.json; then
             echo "versions.json already up to date"
             exit 0
           fi
-          cp "$tmp" versions.json
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add versions.json

@@ -162,8 +162,12 @@ back to the stable entry.
    automatic re-attach state is a VOLATILE registry key); the next start re-attaches
    from inside the distro automatically. If that boot attach fails, see
    `wsl-persistence.md` for the repair path;
-10. delete the downloaded parts, any merged `.zst`, and any `.tar`, after success
-    and on failure.
+10. clean up temp files with one rule: the merged `.zst` and the `.tar` are deleted
+    whenever an import was attempted; **this run's** newly downloaded parts are
+    deleted when the import succeeded or the content was proven suspect
+    (`ContentSuspect`), and kept together with their sidecars when the import
+    failed on non-suspect content (a re-run re-verifies SHA256 and resumes);
+    parts that already existed before this run are not touched by this cleanup.
 
 Then enter it. The distro name depends on **variant × channel**: `agent-devbox` /
 `agent-devbox-core` (stable) or `agent-devbox-beta` / `agent-devbox-core-beta`
@@ -228,12 +232,15 @@ redirected (file/log), the same text is emitted as one normal line per tick so
 the install log still carries progress records.
 
 If an import tier fails, the installer now prints the native `wsl.exe` / `zstd.exe`
-output instead of discarding it, removes a stale `<InstallDir>\ext4.vhdx` left by
-the failed import (only when `wsl -l -q` succeeded and the distro is absent — an
-unknown listing counts as registered, so a live disk is never touched), and
-cleans up the merged files. A failed import keeps this run's parts and sidecars
-(unless the content was proven bad), so re-running the installer re-verifies
-their SHA256 and resumes; a successful import removes this run's parts.
+output instead of discarding it and removes a stale `<InstallDir>\ext4.vhdx` left
+by the failed import (only when `wsl -l -q` succeeded and the distro is absent — an
+unknown listing counts as registered, so a live disk is never touched). Cleanup is
+one decision with three branches: the merged `.zst`/`.tar` intermediates are always
+removed once an import was attempted; this run's newly downloaded parts are removed
+when the import succeeded or `ContentSuspect` is set; a non-suspect import failure
+keeps this run's parts and sidecars so a re-run re-verifies their SHA256 and
+resumes. Parts that were already in the install dir before this run are never
+removed by this cleanup.
 
 ## ARM64 (Windows 11)
 
@@ -255,9 +262,10 @@ installer executes `uname -m` and requires the matching value: `wsl --import`
 itself does **not** validate the architecture, so without this probe a wrong-arch
 rootfs would only fail much later. On a mismatch, or when the rootfs cannot
 execute at all (`Exec format error`), the installer unregisters the just-imported
-distro, removes only its `ext4.vhdx`, keeps `data.vhdx`, leaves any already-cleaned
-parts to the normal success cleanup, and throws a readable error. A re-run
-re-verifies/re-downloads the parts.
+distro, removes only its `ext4.vhdx`, keeps `data.vhdx`, and lets the parts follow
+the same cleanup rule (a successful import already removed this run's parts;
+pre-existing parts stay), then throws a readable error. A re-run re-verifies or
+re-downloads the parts.
 
 Tier 3 does not exist on ARM64: the pinned `zstd.exe` is a win64 binary. ARM64
 therefore has **Tier 1 (streaming) and Tier 2 (file import) only**. Skipping
@@ -359,9 +367,17 @@ Get-ChildItem "$InstallDir\agent-devbox-install-*.log" |
 ## The paseo password
 
 The installer **does not print the paseo password** to the console or to the
-install log. It is stored only in the distro's `/etc/agent-devbox.conf`. Each
-channel has its own password. Read it
-back with:
+install log. It keeps two copies, both mode `600`:
+
+- `/etc/agent-devbox.conf` on the (new) system disk: the **runtime copy** that
+  `paseo-boot` reads on start;
+- `/mnt/<DATA_MNTNAME>/.paseo-password` on the data disk: the **upgrade source**
+  that survives system-disk replacement.
+
+Interactive entry uses `Read-Host -AsSecureString` (no echo); reading an existing
+password crosses native stdout as **base64** decoded as UTF-8; printed failures
+are redacted with `Hide-SecretText` first. Each channel has its own password. Read
+the runtime copy with:
 
 ```powershell
 # from Windows (define $Distro first, or write agent-devbox / agent-devbox-core /
@@ -376,7 +392,10 @@ cat /etc/agent-devbox.conf
 
 The data-disk copy used across upgrades lives at
 `/mnt/<DATA_MNTNAME>/.paseo-password`: `/mnt/devbox-data/.paseo-password` for
-stable, `/mnt/devbox-data-beta/.paseo-password` for beta.
+stable, `/mnt/devbox-data-beta/.paseo-password` for beta. There is no migration
+from an old system-disk `/etc/agent-devbox.conf`: upgrades never read it. The
+data-disk file is the only upgrade source; if it cannot be read, the installer
+warns and treats the value as a new password (the old one stops working).
 
 ## Antivirus prompt and the elevated window
 
@@ -577,11 +596,14 @@ Any other answer is re-asked once, then treated as cancel. The prompt is
 skipped (the upgrade proceeds) when stdin/stdout is redirected, with `-Yes`, or
 with `-KeepExisting` (keep the current install). The data disk (`/home`,
 `/root`, `/workspace`) is kept,
-and the **paseo password is preserved**: it is stored on the data disk at
+and the **paseo password is preserved**: the data disk at
 `/mnt/<DATA_MNTNAME>/.paseo-password` (`/mnt/devbox-data` for stable,
-`/mnt/devbox-data-beta` for beta; mode 600), read back during `[7/10]`, and
-rewritten after the first install. (Installs that predate this get the password
-migrated once from the old `/etc/agent-devbox.conf`.) `-Reinstall` is still
+`/mnt/devbox-data-beta` for beta; mode 600) is the ONLY upgrade source, read back
+during `[7/10]` and rewritten after the first install; the new
+`/etc/agent-devbox.conf` (also mode 600) is only the runtime copy. Upgrades never
+read an old system-disk `/etc/agent-devbox.conf` and offer no migration from it;
+if the data-disk password cannot be read, the installer warns and treats it as a
+new password (the old one will no longer apply). `-Reinstall` is still
 accepted for compatibility (an upgrade is the default), and `-Yes` stays
 unattended (it now upgrades too).
 

@@ -25,10 +25,13 @@
 # V1 via `opencode-ai@^1`, omo = `oh-my-openagent@latest`) so a rebuild picks up
 # the newest, while `versions.json` + a CI diff-gate records what was resolved.
 # =============================================================================
-FROM node:24-trixie-slim
+# The base is pinned by its OCI *index* digest (multi-arch). Keep the readable
+# tag alongside the digest so the provenance is obvious and updates stay reviewable.
+FROM node:24-trixie-slim@sha256:af02d57b57719b9657a45199a79264a9437940cd55b3c7b3fc99615654f124a0
 
 ARG PLAYWRIGHT_VERSION=1.64.1
 ARG GO_VERSION=1.27.2
+ARG UV_VERSION=0.13.9
 
 ENV DEBIAN_FRONTEND=noninteractive \
     LANG=C.UTF-8 \
@@ -41,7 +44,6 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PASEO_LOG_FORMAT=json \
     PASEO_LOG_LEVEL=info \
     GOROOT=/usr/local/go \
-    GOSUMDB=off \
     IS_DOCKER=true \
     PATH=/usr/local/go/bin:/usr/local/bin:$PATH
 # HOME is deliberately NOT set globally: the WSL root shell must keep HOME=/root.
@@ -49,6 +51,20 @@ ENV DEBIAN_FRONTEND=noninteractive \
 
 # Use bash with pipefail so any RUN pipeline fails fast (satisfies hadolint DL4006).
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+# -----------------------------------------------------------------------------
+# L0) verified third-party asset policy (P1-1).
+#     config/image-assets.sha256 is the only source of
+#     (version, filename, arch) -> sha256, and every tool downloaded below is
+#     verified with scripts/image-assets.sh BEFORE it is extracted/installed.
+#     The helper lives under scripts/ because .dockerignore keeps .github/ out
+#     of the build context.
+# -----------------------------------------------------------------------------
+COPY scripts/image-assets.sh /usr/local/bin/image-assets
+COPY config/image-assets.sha256 /usr/local/share/agent-devbox/image-assets.sha256
+RUN set -eux; \
+    chmod 0755 /usr/local/bin/image-assets; \
+    image-assets verify-manifest /usr/local/share/agent-devbox/image-assets.sha256
 
 # -----------------------------------------------------------------------------
 # L1) base CLI, init helpers, build toolchain, python, VCS
@@ -75,7 +91,8 @@ RUN set -eux; \
 # -----------------------------------------------------------------------------
 # L1b) repo/dev QA tooling: the suite this repo runs itself (bats/shellcheck),
 #      CI triage (gh), man pages, and general network/forensics CLIs.
-#      `marksman` has no Debian package -> GitHub release binary, arch-mapped.
+#      `marksman` has no Debian package -> a fixed-tag GitHub release binary,
+#      arch-mapped and verified before it is installed.
 #      It is a .NET single-file binary: without libicu76 it aborts with
 #      "Couldn't find a valid ICU package" (exit 139), so the runtime is NOT
 #      optional here.
@@ -87,15 +104,16 @@ RUN set -eux; \
       bind9-dnsutils netcat-openbsd ethtool sysstat bridge-utils iproute2 \
       iptables nftables zstd parallel; \
     rm -rf /var/lib/apt/lists/*; \
-    case "$(dpkg --print-architecture)" in \
-      amd64) marksman_arch=x64 ;; \
-      arm64) marksman_arch=arm64 ;; \
-      *) echo "unsupported arch: $(dpkg --print-architecture)" >&2; exit 1 ;; \
-    esac; \
+    arch="$(dpkg --print-architecture)"; \
+    marksman_asset="$(image-assets asset-name marksman "$arch")"; \
     curl -fsSL --retry 5 --retry-all-errors --retry-delay 3 \
-      -o /usr/local/bin/marksman \
-      "https://github.com/artempyanykh/marksman/releases/latest/download/marksman-linux-${marksman_arch}"; \
-    chmod +x /usr/local/bin/marksman; \
+      -o "/tmp/${marksman_asset}" \
+      "https://github.com/artempyanykh/marksman/releases/download/2026-02-08/${marksman_asset}"; \
+    image-assets verify-file \
+      /usr/local/share/agent-devbox/image-assets.sha256 \
+      2026-02-08 "$marksman_asset" "$arch" "/tmp/${marksman_asset}"; \
+    install -m 0755 "/tmp/${marksman_asset}" /usr/local/bin/marksman; \
+    rm -f "/tmp/${marksman_asset}"; \
     marksman --version
 
 # -----------------------------------------------------------------------------
@@ -142,10 +160,26 @@ RUN set -eux; \
       playwright@${PLAYWRIGHT_VERSION}
 
 # -----------------------------------------------------------------------------
-# L6) Python tooling: uv
+# L6) Python tooling: uv + uvx from the pinned release archive.
+#     The upstream curl-pipe-to-shell installer always takes the current release
+#     and cannot be byte-verified, so it is deliberately unused.
 # -----------------------------------------------------------------------------
 RUN set -eux; \
-    curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh
+    arch="$(dpkg --print-architecture)"; \
+    uv_asset="$(image-assets asset-name uv "$arch")"; \
+    uv_dir="${uv_asset%.tar.gz}"; \
+    curl -fsSL --retry 5 --retry-all-errors --retry-delay 3 \
+      -o "/tmp/${uv_asset}" \
+      "https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/${uv_asset}"; \
+    image-assets verify-file \
+      /usr/local/share/agent-devbox/image-assets.sha256 \
+      "$UV_VERSION" "$uv_asset" "$arch" "/tmp/${uv_asset}"; \
+    tar -C /tmp -xzf "/tmp/${uv_asset}"; \
+    install -m 0755 "/tmp/${uv_dir}/uv" /usr/local/bin/uv; \
+    install -m 0755 "/tmp/${uv_dir}/uvx" /usr/local/bin/uvx; \
+    rm -rf "/tmp/${uv_asset}" "/tmp/${uv_dir}"; \
+    uv --version; \
+    uvx --version
 
 # -----------------------------------------------------------------------------
 # L7) Debuggers (gdb/lldb). ptrace needs --cap-add=SYS_PTRACE in Docker.
@@ -159,15 +193,31 @@ RUN set -eux; \
 # L8) Go toolchain (system-wide) ; per-user GOPATH/GOCACHE come from agent-env.sh
 #     Arch comes from the container itself (dpkg), not BuildKit's TARGETARCH ARG,
 #     whose default stuck at amd64 and broke the arm64 build.
+#     The tarball is verified against config/image-assets.sha256 before extraction.
+#     GOSUMDB must stay at the Go default (sum.golang.org): module checksum
+#     verification is a supply-chain control, so the build fails if it is off.
 # -----------------------------------------------------------------------------
 RUN set -eux; \
     arch="$(dpkg --print-architecture)"; \
-    curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-${arch}.tar.gz" -o /tmp/go.tgz; \
-    tar -C /usr/local -xzf /tmp/go.tgz; \
-    rm -f /tmp/go.tgz; \
+    go_arch="$(image-assets asset-name go "$arch")"; \
+    go_asset="go${GO_VERSION}.linux-${go_arch}.tar.gz"; \
+    curl -fsSL --retry 5 --retry-all-errors --retry-delay 3 \
+      -o "/tmp/${go_asset}" \
+      "https://go.dev/dl/${go_asset}"; \
+    image-assets verify-file \
+      /usr/local/share/agent-devbox/image-assets.sha256 \
+      "$GO_VERSION" "$go_asset" "$arch" "/tmp/${go_asset}"; \
+    tar -C /usr/local -xzf "/tmp/${go_asset}"; \
+    rm -f "/tmp/${go_asset}"; \
     ln -sf /usr/local/go/bin/go /usr/local/bin/go; \
     ln -sf /usr/local/go/bin/gofmt /usr/local/bin/gofmt; \
-    go version
+    go version; \
+    sumdb="$(go env GOSUMDB)"; \
+    echo "GOSUMDB=${sumdb}"; \
+    if [ "$sumdb" = "off" ]; then \
+      echo "GOSUMDB must not be off (module checksum verification is required)" >&2; \
+      exit 1; \
+    fi
 
 # L8b) Wails v3 desktop build libs + C/C++ LSP
 RUN set -eux; \

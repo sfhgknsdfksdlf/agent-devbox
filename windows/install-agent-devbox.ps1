@@ -875,13 +875,17 @@ if ($dataDiskMounted) {
   Warn '数据盘未能挂载：本次仍会完成安装，但密码无法保存到数据盘（下次升级可能需要重新设置）。'
 }
 
-# --- [8/10] 修复权限（尽力而为：让非提权的 WSL 用户也能打开该 VHDX）---------
-Step '[8/10] 修复权限…'
+# --- [8/10] 明确交互式用户并验证数据盘所有者/ACL ----------------------------
+# Win32_ComputerSystem.UserName 是控制台登录用户（UAC 提权后仍是它）；拿不到
+# 才退回当前环境。两者都空就必须停下：宁可安装失败，也不能把盘交给 SYSTEM。
+Step '[8/10] 验证数据盘所有者与访问权限…'
 $RunAsUser = (Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue).UserName
-if (-not $RunAsUser) { $RunAsUser = "$env:USERDOMAIN\$env:USERNAME" }
-Invoke-Native 'icacls.exe' @($VhdxPath, '/setowner', $RunAsUser) | Out-Null
-Invoke-Native 'icacls.exe' @($VhdxPath, '/grant', "${RunAsUser}:(F)") | Out-Null
-Ok "已尽力修复 $VhdxName 的所有者/ACL（$RunAsUser）。"
+if ([string]::IsNullOrWhiteSpace($RunAsUser)) { $RunAsUser = "$env:USERDOMAIN\$env:USERNAME" }
+if ([string]::IsNullOrWhiteSpace($RunAsUser)) {
+  throw '无法确定交互式 Windows 用户：不能设置数据盘所有者/ACL，已停止（尚未写入 /etc/agent-devbox.conf）。'
+}
+$ownerSid = Set-AgentDevboxVhdAcl -Path $VhdxPath -InteractiveUser $RunAsUser
+Ok "已设置 $VhdxName 的所有者为交互式用户（$RunAsUser，SID $ownerSid），并确认显式完全控制权限。"
 
 # --- paseo 密码（后台服务必填）；写入启动配置 ------------------------------
 # 优先级：数据盘上保存的密码（升级的唯一来源）> 交互输入 / 随机生成（仅首次安装）。
