@@ -3,9 +3,11 @@
 #   Invoke-Pester -Path tests/powershell/download.Tests.ps1 -CI
 #
 # The server is a separate PowerShell process (so it can really answer several
-# requests concurrently) with a System.Net.HttpListener bound to a random
-# 127.0.0.1 port. If the port cannot be bound the test is skipped explicitly;
-# it never silently passes.
+# requests concurrently) with a System.Net.HttpListener bound to 127.0.0.1 on a
+# port the OS just granted via TcpListener port 0 (retried 5 times). In CI a
+# bind failure FAILS the test; only a local run without injection skips
+# explicitly. AGENT_DEVBOX_TEST_HTTPLISTEN_FAIL=1 forces the bind failure so
+# download-failure.ps1 can prove that path is red.
 
 #Requires -Version 5.1
 BeforeAll {
@@ -182,59 +184,150 @@ AfterAll {
 }
 
 BeforeAll {
+  # Test-only port acquisition: bind a TcpListener on an ephemeral loopback
+  # port instead of guessing a port in a fixed range. Port 0 lets the OS pick a
+  # free port; a real bind failure is retried 5 times, then thrown so the caller
+  # can turn it into a test failure (CI) or a skip (local, non-injected).
+  # AGENT_DEVBOX_TEST_HTTPLISTEN_FAIL=1 / -ForceBindFailure simulate the failure
+  # deterministically without binding anything; every attempt is appended to
+  # AGENT_DEVBOX_TEST_HTTPLISTEN_ATTEMPTS_FILE when that env var is set.
+  function Get-FreeLoopbackPort {
+    param([switch] $ForceBindFailure)
+    $inject = $ForceBindFailure -or ($env:AGENT_DEVBOX_TEST_HTTPLISTEN_FAIL -eq '1')
+    $attemptsFile = $env:AGENT_DEVBOX_TEST_HTTPLISTEN_ATTEMPTS_FILE
+    $lastError = ''
+    for ($attempt = 1; $attempt -le 5; $attempt++) {
+      if (-not [string]::IsNullOrEmpty($attemptsFile)) {
+        try { [System.IO.File]::AppendAllText($attemptsFile, ("attempt {0}`n" -f $attempt)) } catch { }
+      }
+      if ($inject) {
+        $lastError = 'injected HttpListener bind failure'
+        continue
+      }
+      $listener = $null
+      try {
+        $listener = New-Object System.Net.Sockets.TcpListener -ArgumentList ([System.Net.IPAddress]::Loopback), 0
+        $listener.Start()
+        return [int]$listener.LocalEndpoint.Port
+      } catch {
+        $lastError = "$($_.Exception.Message)"
+      } finally {
+        if ($null -ne $listener) {
+          try { $listener.Stop() } catch { }
+        }
+      }
+    }
+    $ex = New-Object System.Exception ("Get-FreeLoopbackPort failed after 5 attempts to bind a loopback port: $lastError")
+    $ex.Data['AdboxPortFailure'] = $true
+    throw $ex
+  }
+
+  # Start the child listener on a real 127.0.0.1 port. The whole start is
+  # retried up to 5 times when the child reports a bind failure or never
+  # becomes ready; each failed attempt is torn down (process + temp dir) before
+  # the next one. A port-acquisition failure is not retried here because
+  # Get-FreeLoopbackPort already exhausted its own 5 attempts.
   function Start-DownloadServer {
-    param([hashtable] $Config)
-  $base = Join-Path ([System.IO.Path]::GetTempPath()) ('adbox-dl-' + [guid]::NewGuid().ToString('N'))
-  New-Item -ItemType Directory -Path $base -Force | Out-Null
-  $serverPath = Join-Path $base 'server.ps1'
-  [System.IO.File]::WriteAllText($serverPath, $script:ServerScript, (New-Object System.Text.UTF8Encoding($false)))
-  $configPath = Join-Path $base 'config.json'
-  $logPath = Join-Path $base 'requests.log'
-  $readyPath = Join-Path $base 'ready.txt'
-  $config | ConvertTo-Json -Depth 6 | ForEach-Object { [System.IO.File]::WriteAllText($configPath, $_, (New-Object System.Text.UTF8Encoding($false))) }
-  $port = Get-Random -Minimum 20000 -Maximum 60000
-  $prefix = "http://127.0.0.1:$port/"
-  $saved = @{}
-  foreach ($n in @('ADBOX_TEST_PREFIX', 'ADBOX_TEST_CONFIG', 'ADBOX_TEST_LOG', 'ADBOX_TEST_READY')) {
-    $saved[$n] = [Environment]::GetEnvironmentVariable($n)
-  }
-  $proc = $null
-  try {
-    [Environment]::SetEnvironmentVariable('ADBOX_TEST_PREFIX', $prefix)
-    [Environment]::SetEnvironmentVariable('ADBOX_TEST_CONFIG', $configPath)
-    [Environment]::SetEnvironmentVariable('ADBOX_TEST_LOG', $logPath)
-    [Environment]::SetEnvironmentVariable('ADBOX_TEST_READY', $readyPath)
-    $exe = (Get-Process -Id $PID).Path
-    $startArgs = @{
-      FilePath = $exe
-      ArgumentList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', 'server.ps1')
-      WorkingDirectory = $base
-      PassThru = $true
-    }
-    if ($env:OS -eq 'Windows_NT') { $startArgs['WindowStyle'] = 'Hidden' }
+    param([hashtable] $Config, [switch] $ForceBindFailure)
+  $inject = $ForceBindFailure -or ($env:AGENT_DEVBOX_TEST_HTTPLISTEN_FAIL -eq '1')
+  $maxAttempts = 5
+  $lastError = ''
+  for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+    $base = $null
+    $proc = $null
+    $keep = $false
+    $prefix = $null
     try {
-      $proc = Start-Process @startArgs
-    } catch {
-      Remove-Item -LiteralPath $base -Recurse -Force -ErrorAction SilentlyContinue
-      throw
+      try {
+        $port = Get-FreeLoopbackPort -ForceBindFailure:$ForceBindFailure
+      } catch {
+        $isPortFailure = ($_.Exception.Data -and $_.Exception.Data['AdboxPortFailure'])
+        if ($isPortFailure -and $inject) { throw }
+        if ($isPortFailure) {
+          $lastError = "$($_.Exception.Message)"
+          return [pscustomobject]@{
+            Process = $null
+            Base = $null
+            Url = $null
+            Log = $null
+            Ready = $false
+            Error = $lastError
+            Attempts = $attempt
+          }
+        }
+        throw
+      }
+
+      $base = Join-Path ([System.IO.Path]::GetTempPath()) ('adbox-dl-' + [guid]::NewGuid().ToString('N'))
+      New-Item -ItemType Directory -Path $base -Force | Out-Null
+      $serverPath = Join-Path $base 'server.ps1'
+      [System.IO.File]::WriteAllText($serverPath, $script:ServerScript, (New-Object System.Text.UTF8Encoding($false)))
+      $configPath = Join-Path $base 'config.json'
+      $logPath = Join-Path $base 'requests.log'
+      $readyPath = Join-Path $base 'ready.txt'
+      $config | ConvertTo-Json -Depth 6 | ForEach-Object { [System.IO.File]::WriteAllText($configPath, $_, (New-Object System.Text.UTF8Encoding($false))) }
+      $prefix = "http://127.0.0.1:$port/"
+      $saved = @{}
+      foreach ($n in @('ADBOX_TEST_PREFIX', 'ADBOX_TEST_CONFIG', 'ADBOX_TEST_LOG', 'ADBOX_TEST_READY')) {
+        $saved[$n] = [Environment]::GetEnvironmentVariable($n)
+      }
+      try {
+        [Environment]::SetEnvironmentVariable('ADBOX_TEST_PREFIX', $prefix)
+        [Environment]::SetEnvironmentVariable('ADBOX_TEST_CONFIG', $configPath)
+        [Environment]::SetEnvironmentVariable('ADBOX_TEST_LOG', $logPath)
+        [Environment]::SetEnvironmentVariable('ADBOX_TEST_READY', $readyPath)
+        $exe = (Get-Process -Id $PID).Path
+        $startArgs = @{
+          FilePath = $exe
+          ArgumentList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', 'server.ps1')
+          WorkingDirectory = $base
+          PassThru = $true
+        }
+        if ($env:OS -eq 'Windows_NT') { $startArgs['WindowStyle'] = 'Hidden' }
+        $proc = Start-Process @startArgs
+      } finally {
+        foreach ($n in $saved.Keys) { [Environment]::SetEnvironmentVariable($n, $saved[$n]) }
+      }
+      $deadline = [DateTime]::UtcNow.AddSeconds(15)
+      while (-not (Test-Path -LiteralPath $readyPath) -and [DateTime]::UtcNow -lt $deadline) {
+        if ($proc -and $proc.HasExited) { break }
+        Start-Sleep -Milliseconds 100
+      }
+      $ready = ''
+      if (Test-Path -LiteralPath $readyPath) { $ready = [System.IO.File]::ReadAllText($readyPath) }
+      if ($ready -eq 'ok') {
+        $keep = $true
+        return [pscustomobject]@{
+          Process = $proc
+          Base = $base
+          Url = ($prefix + 'asset')
+          Log = $logPath
+          Ready = $true
+          Error = $ready
+          Attempts = $attempt
+        }
+      }
+      if ($ready) { $lastError = $ready } else { $lastError = 'child server did not become ready' }
+    } finally {
+      if (-not $keep) {
+        if ($proc -and -not $proc.HasExited) {
+          try { Stop-Process -Id $proc.Id -Force -ErrorAction Stop } catch { }
+          try { [void]$proc.WaitForExit(5000) } catch { }
+        }
+        if ($base -and (Test-Path -LiteralPath $base)) {
+          Remove-Item -LiteralPath $base -Recurse -Force -ErrorAction SilentlyContinue
+        }
+      }
     }
-  } finally {
-    foreach ($n in $saved.Keys) { [Environment]::SetEnvironmentVariable($n, $saved[$n]) }
   }
-  $deadline = [DateTime]::UtcNow.AddSeconds(15)
-  while (-not (Test-Path -LiteralPath $readyPath) -and [DateTime]::UtcNow -lt $deadline) {
-    if ($proc -and $proc.HasExited) { break }
-    Start-Sleep -Milliseconds 100
-  }
-  $ready = ''
-  if (Test-Path -LiteralPath $readyPath) { $ready = [System.IO.File]::ReadAllText($readyPath) }
   return [pscustomobject]@{
-    Process = $proc
-    Base = $base
-    Url = ($prefix + 'asset')
-    Log = $logPath
-    Ready = ($ready -eq 'ok')
-    Error = $ready
+    Process = $null
+    Base = $null
+    Url = $null
+    Log = $null
+    Ready = $false
+    Error = $lastError
+    Attempts = $maxAttempts
   }
 }
 
@@ -248,6 +341,24 @@ function Stop-DownloadServer {
   if ($Server.Base -and (Test-Path -LiteralPath $Server.Base)) {
     Remove-Item -LiteralPath $Server.Base -Recurse -Force -ErrorAction SilentlyContinue
   }
+}
+
+# Shared entry point for every test: a ready server, or a hard failure when a
+# bind problem must not be hidden. In CI (and under the injected failure) a
+# bind failure throws so Pester marks the test failed; only a local run without
+# injection is allowed to skip explicitly.
+function Start-TestDownloadServer {
+  param([hashtable] $Config, [switch] $ForceBindFailure)
+  $injected = $ForceBindFailure -or ($env:AGENT_DEVBOX_TEST_HTTPLISTEN_FAIL -eq '1')
+  $server = Start-DownloadServer -Config $Config -ForceBindFailure:$ForceBindFailure
+  if ($server.Ready) { return $server }
+  $why = [string]$server.Error
+  Stop-DownloadServer -Server $server
+  if (($env:CI -eq 'true') -or $injected) {
+    throw "HttpListener could not bind: $why"
+  }
+  Set-ItResult -Skipped -Because "HttpListener could not bind: $why"
+  return $null
 }
 
 function Get-TestLog {
@@ -270,13 +381,8 @@ function Test-FileEqualsBytes {
 
 Describe 'Save-Download segmented mode' {
   It 'keeps -Connections 1 on the unchanged single-stream path' {
-    $server = Start-DownloadServer -Config @{ Mode = 'range'; Total = $script:Total }
-    if (-not $server.Ready) {
-      $why = $server.Error
-      Stop-DownloadServer -Server $server
-      Set-ItResult -Skipped -Because "HttpListener could not bind: $why"
-      return
-    }
+    $server = Start-TestDownloadServer -Config @{ Mode = 'range'; Total = $script:Total }
+    if ($null -eq $server) { return }
     try {
       $dest = Join-Path $server.Base 'rootfs-core-amd64.tar.zst.part-00'
       Save-Download -Url $server.Url -Dest $dest -ExpectedBytes $script:Total -Sha256 $script:ContentSha `
@@ -294,13 +400,8 @@ Describe 'Save-Download segmented mode' {
   }
 
   It 'discards an active segment layout when -Connections 1 is requested' {
-    $server = Start-DownloadServer -Config @{ Mode = 'range'; Total = $script:Total }
-    if (-not $server.Ready) {
-      $why = $server.Error
-      Stop-DownloadServer -Server $server
-      Set-ItResult -Skipped -Because "HttpListener could not bind: $why"
-      return
-    }
+    $server = Start-TestDownloadServer -Config @{ Mode = 'range'; Total = $script:Total }
+    if ($null -eq $server) { return }
     try {
       $dest = Join-Path $server.Base 'rootfs-core-amd64.tar.zst.part-00'
       $plan = @(Get-SegmentPlan -TotalBytes $script:Total -Connections 4)
@@ -324,13 +425,8 @@ Describe 'Save-Download segmented mode' {
   }
 
   It 'downloads every segment with 206 and produces the exact bytes and SHA256' {
-    $server = Start-DownloadServer -Config @{ Mode = 'range'; Total = $script:Total }
-    if (-not $server.Ready) {
-      $why = $server.Error
-      Stop-DownloadServer -Server $server
-      Set-ItResult -Skipped -Because "HttpListener could not bind: $why"
-      return
-    }
+    $server = Start-TestDownloadServer -Config @{ Mode = 'range'; Total = $script:Total }
+    if ($null -eq $server) { return }
     try {
       $dest = Join-Path $server.Base 'rootfs-core-amd64.tar.zst.part-00'
       Save-Download -Url $server.Url -Dest $dest -ExpectedBytes $script:Total -Sha256 $script:ContentSha `
@@ -350,13 +446,8 @@ Describe 'Save-Download segmented mode' {
   }
 
   It 'falls back to one stream from zero when the server returns 200' {
-    $server = Start-DownloadServer -Config @{ Mode = 'ignore-range'; Total = $script:Total }
-    if (-not $server.Ready) {
-      $why = $server.Error
-      Stop-DownloadServer -Server $server
-      Set-ItResult -Skipped -Because "HttpListener could not bind: $why"
-      return
-    }
+    $server = Start-TestDownloadServer -Config @{ Mode = 'ignore-range'; Total = $script:Total }
+    if ($null -eq $server) { return }
     try {
       $dest = Join-Path $server.Base 'rootfs-core-amd64.tar.zst.part-00'
       $warnings = @()
@@ -376,13 +467,8 @@ Describe 'Save-Download segmented mode' {
   }
 
   It 'reduces concurrency to one after 429 and still completes' {
-    $server = Start-DownloadServer -Config @{ Mode = '429'; Total = $script:Total; First429 = 4 }
-    if (-not $server.Ready) {
-      $why = $server.Error
-      Stop-DownloadServer -Server $server
-      Set-ItResult -Skipped -Because "HttpListener could not bind: $why"
-      return
-    }
+    $server = Start-TestDownloadServer -Config @{ Mode = '429'; Total = $script:Total; First429 = 4 }
+    if ($null -eq $server) { return }
     try {
       $dest = Join-Path $server.Base 'rootfs-core-amd64.tar.zst.part-00'
       Save-Download -Url $server.Url -Dest $dest -ExpectedBytes $script:Total -Sha256 $script:ContentSha `
@@ -399,13 +485,8 @@ Describe 'Save-Download segmented mode' {
   }
 
   It 'resumes pre-seeded segment files and asks the server for the exact Range starts' {
-    $server = Start-DownloadServer -Config @{ Mode = 'range'; Total = $script:Total }
-    if (-not $server.Ready) {
-      $why = $server.Error
-      Stop-DownloadServer -Server $server
-      Set-ItResult -Skipped -Because "HttpListener could not bind: $why"
-      return
-    }
+    $server = Start-TestDownloadServer -Config @{ Mode = 'range'; Total = $script:Total }
+    if ($null -eq $server) { return }
     try {
       $dest = Join-Path $server.Base 'rootfs-core-amd64.tar.zst.part-00'
       $plan = @(Get-SegmentPlan -TotalBytes $script:Total -Connections 4)
@@ -430,16 +511,13 @@ Describe 'Save-Download segmented mode' {
 
   It 'aborts a slow window with a resume-safe segment state, then resumes to completion' {
     $goFast = Join-Path ([System.IO.Path]::GetTempPath()) ('adbox-go-' + [guid]::NewGuid().ToString('N'))
-    $server = Start-DownloadServer -Config @{
+    $server = Start-TestDownloadServer -Config @{
       Mode = 'slow'; Total = $script:Total
       SlowChunk = 256; SlowDelayMs = 200
       GoFastPath = $goFast
     }
-    if (-not $server.Ready) {
-      $why = $server.Error
-      Stop-DownloadServer -Server $server
+    if ($null -eq $server) {
       Remove-Item -LiteralPath $goFast -Force -ErrorAction SilentlyContinue
-      Set-ItResult -Skipped -Because "HttpListener could not bind: $why"
       return
     }
     try {
@@ -467,13 +545,8 @@ Describe 'Save-Download segmented mode' {
   }
 
   It 'restarts from zero after 412 instead of appending to stale segments' {
-    $server = Start-DownloadServer -Config @{ Mode = '412'; Total = $script:Total; First412 = 1 }
-    if (-not $server.Ready) {
-      $why = $server.Error
-      Stop-DownloadServer -Server $server
-      Set-ItResult -Skipped -Because "HttpListener could not bind: $why"
-      return
-    }
+    $server = Start-TestDownloadServer -Config @{ Mode = '412'; Total = $script:Total; First412 = 1 }
+    if ($null -eq $server) { return }
     try {
       $dest = Join-Path $server.Base 'rootfs-core-amd64.tar.zst.part-00'
       $plan = @(Get-SegmentPlan -TotalBytes $script:Total -Connections 4)
@@ -503,6 +576,20 @@ Describe 'Save-Download segmented mode' {
         }).Count | Should -Be 0
       $meta = Read-DownloadSidecar -Path (Get-DownloadMetaPath -Dest $dest)
       $meta.segmentState | Should -Be 'complete'
+    } finally {
+      Stop-DownloadServer -Server $server
+    }
+  }
+}
+
+Describe 'download listener guard' {
+  It 'starts a real loopback HTTP listener and never silently skips in CI' -Tag 'listener-failure' {
+    $server = Start-TestDownloadServer -Config @{ Mode = 'range'; Total = $script:Total }
+    if ($null -eq $server) { return }
+    try {
+      $server.Ready | Should -BeTrue
+      ([int]$server.Attempts) | Should -BeGreaterThan 0
+      ([string]$server.Url) | Should -Match '^http://127\.0\.0\.1:\d+/asset$'
     } finally {
       Stop-DownloadServer -Server $server
     }

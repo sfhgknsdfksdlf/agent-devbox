@@ -11,9 +11,19 @@
 # CI passes CORE_IMAGE=<core image at the same datetime tag>.
 # =============================================================================
 ARG CORE_IMAGE=ghcr.io/sfhgknsdfksdlf/agent-devbox-core:latest
+# CI passes CORE_IMAGE pinned to the same-run core digest; the :latest default
+# is only a local fallback, so hadolint's DL3006 does not apply here.
+# hadolint ignore=DL3006
 FROM ${CORE_IMAGE}
 
+# The image contract is an interactive root shell; the paseo daemon drops to the
+# non-root `paseo` user at runtime. Root is intentional here.
+# hadolint ignore=DL3002,DL3066
 USER root
+
+# Use bash with pipefail so a failing command anywhere in a RUN pipeline fails
+# the build instead of being masked by the pipeline's last command.
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
 # -----------------------------------------------------------------------------
 # Extra AI coding-agent CLIs (Node-based). Installed strictly: if an upstream

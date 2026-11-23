@@ -11,7 +11,7 @@ additionalProperties:
       rule: paramPort
       type: number
       edit: true
-    - default: change-me-please
+    - default: ""
       envKey: PASEO_PASSWORD
       labelEn: Access password (required)
       labelZh: 访问密码（必填）

@@ -75,3 +75,72 @@ PY
     printf '%s\n' "$envkeys" | grep -Fxq "$v" || { echo "undeclared env var in compose: $v"; return 1; }
   done <<< "$used"
 }
+
+@test "PASEO_PASSWORD form field has an empty default and is required (yaml)" {
+  if ! command -v python3 >/dev/null 2>&1; then
+    skip "python3 is not available"
+  fi
+
+  run python3 - "$APP" <<'PY'
+import os
+import sys
+
+import yaml
+
+root = sys.argv[1]
+version_data = os.path.join(root, "latest", "data.yml")
+text = open(version_data).read()
+fields = yaml.safe_load(text)["additionalProperties"]["formFields"]
+matches = [f for f in fields if f.get("envKey") == "PASEO_PASSWORD"]
+assert len(matches) == 1, "expected exactly one PASEO_PASSWORD field, got %d" % len(matches)
+field = matches[0]
+assert "default" in field and field["default"] == "", \
+    "PASEO_PASSWORD default must be an empty string"
+assert field.get("required") is True, "PASEO_PASSWORD must be required"
+assert "random" not in field, "PASEO_PASSWORD must not use the random default"
+assert field.get("rule") == "paramComplexity", "PASEO_PASSWORD must keep rule paramComplexity"
+assert field.get("type") == "password", "PASEO_PASSWORD must stay a password field"
+assert "change-me-please" not in text, "the retired public default must be gone from data.yml"
+print("ok")
+PY
+  [ "$status" -eq 0 ]
+}
+
+@test "PASEO_PASSWORD form field has an empty default and is required (POSIX fallback)" {
+  local data="$APP/latest/data.yml"
+  [ -f "$data" ]
+
+  # Locate the field by envKey, never by position, so reordering the form
+  # cannot silently move the assertions to another field.
+  local block
+  block="$(awk '
+    /^[[:space:]]*-[[:space:]]/ {
+      if (in_item && found && !printed) { print block; printed = 1 }
+      in_item = 1
+      block = $0
+      found = 0
+      next
+    }
+    in_item { block = block "\n" $0 }
+    /^[[:space:]]*envKey:[[:space:]]*PASEO_PASSWORD[[:space:]]*$/ { found = 1 }
+    END { if (in_item && found && !printed) print block }
+  ' "$data")"
+  [ -n "$block" ] || { echo "PASEO_PASSWORD field not found by envKey"; return 1; }
+
+  printf '%s\n' "$block" | grep -Eq '^[[:space:]]*(-[[:space:]]+)?default:[[:space:]]*""[[:space:]]*$' \
+    || { echo "PASEO_PASSWORD default must be an empty string"; return 1; }
+  printf '%s\n' "$block" | grep -Eq '^[[:space:]]*required:[[:space:]]*true[[:space:]]*$' \
+    || { echo "PASEO_PASSWORD must be required: true"; return 1; }
+  if printf '%s\n' "$block" | grep -Eq '^[[:space:]]*random:'; then
+    echo "PASEO_PASSWORD must not set random"
+    return 1
+  fi
+  printf '%s\n' "$block" | grep -Eq '^[[:space:]]*rule:[[:space:]]*paramComplexity[[:space:]]*$' \
+    || { echo "PASEO_PASSWORD must keep rule paramComplexity"; return 1; }
+  printf '%s\n' "$block" | grep -Eq '^[[:space:]]*type:[[:space:]]*password[[:space:]]*$' \
+    || { echo "PASEO_PASSWORD must stay a password field"; return 1; }
+  if grep -Fq 'change-me-please' "$data"; then
+    echo "the retired public default must be gone from data.yml"
+    return 1
+  fi
+}

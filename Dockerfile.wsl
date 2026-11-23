@@ -10,6 +10,9 @@
 # pwsh); the WSL distro gets a working Docker Engine.
 # =============================================================================
 ARG BASE_IMAGE
+# CI supplies a pinned base (the same-run image digest, or a dated tag) via
+# --build-arg; hadolint cannot see that value, so DL3006 does not apply here.
+# hadolint ignore=DL3006
 FROM ${BASE_IMAGE}
 
 # PowerShell has no Debian package; pin the upstream release so the .deb URL is
@@ -32,6 +35,11 @@ RUN set -eux; \
     docker --version; \
     docker compose version; \
     dockerd --version
+
+# Read-only marker: boot requires dockerd AND paseo only when this file exists.
+# It is added here, after the engine self-check, so every exported WSL rootfs has
+# it while the published ghcr agents/core images never do.
+RUN install -o root -g root -m 0444 /dev/null /etc/agent-devbox-wsl-overlay
 
 RUN set -eux; \
     arch="$(dpkg --print-architecture)"; \

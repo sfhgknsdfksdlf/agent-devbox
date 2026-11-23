@@ -8,6 +8,15 @@
 BeforeAll {
   $repoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
   . (Join-Path (Join-Path $repoRoot 'windows') 'wsl-ensure.ps1')
+  . (Join-Path (Join-Path $repoRoot 'windows') 'wsl-ensure-downloads.ps1')
+
+  # Creates a sparse file of an exact length so the download helper's size gate
+  # can run against real files while Get-FileHash is mocked. No multi-MB writes.
+  function New-P05SizedFile {
+    param([Parameter(Mandatory)][string] $Path, [Parameter(Mandatory)][int64] $Length)
+    $fs = [System.IO.File]::Open($Path, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write)
+    try { $fs.SetLength($Length) } finally { $fs.Dispose() }
+  }
 }
 
 Describe 'Join-Parts' {
@@ -109,5 +118,261 @@ Describe 'Get-AgentDevboxChannelIdentity' {
     $id.MountName | Should -Not -Be $stable.MountName
     $id.TerminalGuid | Should -Not -Be $stable.TerminalGuid
     $id.HideGuid | Should -Not -Be $stable.HideGuid
+  }
+}
+
+Describe 'Install-WslUi: pinned release and verified bytes' {
+  BeforeEach {
+    Mock Write-Host {}
+    $script:p05Order = New-Object System.Collections.Generic.List[string]
+  }
+
+  It 'x64: downloads the pinned v0.21.0 asset, verifies, then unblocks and installs' {
+    $script:p05Asset = (Get-WslUiReleaseSpec).Assets['x64']
+    $script:p05Url = $null
+    $script:p05Out = $null
+    Mock Invoke-WebRequest {
+      $script:p05Order.Add('download')
+      $script:p05Url = $Uri
+      $script:p05Out = $OutFile
+      New-P05SizedFile -Path $OutFile -Length $script:p05Asset.Length
+    }
+    Mock Get-FileHash {
+      $script:p05Order.Add('hash')
+      [pscustomobject]@{ Hash = $script:p05Asset.Sha256.ToUpperInvariant() }
+    }
+    Mock Unblock-File { $script:p05Order.Add('unblock') }
+    Mock Start-Process {
+      $script:p05Order.Add('start')
+      [pscustomobject]@{ ExitCode = 0 }
+    }
+
+    Install-WslUi -Arch 'x64'
+
+    $script:p05Url | Should -Be ('https://github.com/octasoft-ltd/wsl-ui/releases/download/v0.21.0/' + $script:p05Asset.Name)
+    $script:p05Url | Should -Not -Match 'releases/latest'
+    $script:p05Order.IndexOf('hash') | Should -BeLessThan $script:p05Order.IndexOf('unblock')
+    $script:p05Order.IndexOf('unblock') | Should -BeLessThan $script:p05Order.IndexOf('start')
+    Should -Invoke Start-Process -Times 1 -Exactly
+    Should -Invoke Start-Process -Times 1 -Exactly -ParameterFilter { $ArgumentList -contains '/S' }
+    Test-Path -LiteralPath (Split-Path -Parent $script:p05Out) | Should -BeFalse
+  }
+
+  It 'arm64: downloads the pinned arm64 asset from an exact URL' {
+    $script:p05Asset = (Get-WslUiReleaseSpec).Assets['arm64']
+    $script:p05Url = $null
+    Mock Invoke-WebRequest {
+      $script:p05Url = $Uri
+      New-P05SizedFile -Path $OutFile -Length $script:p05Asset.Length
+    }
+    Mock Get-FileHash { [pscustomobject]@{ Hash = $script:p05Asset.Sha256 } }
+    Mock Unblock-File {}
+    Mock Start-Process { [pscustomobject]@{ ExitCode = 0 } }
+
+    Install-WslUi -Arch 'arm64'
+
+    $script:p05Url | Should -Be ('https://github.com/octasoft-ltd/wsl-ui/releases/download/v0.21.0/' + $script:p05Asset.Name)
+    $script:p05Asset.Name | Should -Be 'WSL.UI_0.21.0_arm64-setup.exe'
+    Should -Invoke Start-Process -Times 1 -Exactly
+  }
+
+  It 'unknown arch: fails closed without downloading, unblocking or executing' {
+    Mock Invoke-WebRequest {}
+    Mock Get-FileHash { throw 'must not hash' }
+    Mock Unblock-File {}
+    Mock Start-Process { [pscustomobject]@{ ExitCode = 0 } }
+
+    { Install-WslUi -Arch 'riscv64' } | Should -Throw
+
+    Should -Invoke Invoke-WebRequest -Times 0 -Exactly
+    Should -Invoke Get-FileHash -Times 0 -Exactly
+    Should -Invoke Unblock-File -Times 0 -Exactly
+    Should -Invoke Start-Process -Times 0 -Exactly
+  }
+
+  It 'wrong SHA256: throws before unblocking or executing the installer' {
+    $script:p05Asset = (Get-WslUiReleaseSpec).Assets['x64']
+    Mock Invoke-WebRequest { New-P05SizedFile -Path $OutFile -Length $script:p05Asset.Length }
+    Mock Get-FileHash { [pscustomobject]@{ Hash = ('0' * 64) } }
+    Mock Unblock-File {}
+    Mock Start-Process { [pscustomobject]@{ ExitCode = 0 } }
+
+    { Install-WslUi -Arch 'x64' } | Should -Throw '*SHA256*'
+
+    Should -Invoke Unblock-File -Times 0 -Exactly
+    Should -Invoke Start-Process -Times 0 -Exactly
+  }
+
+  It 'wrong length: throws before unblocking or executing the installer' {
+    $script:p05Asset = (Get-WslUiReleaseSpec).Assets['x64']
+    Mock Invoke-WebRequest { New-P05SizedFile -Path $OutFile -Length ($script:p05Asset.Length - 1) }
+    Mock Get-FileHash { [pscustomobject]@{ Hash = $script:p05Asset.Sha256 } }
+    Mock Unblock-File {}
+    Mock Start-Process { [pscustomobject]@{ ExitCode = 0 } }
+
+    { Install-WslUi -Arch 'x64' } | Should -Throw '*大小*'
+
+    Should -Invoke Unblock-File -Times 0 -Exactly
+    Should -Invoke Start-Process -Times 0 -Exactly
+  }
+
+  It 'installer non-zero exit: surfaces the exit code' {
+    $script:p05Asset = (Get-WslUiReleaseSpec).Assets['x64']
+    Mock Invoke-WebRequest { New-P05SizedFile -Path $OutFile -Length $script:p05Asset.Length }
+    Mock Get-FileHash { [pscustomobject]@{ Hash = $script:p05Asset.Sha256 } }
+    Mock Unblock-File {}
+    Mock Start-Process { [pscustomobject]@{ ExitCode = 23 } }
+
+    { Install-WslUi -Arch 'x64' } | Should -Throw '*23*'
+    Should -Invoke Unblock-File -Times 1 -Exactly
+    Should -Invoke Start-Process -Times 1 -Exactly
+  }
+}
+
+Describe 'Get-ZstdExeFromRelease: pinned zip/exe and cache reverification' {
+  BeforeEach {
+    Mock Write-Host {}
+    $script:p05Spec = Get-ZstdReleaseSpec
+    $script:p05Install = Join-Path $TestDrive ('zstd-' + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $script:p05Install -Force | Out-Null
+    $script:p05Installed = Join-Path $script:p05Install 'zstd.exe'
+    $script:p05Order = New-Object System.Collections.Generic.List[string]
+    $script:p05Hashed = New-Object System.Collections.Generic.List[string]
+    $script:p05ZipPath = $null
+    $script:p05Unblocked = $false
+
+    Mock Invoke-WebRequest {
+      $script:p05Order.Add('download-zip')
+      $script:p05ZipPath = $OutFile
+      New-P05SizedFile -Path $OutFile -Length $script:p05Spec.ZipLength
+    }
+    Mock Get-FileHash {
+      $script:p05Hashed.Add($LiteralPath)
+      $script:p05Order.Add('hash')
+      if ($LiteralPath -like '*.zip') {
+        [pscustomobject]@{ Hash = $script:p05Spec.ZipSha256 }
+      } else {
+        [pscustomobject]@{ Hash = $script:p05Spec.ExeSha256 }
+      }
+    }
+    Mock Expand-Archive {
+      $script:p05Order.Add('expand')
+      $dir = Join-Path $DestinationPath $script:p05Spec.ExeDir
+      New-Item -ItemType Directory -Path $dir -Force | Out-Null
+      New-P05SizedFile -Path (Join-Path $dir $script:p05Spec.ExeName) -Length $script:p05Spec.ExeLength
+    }
+    Mock Unblock-File { $script:p05Unblocked = $true }
+  }
+
+  It 'verifies the zip before expanding, accepts only the reviewed path, and installs a verified exe' {
+    $result = Get-ZstdExeFromRelease -InstallDir $script:p05Install -Arch 'amd64'
+
+    $result | Should -Be $script:p05Installed
+    Test-Path -LiteralPath $result | Should -BeTrue
+    $script:p05Order[0] | Should -Be 'download-zip'
+    $script:p05Order.IndexOf('hash') | Should -BeLessThan $script:p05Order.IndexOf('expand')
+    @($script:p05Order | Where-Object { $_ -eq 'hash' }).Count | Should -BeGreaterOrEqual 2
+    $script:p05Unblocked | Should -Be $false
+    Test-Path -LiteralPath (Split-Path -Parent $script:p05ZipPath) | Should -BeFalse
+    Test-Path -LiteralPath (Join-Path $script:p05Install 'zstd.zip') | Should -BeFalse
+  }
+
+  It 'wrong zip SHA256: throws before extracting and installs nothing' {
+    Mock Get-FileHash {
+      if ($LiteralPath -like '*.zip') { [pscustomobject]@{ Hash = ('0' * 64) } }
+      else { [pscustomobject]@{ Hash = $script:p05Spec.ExeSha256 } }
+    }
+
+    { Get-ZstdExeFromRelease -InstallDir $script:p05Install -Arch 'amd64' } | Should -Throw '*压缩包*'
+
+    Should -Invoke Expand-Archive -Times 0 -Exactly
+    Test-Path -LiteralPath $script:p05Installed | Should -BeFalse
+  }
+
+  It 'wrong extracted exe SHA256: throws and never replaces the destination' {
+    Mock Get-FileHash {
+      if ($LiteralPath -like '*.zip') { [pscustomobject]@{ Hash = $script:p05Spec.ZipSha256 } }
+      else { [pscustomobject]@{ Hash = ('0' * 64) } }
+    }
+
+    { Get-ZstdExeFromRelease -InstallDir $script:p05Install -Arch 'amd64' } | Should -Throw '*zstd.exe*'
+
+    Should -Invoke Expand-Archive -Times 1 -Exactly
+    Test-Path -LiteralPath $script:p05Installed | Should -BeFalse
+  }
+
+  It 'wrong cached exe: is never reused; a verified download replaces it' {
+    New-P05SizedFile -Path $script:p05Installed -Length $script:p05Spec.ExeLength
+    $script:p05CacheChecked = $false
+    Mock Get-FileHash {
+      if ($LiteralPath -eq $script:p05Installed -and -not $script:p05CacheChecked) {
+        $script:p05CacheChecked = $true
+        return [pscustomobject]@{ Hash = ('f' * 64) }
+      }
+      if ($LiteralPath -like '*.zip') { return [pscustomobject]@{ Hash = $script:p05Spec.ZipSha256 } }
+      [pscustomobject]@{ Hash = $script:p05Spec.ExeSha256 }
+    }
+
+    $result = Get-ZstdExeFromRelease -InstallDir $script:p05Install -Arch 'amd64'
+
+    $result | Should -Be $script:p05Installed
+    Should -Invoke Invoke-WebRequest -Times 1 -Exactly
+    Should -Invoke Expand-Archive -Times 1 -Exactly
+    Test-Path -LiteralPath $script:p05Installed | Should -BeTrue
+  }
+
+  It 'good cached exe: is reverified and reused without downloading' {
+    New-P05SizedFile -Path $script:p05Installed -Length $script:p05Spec.ExeLength
+
+    $result = Get-ZstdExeFromRelease -InstallDir $script:p05Install -Arch 'amd64'
+
+    $result | Should -Be $script:p05Installed
+    Should -Invoke Invoke-WebRequest -Times 0 -Exactly
+    Should -Invoke Expand-Archive -Times 0 -Exactly
+    $script:p05Hashed | Should -Contain $script:p05Installed
+  }
+
+  It 'extra same-name files: the exact reviewed entry wins over a decoy' {
+    $script:p05Decoy = $null
+    Mock Expand-Archive {
+      $decoyDir = Join-Path $DestinationPath 'aaa'
+      New-Item -ItemType Directory -Path $decoyDir -Force | Out-Null
+      $script:p05Decoy = Join-Path $decoyDir $script:p05Spec.ExeName
+      New-P05SizedFile -Path $script:p05Decoy -Length $script:p05Spec.ExeLength
+      $dir = Join-Path $DestinationPath $script:p05Spec.ExeDir
+      New-Item -ItemType Directory -Path $dir -Force | Out-Null
+      New-P05SizedFile -Path (Join-Path $dir $script:p05Spec.ExeName) -Length $script:p05Spec.ExeLength
+    }
+    Mock Get-FileHash {
+      $script:p05Hashed.Add($LiteralPath)
+      if ($LiteralPath -like '*.zip') { return [pscustomobject]@{ Hash = $script:p05Spec.ZipSha256 } }
+      $parentLeaf = Split-Path -Leaf (Split-Path -Parent $LiteralPath)
+      if ($LiteralPath -eq $script:p05Installed -or $parentLeaf -eq $script:p05Spec.ExeDir) {
+        return [pscustomobject]@{ Hash = $script:p05Spec.ExeSha256 }
+      }
+      [pscustomobject]@{ Hash = ('0' * 64) }
+    }
+
+    $result = Get-ZstdExeFromRelease -InstallDir $script:p05Install -Arch 'amd64'
+
+    $result | Should -Be $script:p05Installed
+    $script:p05Hashed | Should -Not -Contain $script:p05Decoy
+  }
+
+  It 'missing exact entry: a same-name file elsewhere is not accepted' {
+    Mock Expand-Archive {
+      $decoyDir = Join-Path $DestinationPath 'aaa'
+      New-Item -ItemType Directory -Path $decoyDir -Force | Out-Null
+      New-P05SizedFile -Path (Join-Path $decoyDir $script:p05Spec.ExeName) -Length $script:p05Spec.ExeLength
+    }
+
+    { Get-ZstdExeFromRelease -InstallDir $script:p05Install -Arch 'amd64' } | Should -Throw '*zstd.exe*'
+    Test-Path -LiteralPath $script:p05Installed | Should -BeFalse
+  }
+
+  It 'arm64: never fetches zstd.exe' {
+    { Get-ZstdExeFromRelease -InstallDir $script:p05Install -Arch 'arm64' } | Should -Throw '*ARM64*'
+    Should -Invoke Invoke-WebRequest -Times 0 -Exactly
+    Should -Invoke Expand-Archive -Times 0 -Exactly
   }
 }

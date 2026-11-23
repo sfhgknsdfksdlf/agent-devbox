@@ -38,7 +38,31 @@ setup() {
   export AGENT_DEVBOX_DOCKERD_PID="$TMP/dockerd.pid"
   export AGENT_DEVBOX_DOCKERD_LOG="$TMP/dockerd.log"
   export AGENT_DEVBOX_DOCKERD_LOG_MAX=10
-  mkdir -p "$BINDIR" "$AGENT_DEVBOX_DATADIR"
+  export AGENT_DEVBOX_PASEO_LOG="$TMP/paseo.log"
+  export AGENT_DEVBOX_PASEO_PID="$TMP/paseo.pid"
+  export AGENT_DEVBOX_PASEO_BOOT_BIN="$TMP/paseo-boot.sh"
+  export AGENT_DEVBOX_PASEO_HEALTH_URL="http://127.0.0.1:6767/api/health"
+  export AGENT_DEVBOX_DOCKER_SOCK="$TMP/docker.sock"
+  export AGENT_DEVBOX_DOCKER_BIN="$BINDIR/docker"
+  export AGENT_DEVBOX_DOCKERD_BIN="$BINDIR/dockerd"
+  export AGENT_DEVBOX_CURL_BIN="$BINDIR/curl"
+  export AGENT_DEVBOX_SETSID_BIN="$BINDIR/setsid"
+  export AGENT_DEVBOX_PROC_FS="$TMP/proc"
+  export AGENT_DEVBOX_OVERLAY_MARKER="$TMP/overlay.marker"
+  export AGENT_DEVBOX_READY_TIMEOUT=30
+  export AGENT_DEVBOX_READY_POLL_MS=2000
+  export AGENT_DEVBOX_PASEO_UID="$(id -u)"
+  export AGENT_DEVBOX_BOOT_ID="boot-test"
+  export AGENT_DEVBOX_NODE_BIN="$TMP/node-bin"
+  export AGENT_DEVBOX_OPENCODE_BIN="$TMP/no-opencode"
+  export LAUNCHED_PASEO="$TMP/launched.paseo"
+  export LAUNCHED_DOCKERD="$TMP/launched.dockerd"
+  export CLOCK_COUNT="$TMP/clock.count"
+  export BOUND="$TMP/bound"
+  export DOCKERD_PIDFILE="$AGENT_DEVBOX_DOCKERD_PID"
+  export PASEO_PIDFILE="$AGENT_DEVBOX_PASEO_PID"
+  mkdir -p "$BINDIR" "$AGENT_DEVBOX_DATADIR" "$AGENT_DEVBOX_PROC_FS/sys/kernel/random"
+  printf 'boot-test\n' > "$AGENT_DEVBOX_PROC_FS/sys/kernel/random/boot_id"
   : > "$CALL_LOG"
   : > "$WSL_LOG"
   : > "$AGENT_DEVBOX_LOG"
@@ -107,6 +131,9 @@ if [ "${TIMEOUT_EXIT:-0}" = "124" ]; then
   exit 124
 fi
 if [ "${1:-}" = "-k" ]; then
+  shift 2
+fi
+if [ "${1:-}" = "-s" ]; then
   shift 2
 fi
 shift
@@ -222,6 +249,10 @@ exit 0
 SH
   cat > "$BINDIR/stat" <<SH
 #!/bin/sh
+if [ "\$1" = "-c" ] && [ "\$2" = "%s" ]; then
+  /usr/bin/stat -c %s "\$3"
+  exit 0
+fi
 case "\$3" in
   *src*) echo "$1" ;;
   *dst*) echo "$2" ;;
@@ -229,6 +260,125 @@ case "\$3" in
 esac
 SH
   chmod +x "$BINDIR"/mountpoint "$BINDIR"/mount "$BINDIR"/stat
+}
+
+# readiness_shims: fake Supervisor/dockerd locks under AGENT_DEVBOX_PROC_FS, a
+# real unix socket, probe shims and an advanceable clock. publish_service runs
+# from the clock, so the setsid parent has already returned when the pidfile
+# appears — the suite never trusts $! or a synchronous child.
+readiness_shims() {
+  base_shims
+  cat > "$BINDIR/mk_proc" <<'SH'
+#!/bin/sh
+procdir="$1"; pid="$2"; uid="$3"; comm="$4"; title="$5"; start="$6"; exe="$7"; shift 7
+p="$procdir/$pid"
+/bin/mkdir -p "$p"
+zeros=''
+i=0
+while [ "$i" -lt 18 ]; do zeros="$zeros 0"; i=$((i + 1)); done
+printf '%s (%s) S%s %s\n' "$pid" "$comm" "$zeros" "$start" > "$p/stat"
+printf 'Name:\t%s\nUid:\t%s\t%s\t%s\t%s\n' "$comm" "$uid" "$uid" "$uid" "$uid" > "$p/status"
+printf '%s\n' "$comm" > "$p/comm"
+{ printf '%s\0' "$title"; for a in "$@"; do printf '%s\0' "$a"; done; } > "$p/cmdline"
+ln -sfn "$exe" "$p/exe"
+SH
+  cat > "$BINDIR/publish_service" <<'SH'
+#!/bin/sh
+if [ -f "$LAUNCHED_PASEO" ] && [ ! -f "$PASEO_PIDFILE" ]; then
+  "$BINDIR/mk_proc" "$AGENT_DEVBOX_PROC_FS" "${PASEO_FAKE_PID:-4242}" \
+    "${PASEO_FAKE_UID:-$AGENT_DEVBOX_PASEO_UID}" "Paseo Superviso" "Paseo Supervisor" \
+    "${PASEO_FAKE_START:-111}" "$AGENT_DEVBOX_NODE_BIN"
+  printf '{"pid":%s,"startedAt":"2026-01-01T00:00:00.000Z","hostname":"h","uid":%s,"listen":"0.0.0.0:6767","heartbeat":true,"bootId":"%s","serverId":"srv_x"}' \
+    "${PASEO_FAKE_PID:-4242}" "${PASEO_FAKE_UID:-$AGENT_DEVBOX_PASEO_UID}" \
+    "$AGENT_DEVBOX_BOOT_ID" > "$PASEO_PIDFILE"
+fi
+if [ -f "$LAUNCHED_DOCKERD" ] && [ ! -f "$DOCKERD_PIDFILE" ]; then
+  "$BINDIR/mk_proc" "$AGENT_DEVBOX_PROC_FS" "${DOCKERD_FAKE_PID:-5151}" \
+    "${DOCKERD_FAKE_UID:-0}" "dockerd" "dockerd" "${DOCKERD_FAKE_START:-222}" \
+    "$AGENT_DEVBOX_DOCKERD_BIN" "--pidfile" "$DOCKERD_PIDFILE"
+  printf '%s\n' "${DOCKERD_FAKE_PID:-5151}" > "$DOCKERD_PIDFILE"
+  python3 - "$AGENT_DEVBOX_DOCKER_SOCK" <<'PY'
+import socket
+import sys
+s = socket.socket(socket.AF_UNIX)
+s.bind(sys.argv[1])
+PY
+fi
+SH
+  cat > "$BINDIR/curl" <<'SH'
+#!/bin/sh
+echo "curl $*" >> "$CALL_LOG"
+if [ -n "${CURL_HOOK:-}" ] && [ -x "$CURL_HOOK" ]; then "$CURL_HOOK" "$@"; fi
+printf '%s' "${CURL_CODE:-200}"
+exit "${CURL_RC:-0}"
+SH
+  cat > "$BINDIR/docker" <<'SH'
+#!/bin/sh
+echo "docker $*" >> "$CALL_LOG"
+exit "${DOCKER_INFO_RC:-0}"
+SH
+  cat > "$BINDIR/setsid" <<'SH'
+#!/bin/sh
+echo "setsid $*" >> "$CALL_LOG"
+case "$*" in
+  *dockerd*) : > "$LAUNCHED_DOCKERD" ;;
+  *paseo-boot*) : > "$LAUNCHED_PASEO" ;;
+esac
+if [ -f "$PASEO_PIDFILE" ]; then
+  echo "paseo-pidfile-present-at-launch" >> "$CALL_LOG"
+fi
+exit "${SETSID_EXIT:-0}"
+SH
+  cat > "$BINDIR/clock" <<'SH'
+#!/bin/sh
+n=0
+if [ -f "$CLOCK_COUNT" ]; then n=$(cat "$CLOCK_COUNT"); fi
+n=$((n + 1))
+echo "$n" > "$CLOCK_COUNT"
+if [ -x "$BINDIR/publish_service" ]; then
+  "$BINDIR/publish_service" "$n" >/dev/null 2>&1 || true
+fi
+echo $((n * 2000))
+SH
+  printf '#!/bin/sh\nexit 0\n' > "$AGENT_DEVBOX_PASEO_BOOT_BIN"
+  printf '#!/bin/sh\nexit 0\n' > "$TMP/node-bin"
+  chmod +x "$BINDIR"/* "$AGENT_DEVBOX_PASEO_BOOT_BIN" "$TMP/node-bin"
+}
+
+# prep_main: mounted data disk with the first-run marker, successful bind shims,
+# an empty conf (no UUID check) and the advanceable clock.
+prep_main() {
+  readiness_shims
+  bind_shims "1:1" "1:1"
+  : > "$AGENT_DEVBOX_CONF"
+  : > "$MOUNT_MARKER"
+  : > "$AGENT_DEVBOX_DATADIR/.initialized"
+  : > "$BOUND"
+  export AGENT_DEVBOX_NOW_MS_CMD="$BINDIR/clock"
+}
+
+# publish_dockerd: pre-create a valid engine lock + socket (already running).
+publish_dockerd() {
+  "$BINDIR/mk_proc" "$AGENT_DEVBOX_PROC_FS" "${DOCKERD_FAKE_PID:-5151}" 0 \
+    "dockerd" "dockerd" "${DOCKERD_FAKE_START:-222}" "$AGENT_DEVBOX_DOCKERD_BIN" \
+    "--pidfile" "$DOCKERD_PIDFILE"
+  printf '%s\n' "${DOCKERD_FAKE_PID:-5151}" > "$DOCKERD_PIDFILE"
+  python3 - "$AGENT_DEVBOX_DOCKER_SOCK" <<'PY'
+import socket
+import sys
+s = socket.socket(socket.AF_UNIX)
+s.bind(sys.argv[1])
+PY
+}
+
+# publish_paseo: pre-create a valid Supervisor lock for pid 4242.
+publish_paseo() {
+  "$BINDIR/mk_proc" "$AGENT_DEVBOX_PROC_FS" "${PASEO_FAKE_PID:-4242}" \
+    "${PASEO_FAKE_UID:-$AGENT_DEVBOX_PASEO_UID}" "Paseo Superviso" "Paseo Supervisor" \
+    "${PASEO_FAKE_START:-111}" "$AGENT_DEVBOX_NODE_BIN"
+  printf '{"pid":%s,"startedAt":"2026-01-01T00:00:00.000Z","hostname":"h","uid":%s,"listen":"0.0.0.0:6767","heartbeat":true,"bootId":"%s","serverId":"srv_x"}' \
+    "${PASEO_FAKE_PID:-4242}" "${PASEO_FAKE_UID:-$AGENT_DEVBOX_PASEO_UID}" \
+    "$AGENT_DEVBOX_BOOT_ID" > "$PASEO_PIDFILE"
 }
 
 @test "sourcing is silent and defines ensure_mounted" {
@@ -292,9 +442,26 @@ SH
   ! grep -Fq 'x' "$TMP/paseo.log.1"
 }
 
-@test "main: the paseo stdout log is rotated before the child starts" {
-  run grep -nE 'rotate_log "\$PASEO_LOG" "\$PASEO_LOG_MAX"' "$SCRIPT"
+@test "main: an oversized paseo log is rotated when the service actually starts" {
+  prep_main
+  export AGENT_DEVBOX_PASEO_LOG_MAX=10
+  head -c 64 /dev/zero | tr '\0' 'x' > "$AGENT_DEVBOX_PASEO_LOG"
+  run bash -c '. "$SCRIPT"; main'
   [ "$status" -eq 0 ]
+  printf '%s' "$output" | grep -Fq 'boot complete'
+  [ -s "$AGENT_DEVBOX_PASEO_LOG.1" ]
+}
+
+@test "main: a live Supervisor lock is probed without rotating its log" {
+  prep_main
+  export AGENT_DEVBOX_PASEO_LOG_MAX=10
+  publish_paseo
+  head -c 64 /dev/zero | tr '\0' 'x' > "$AGENT_DEVBOX_PASEO_LOG"
+  run bash -c '. "$SCRIPT"; main'
+  [ "$status" -eq 0 ]
+  printf '%s' "$output" | grep -Fq 'boot complete'
+  [ ! -e "$AGENT_DEVBOX_PASEO_LOG.1" ]
+  assert_log_lacks 'setsid'
 }
 
 @test "empty conf (exists but no DATA_VHDX): still reports an unconfigured disk" {
@@ -657,40 +824,52 @@ SH
 # sit between the home shim and paseo in main().
 # ---------------------------------------------------------------------------
 
-@test "start_dockerd: absent dockerd is a logged no-op" {
+@test "start_dockerd: an absent binary is a fatal missing-binary, not a no-op" {
   base_shims
   export AGENT_DEVBOX_DOCKERD_BIN=
-  run bash -c '. "$SCRIPT"; start_dockerd'
+  run bash -c '. "$SCRIPT"; start_dockerd; echo "rc=$? reason=${READY_REASON:-}"'
   [ "$status" -eq 0 ]
-  printf '%s' "$output" | grep -Fq 'dockerd 未安装'
+  printf '%s' "$output" | grep -Fq 'rc=2 reason=missing-binary'
   [ ! -e "$AGENT_DEVBOX_DOCKERD_PID" ]
+  assert_log_lacks 'setsid'
 }
 
-@test "start_dockerd: a live pidfile is not restarted" {
+@test "start_dockerd: a live PID with the wrong identity fails and is never killed" {
   base_shims
-  # tail, not sleep: base_shims replaces sleep with an instant-exit shim.
+  export AGENT_DEVBOX_PROC_FS=/proc
   tail -f /dev/null >/dev/null 2>&1 &
   live=$!
   echo "$live" > "$AGENT_DEVBOX_DOCKERD_PID"
-  run bash -c '. "$SCRIPT"; start_dockerd'
+  run bash -c '. "$SCRIPT"; start_dockerd; echo "rc=$? reason=${READY_REASON:-}"'
   status_saved=$status
+  kill -0 "$live"
+  alive=$?
   kill "$live" 2>/dev/null || true
   [ "$status_saved" -eq 0 ]
-  printf '%s' "$output" | grep -Fq "dockerd 已在运行"
-  ! grep -q 'dockerd' "$CALL_LOG"
+  [ "$alive" -eq 0 ]
+  printf '%s' "$output" | grep -Fq 'rc=2 reason=identity'
+  assert_log_lacks 'setsid'
 }
 
-@test "start_dockerd: execs the absolute resolved path" {
-  base_shims
-  run bash -c '. "$SCRIPT"; start_dockerd'
+@test "start_dockerd: a correctly identified live engine is only probed" {
+  prep_main
+  publish_dockerd
+  run bash -c '. "$SCRIPT"; start_dockerd; echo "rc=$? reason=${READY_REASON:-}"'
   [ "$status" -eq 0 ]
-  # The engine is backgrounded; wait for the stub to write. `sleep` is shimmed
-  # to an instant no-op by base_shims, so use the real binary.
-  for _ in 1 2 3 4 5 6 7 8 9 10; do
-    grep -Fq "$BINDIR/dockerd" "$CALL_LOG" && break
-    /bin/sleep 0.1
-  done
-  grep -Fq "$BINDIR/dockerd" "$CALL_LOG"
+  printf '%s' "$output" | grep -Fq 'rc=0'
+  printf '%s' "$output" | grep -Fq '只探测不重启'
+  assert_log_lacks 'setsid'
+}
+
+@test "start_dockerd: execs the resolved absolute path with the exact --pidfile" {
+  prep_main
+  run bash -c '. "$SCRIPT"; start_dockerd; echo "rc=$? reason=${READY_REASON:-}"'
+  [ "$status" -eq 0 ]
+  printf '%s' "$output" | grep -Fq 'rc=0'
+  run grep -F -- "setsid --fork $BINDIR/dockerd --pidfile $AGENT_DEVBOX_DOCKERD_PID" "$CALL_LOG"
+  [ "$status" -eq 0 ]
+  run grep -Fq -- '--wait' "$CALL_LOG"
+  [ "$status" -ne 0 ]
 }
 
 @test "wsl-boot exports PATH for child execs" {
@@ -754,12 +933,15 @@ SH
   grep -Fq 'mount-datadisk.cmd' "$AGENT_DEVBOX_MOTD"
 }
 
-@test "start_dockerd: is called after the home shim and before paseo" {
-  shim_idx=$(grep -n 'ensure_opencode_shim /root /home/\*' "$SCRIPT" | cut -d: -f1)
-  docker_idx=$(grep -n '^  start_dockerd$' "$SCRIPT" | cut -d: -f1)
-  paseo_idx=$(grep -n 'setsid /usr/local/bin/paseo-boot.sh' "$SCRIPT" | cut -d: -f1)
-  [ -n "$shim_idx" ] && [ -n "$docker_idx" ] && [ -n "$paseo_idx" ]
-  [ "$docker_idx" -gt "$shim_idx" ] && [ "$docker_idx" -lt "$paseo_idx" ]
+@test "main: the call trace launches dockerd before paseo" {
+  prep_main
+  : > "$AGENT_DEVBOX_OVERLAY_MARKER"
+  run bash -c '. "$SCRIPT"; main'
+  [ "$status" -eq 0 ]
+  docker_line=$(grep -n "setsid --fork $BINDIR/dockerd" "$CALL_LOG" | cut -d: -f1)
+  paseo_line=$(grep -n "setsid --fork $AGENT_DEVBOX_PASEO_BOOT_BIN" "$CALL_LOG" | cut -d: -f1)
+  [ -n "$docker_line" ] && [ -n "$paseo_line" ]
+  [ "$docker_line" -lt "$paseo_line" ]
 }
 
 # ---------------------------------------------------------------------------
@@ -914,4 +1096,156 @@ shim() {
   [ "$status" -eq 0 ]
   [[ "$output" == *"补充可执行位"* ]]
   [ -x "$TMP/h1/.opencode/bin/opencode" ]
+}
+# ---------------------------------------------------------------------------
+# readiness handshake (P0-1): one 30s monotonic deadline shared by every
+# required service, Supervisor/dockerd identity from /proc, the overlay marker
+# deciding whether dockerd is required, and exactly ONE `boot complete`.
+# ---------------------------------------------------------------------------
+
+@test "main: without the overlay marker docker is never launched or probed" {
+  prep_main
+  run bash -c '. "$SCRIPT"; main'
+  [ "$status" -eq 0 ]
+  printf '%s' "$output" | grep -Fq 'boot complete'
+  assert_log_lacks 'docker '
+  assert_log_lacks 'dockerd'
+}
+
+@test "main: overlay marker, both services ready -> exactly one boot complete" {
+  prep_main
+  : > "$AGENT_DEVBOX_OVERLAY_MARKER"
+  run bash -c '. "$SCRIPT"; main'
+  [ "$status" -eq 0 ]
+  boot_out="$output"
+  [ "$(printf '%s\n' "$boot_out" | grep -cF 'boot complete')" -eq 1 ]
+  grep -Fq 'docker ' "$CALL_LOG"
+  grep -Fq 'curl ' "$CALL_LOG"
+  grep -F -- "setsid --fork $BINDIR/dockerd --pidfile $AGENT_DEVBOX_DOCKERD_PID" "$CALL_LOG"
+  grep -F -- "setsid --fork $AGENT_DEVBOX_PASEO_BOOT_BIN" "$CALL_LOG"
+  # The parent returned before the lock appeared: this is not $!.
+  run grep -Fq 'paseo-pidfile-present-at-launch' "$CALL_LOG"
+  [ "$status" -ne 0 ]
+  [ "$(printf '%s\n' "$boot_out" | tail -n 1 | grep -cF 'boot complete')" -eq 1 ]
+}
+
+@test "main: overlay marker without dockerd fails closed and never starts paseo" {
+  prep_main
+  : > "$AGENT_DEVBOX_OVERLAY_MARKER"
+  export AGENT_DEVBOX_DOCKERD_BIN=
+  run bash -c '. "$SCRIPT"; main'
+  [ "$status" -eq 0 ]
+  printf '%s' "$output" | grep -Fq 'boot failed: service=dockerd reason=missing-binary'
+  grep -Fq 'readiness failed: service=dockerd reason=missing-binary' "$AGENT_DEVBOX_DOCKERD_LOG"
+  ! printf '%s' "$output" | grep -Fq 'boot complete'
+  assert_log_lacks 'setsid'
+  grep -Fq '数据盘已挂载；dockerd 未就绪。 Data disk mounted; dockerd not ready.' "$AGENT_DEVBOX_MOTD"
+  run grep -Fq 'mount-datadisk.cmd' "$AGENT_DEVBOX_MOTD"
+  [ "$status" -ne 0 ]
+}
+
+@test "main: a Supervisor lock with the wrong uid fails even when HTTP is 200" {
+  prep_main
+  export PASEO_FAKE_UID=9999
+  run bash -c '. "$SCRIPT"; main'
+  [ "$status" -eq 0 ]
+  printf '%s' "$output" | grep -Fq 'boot failed: service=paseo reason=identity'
+  ! printf '%s' "$output" | grep -Fq 'boot complete'
+  assert_log_lacks 'curl '
+  grep -Fq 'readiness failed: service=paseo reason=identity' "$AGENT_DEVBOX_PASEO_LOG"
+  grep -Fq '数据盘已挂载；paseo 未就绪。 Data disk mounted; paseo not ready.' "$AGENT_DEVBOX_MOTD"
+  run grep -Fq 'mount-datadisk.cmd' "$AGENT_DEVBOX_MOTD"
+  [ "$status" -ne 0 ]
+}
+
+@test "main: the same PID with a changed starttime fails as identity" {
+  prep_main
+  cat > "$TMP/mutate-start" <<SH
+#!/bin/sh
+"$BINDIR/mk_proc" "$AGENT_DEVBOX_PROC_FS" "\${PASEO_FAKE_PID:-4242}" \\
+  "\$AGENT_DEVBOX_PASEO_UID" "Paseo Superviso" "Paseo Supervisor" 999 "\$AGENT_DEVBOX_NODE_BIN"
+SH
+  chmod +x "$TMP/mutate-start"
+  export CURL_HOOK="$TMP/mutate-start"
+  run bash -c '. "$SCRIPT"; main'
+  [ "$status" -eq 0 ]
+  printf '%s' "$output" | grep -Fq 'boot failed: service=paseo reason=identity'
+  ! printf '%s' "$output" | grep -Fq 'boot complete'
+}
+
+@test "main: an unopenable paseo log prevents that launch" {
+  prep_main
+  /bin/mkdir -p "$TMP/paseo-log-dir"
+  export AGENT_DEVBOX_PASEO_LOG="$TMP/paseo-log-dir"
+  run bash -c '. "$SCRIPT"; main'
+  [ "$status" -eq 0 ]
+  printf '%s' "$output" | grep -Fq 'boot failed: service=paseo reason=log-open'
+  ! printf '%s' "$output" | grep -Fq 'boot complete'
+  assert_log_lacks 'setsid'
+}
+
+@test "main: an unopenable dockerd log prevents that launch" {
+  prep_main
+  : > "$AGENT_DEVBOX_OVERLAY_MARKER"
+  /bin/mkdir -p "$TMP/dockerd-log-dir"
+  export AGENT_DEVBOX_DOCKERD_LOG="$TMP/dockerd-log-dir"
+  run bash -c '. "$SCRIPT"; main'
+  [ "$status" -eq 0 ]
+  printf '%s' "$output" | grep -Fq 'boot failed: service=dockerd reason=log-open'
+  ! printf '%s' "$output" | grep -Fq 'boot complete'
+  assert_log_lacks 'setsid'
+}
+
+@test "main: a 503 health probe times out the shared 30s (service=paseo)" {
+  prep_main
+  export CURL_CODE=503
+  run bash -c '. "$SCRIPT"; main'
+  [ "$status" -eq 0 ]
+  printf '%s' "$output" | grep -Fq 'boot failed: service=paseo reason=timeout'
+  ! printf '%s' "$output" | grep -Fq 'boot complete'
+  grep -Fq 'readiness failed: service=paseo reason=timeout' "$AGENT_DEVBOX_PASEO_LOG"
+  grep -Fq '数据盘已挂载；paseo 未就绪。 Data disk mounted; paseo not ready.' "$AGENT_DEVBOX_MOTD"
+}
+
+@test "main: an unready dockerd times out the SAME deadline (service=dockerd)" {
+  prep_main
+  : > "$AGENT_DEVBOX_OVERLAY_MARKER"
+  export DOCKER_INFO_RC=1
+  run bash -c '. "$SCRIPT"; main'
+  [ "$status" -eq 0 ]
+  printf '%s' "$output" | grep -Fq 'boot failed: service=dockerd reason=timeout'
+  ! printf '%s' "$output" | grep -Fq 'boot complete'
+  grep -Fq 'curl ' "$CALL_LOG"
+  grep -Fq 'readiness failed: service=dockerd reason=timeout' "$AGENT_DEVBOX_DOCKERD_LOG"
+  grep -Fq '数据盘已挂载；dockerd 未就绪。 Data disk mounted; dockerd not ready.' "$AGENT_DEVBOX_MOTD"
+  run grep -Fq 'mount-datadisk.cmd' "$AGENT_DEVBOX_MOTD"
+  [ "$status" -ne 0 ]
+}
+
+@test "main: two consecutive runs never double-start a service" {
+  prep_main
+  : > "$AGENT_DEVBOX_OVERLAY_MARKER"
+  run bash -c '. "$SCRIPT"; main'
+  [ "$status" -eq 0 ]
+  run bash -c '. "$SCRIPT"; main'
+  [ "$status" -eq 0 ]
+  [ "$(grep -cF "setsid --fork $AGENT_DEVBOX_PASEO_BOOT_BIN" "$CALL_LOG")" -eq 1 ]
+  [ "$(grep -cF "setsid --fork $BINDIR/dockerd" "$CALL_LOG")" -eq 1 ]
+}
+
+@test "static guard: readiness never uses a background operator, --wait or the shell PID" {
+  run grep -nE 'setsid[^#]*&[[:space:]]*$' "$SCRIPT"
+  [ "$status" -ne 0 ]
+  run grep -nE '\$!' "$SCRIPT"
+  [ "$status" -ne 0 ]
+  run grep -Fq -- '--wait' "$SCRIPT"
+  [ "$status" -ne 0 ]
+  run grep -nE 'comm=node|comm=[^ ]*node' "$SCRIPT"
+  [ "$status" -ne 0 ]
+  run grep -nE 'daemon run' "$SCRIPT"
+  [ "$status" -ne 0 ]
+  run grep -Fq '/run/agent-devbox-paseo.pid' "$SCRIPT"
+  [ "$status" -ne 0 ]
+  run grep -Fq 'grep paseo' "$SCRIPT"
+  [ "$status" -ne 0 ]
 }

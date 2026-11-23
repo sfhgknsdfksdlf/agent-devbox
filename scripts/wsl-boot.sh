@@ -90,6 +90,34 @@ DOCKERD_LOG="${AGENT_DEVBOX_DOCKERD_LOG:-/var/log/dockerd.log}"
 DOCKERD_LOG_MAX="${AGENT_DEVBOX_DOCKERD_LOG_MAX:-5242880}"
 DOCKERD_PID="${AGENT_DEVBOX_DOCKERD_PID:-/run/agent-devbox-dockerd.pid}"
 DOCKERD_BIN="${AGENT_DEVBOX_DOCKERD_BIN-dockerd}"
+# --- boot readiness handshake (P0-1) ----------------------------------------
+# The Supervisor writes this JSON lock itself (owned by paseo); wsl-boot never
+# writes it and never trusts the shell's background PID. The old launch-time
+# pidfile under /run is gone.
+PASEO_PID="${AGENT_DEVBOX_PASEO_PID:-/home/paseo/.paseo/paseo.pid}"
+PASEO_USER="${AGENT_DEVBOX_PASEO_USER:-paseo}"
+PASEO_BOOT_BIN="${AGENT_DEVBOX_PASEO_BOOT_BIN:-/usr/local/bin/paseo-boot.sh}"
+PASEO_HEALTH_URL="${AGENT_DEVBOX_PASEO_HEALTH_URL:-http://127.0.0.1:6767/api/health}"
+DOCKER_SOCK="${AGENT_DEVBOX_DOCKER_SOCK:-/var/run/docker.sock}"
+DOCKER_BIN="${AGENT_DEVBOX_DOCKER_BIN:-/usr/bin/docker}"
+CURL_BIN="${AGENT_DEVBOX_CURL_BIN:-/usr/bin/curl}"
+SETSID_BIN="${AGENT_DEVBOX_SETSID_BIN:-/usr/bin/setsid}"
+# /proc is overridable so the bats suite can serve fake {stat,status,comm,
+# cmdline,exe} trees; production always uses /proc.
+PROC_FS="${AGENT_DEVBOX_PROC_FS:-/proc}"
+# Only the exported WSL rootfs carries this read-only marker (Dockerfile.wsl).
+# Its presence, never `command -v dockerd`, decides whether dockerd is required.
+OVERLAY_MARKER="${AGENT_DEVBOX_OVERLAY_MARKER:-/etc/agent-devbox-wsl-overlay}"
+# ONE monotonic deadline shared by dockerd and paseo, started before the first
+# service launch (mount/UUID/bind already done). Both probes use slices clipped
+# to what is left of it.
+READY_TIMEOUT="${AGENT_DEVBOX_READY_TIMEOUT:-30}"
+READY_POLL_MS="${AGENT_DEVBOX_READY_POLL_MS:-2000}"
+# Test hooks: a sourceable fake clock, an injected paseo uid/boot id and the
+# image node binary. Empty in production.
+NOW_MS_CMD="${AGENT_DEVBOX_NOW_MS_CMD:-}"
+PASEO_UID_OVERRIDE="${AGENT_DEVBOX_PASEO_UID:-}"
+NODE_BIN_OVERRIDE="${AGENT_DEVBOX_NODE_BIN:-}"
 # WSL's [boot] command gets no PATH: bash itself resolves names with a built-in
 # default, but children (setsid -> execvp) inherit an empty environment PATH and
 # fail with ENOENT. Export the standard path once so every child can exec by
@@ -535,43 +563,483 @@ ensure_cgroup2() {
   return 1
 }
 
-# start_dockerd(): fire-and-forget start. WSL has systemd disabled, so this is
-# the only place the engine can come up. It must never block or fail boot:
-# stdin is /dev/null so the [boot] pipe cannot be held open, and no readiness
-# wait is performed. Absent binary = no-op (Docker ships only in the rootfs
-# overlay, so the stock image simply skips it).
-start_dockerd() {
-  local bin pid
-  bin="${DOCKERD_BIN-dockerd}"
-  if [ -z "$bin" ]; then
-    log "dockerd 未安装（仅 WSL rootfs 变体带 Docker），跳过"
+# now_ms(): millisecond clock for the shared readiness deadline. NOW_MS_CMD is a
+# test hook: the suite shims it with an advanceable counter, because a real 30s
+# wait would make every main() case slow and time-dependent.
+now_ms() {
+  local t
+  if [ -n "$NOW_MS_CMD" ]; then
+    "$NOW_MS_CMD"
     return 0
   fi
-  # [boot] gets a minimal PATH; Debian ships dockerd in /usr/sbin, so resolve it
-  # explicitly instead of trusting PATH to contain sbin.
-  # Resolve to an ABSOLUTE path: command -v uses the shell's PATH even when it
-  # was never exported, and a relative name then dies in setsid's execvp.
-  if ! bin="$(command -v "$bin" 2>/dev/null)"; then
-    if [ -x /usr/sbin/dockerd ]; then
-      bin=/usr/sbin/dockerd
-    else
-      log "dockerd 未安装（仅 WSL rootfs 变体带 Docker），跳过"
+  t="${EPOCHREALTIME:-}"
+  if [ -n "$t" ]; then
+    t="${t/[.,]/}"
+    printf '%s\n' "$((t / 1000))"
+    return 0
+  fi
+  printf '%s000\n' "$(date +%s)"
+}
+
+ms_to_s() {
+  printf '%s.%03d\n' "$(($1 / 1000))" "$(($1 % 1000))"
+}
+
+# /proc/<pid>/stat: reject zombies and expose the kernel starttime. Field 22 of
+# the whole line is field 20 after the LAST ") " — comm may itself contain ") ".
+proc_stat_state_start() {
+  local pid="$1" stat rest
+  stat="$(cat "$PROC_FS/$pid/stat" 2>/dev/null)" || return 1
+  rest="${stat##*) }"
+  printf '%s\n' "$rest" | awk '{print $1 " " $20}'
+}
+
+proc_uid_pair() {
+  awk '/^Uid:/ {print $2 " " $3; exit}' "$PROC_FS/$1/status" 2>/dev/null
+}
+
+proc_comm() {
+  tr -d '\n' 2>/dev/null < "$PROC_FS/$1/comm"
+}
+
+proc_title() {
+  tr '\0' '\n' 2>/dev/null < "$PROC_FS/$1/cmdline" | sed -n '1p'
+}
+
+proc_argv_has() {
+  tr '\0' '\n' 2>/dev/null < "$PROC_FS/$1/cmdline" | grep -Fxq -- "$2"
+}
+
+proc_exe() {
+  local exe
+  exe="$(readlink "$PROC_FS/$1/exe" 2>/dev/null)" || return 1
+  printf '%s\n' "${exe% (deleted)}"
+}
+
+paseo_expected_uid() {
+  if [ -n "$PASEO_UID_OVERRIDE" ]; then
+    printf '%s\n' "$PASEO_UID_OVERRIDE"
+    return 0
+  fi
+  id -u "$PASEO_USER" 2>/dev/null
+}
+
+node_exe() {
+  local bin
+  if [ -n "$NODE_BIN_OVERRIDE" ]; then
+    bin="$NODE_BIN_OVERRIDE"
+  else
+    bin="$(command -v node 2>/dev/null)"
+  fi
+  [ -n "$bin" ] || return 1
+  readlink -f "$bin" 2>/dev/null || printf '%s\n' "$bin"
+}
+
+current_boot_id() {
+  if [ -n "${AGENT_DEVBOX_BOOT_ID:-}" ]; then
+    printf '%s\n' "$AGENT_DEVBOX_BOOT_ID"
+    return 0
+  fi
+  [ -r "$PROC_FS/sys/kernel/random/boot_id" ] || return 1
+  tr -d '\n' < "$PROC_FS/sys/kernel/random/boot_id"
+}
+
+# read_paseo_lock(): compact JSON written by the paseo Supervisor. Emit the six
+# fields joined by a non-whitespace separator so empty listen/serverId survive
+# `read`. Invalid/truncated JSON is a retry, never a death verdict.
+read_paseo_lock() {
+  jq -er '
+    select((.pid | type) == "number" and .pid > 0 and .pid == (.pid | floor))
+    | [ (.pid | tostring), (.startedAt // ""), ((.uid // "") | tostring),
+        (.bootId // ""), (.listen // ""), (.serverId // "") ]
+    | join("\u001f")
+  ' "$PASEO_PID" 2>/dev/null
+}
+
+# paseo_identity_ok <pid> <json-uid> <json-boot-id> <expected-starttime>
+#   0 = the recorded PID is this boot's paseo Supervisor and nothing else
+#   2 = process gone/zombie, 3 = identity conflict (uid/comm/title/exe/starttime)
+paseo_identity_ok() {
+  local pid="$1" juid="$2" jboot="$3" want_start="$4"
+  local st state start ids uid_real uid_eff exe want_uid cur_boot node
+  want_uid="$(paseo_expected_uid)" || return 3
+  if [ "$juid" != "$want_uid" ]; then
+    return 3
+  fi
+  cur_boot="$(current_boot_id 2>/dev/null || true)"
+  if [ -n "$jboot" ] && [ -n "$cur_boot" ] && [ "$jboot" != "$cur_boot" ]; then
+    return 3
+  fi
+  st="$(proc_stat_state_start "$pid")" || return 2
+  state="${st%% *}"
+  start="${st#* }"
+  [ "$state" != "Z" ] || return 2
+  [ -n "$start" ] || return 2
+  if [ -n "$want_start" ] && [ "$start" != "$want_start" ]; then
+    return 3
+  fi
+  ids="$(proc_uid_pair "$pid")"
+  uid_real="${ids%% *}"
+  uid_eff="${ids##* }"
+  if [ "$uid_real" != "$want_uid" ] || [ "$uid_eff" != "$want_uid" ]; then
+    return 3
+  fi
+  [ "$(proc_comm "$pid")" = "Paseo Superviso" ] || return 3
+  [ "$(proc_title "$pid")" = "Paseo Supervisor" ] || return 3
+  exe="$(proc_exe "$pid")" || return 3
+  node="$(node_exe)" || return 3
+  [ "$exe" = "$node" ] || return 3
+  PASEO_CUR_START="$start"
+  return 0
+}
+
+read_dockerd_pid() {
+  local raw pid
+  [ -r "$DOCKERD_PID" ] || return 1
+  raw="$(cat "$DOCKERD_PID" 2>/dev/null)" || return 1
+  raw="${raw%$'\n'}"
+  case "$raw" in
+    ''|*$'\n'*|*$'\r'*) return 1 ;;
+  esac
+  case "$raw" in
+    *[!0-9]*) return 1 ;;
+  esac
+  [ "${#raw}" -le 10 ] || return 1
+  pid=$((10#$raw))
+  [ "$pid" -gt 0 ] || return 1
+  printf '%s\n' "$pid"
+}
+
+resolve_dockerd() {
+  local bin="${DOCKERD_BIN-dockerd}"
+  # An explicitly empty value means "this image has no engine"; never fall back.
+  [ -n "$bin" ] || return 1
+  case "$bin" in
+    /*) [ -x "$bin" ] || return 1 ;;
+    *) bin="$(command -v "$bin" 2>/dev/null)" || true ;;
+  esac
+  if [ -z "$bin" ]; then
+    [ -x /usr/sbin/dockerd ] || return 1
+    bin=/usr/sbin/dockerd
+  fi
+  # /proc/<pid>/exe is the real file, so compare against the resolved target
+  # (Debian symlinks /usr/bin/dockerd to /usr/sbin/dockerd).
+  readlink -f "$bin" 2>/dev/null || printf '%s\n' "$bin"
+}
+
+# verify_dockerd_identity <pid> <expected-starttime>
+#   0 = real dockerd from this image (uid 0), 2 = gone/zombie, 3 = conflict
+verify_dockerd_identity() {
+  local pid="$1" want_start="$2" st state start ids uid_real uid_eff exe
+  st="$(proc_stat_state_start "$pid")" || return 2
+  state="${st%% *}"
+  start="${st#* }"
+  [ "$state" != "Z" ] || return 2
+  [ -n "$start" ] || return 2
+  if [ -n "$want_start" ] && [ "$start" != "$want_start" ]; then
+    return 3
+  fi
+  ids="$(proc_uid_pair "$pid")"
+  uid_real="${ids%% *}"
+  uid_eff="${ids##* }"
+  if [ "$uid_real" != "0" ] || [ "$uid_eff" != "0" ]; then
+    return 3
+  fi
+  [ "$(proc_comm "$pid")" = "dockerd" ] || return 3
+  exe="$(proc_exe "$pid")" || return 3
+  [ "$exe" = "$DOCKERD_ABS" ] || return 3
+  proc_argv_has "$pid" "--pidfile" || return 3
+  proc_argv_has "$pid" "$DOCKERD_PID" || return 3
+  DOCKERD_CUR_START="$start"
+  return 0
+}
+
+# start_dockerd(): launch at most once. A live, correctly identified engine is
+# only probed; an identity conflict fails closed and is never killed/overwritten.
+# Returns 0 (started or already running) or 2 with READY_REASON set.
+start_dockerd() {
+  local pid fd rc
+  if ! DOCKERD_ABS="$(resolve_dockerd)"; then
+    READY_REASON="missing-binary"
+    return 2
+  fi
+  if pid="$(read_dockerd_pid)"; then
+    if verify_dockerd_identity "$pid" ""; then
+      DOCKERD_START="$DOCKERD_CUR_START"
+      log "dockerd 已在运行（pid=$pid），只探测不重启"
       return 0
     fi
-  fi
-  if [ -f "$DOCKERD_PID" ]; then
-    pid="$(cat "$DOCKERD_PID" 2>/dev/null || true)"
-    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-      log "dockerd 已在运行（pid=$pid）"
-      return 0
+    if [ -e "$PROC_FS/$pid" ]; then
+      READY_REASON="identity"
+      return 2
+    fi
+    if [ "$(read_dockerd_pid 2>/dev/null)" = "$pid" ]; then
+      rm -f "$DOCKERD_PID" 2>/dev/null || true
     fi
   fi
   ensure_cgroup2 || true
   rotate_log "$DOCKERD_LOG" "$DOCKERD_LOG_MAX"
+  if ! { exec {fd}>>"$DOCKERD_LOG"; } 2>/dev/null; then
+    READY_REASON="log-open"
+    return 2
+  fi
+  "$SETSID_BIN" --fork "$DOCKERD_ABS" --pidfile "$DOCKERD_PID" </dev/null >&"$fd" 2>&1
+  rc=$?
+  exec {fd}>&-
+  if [ "$rc" -ne 0 ]; then
+    READY_REASON="launch"
+    return 2
+  fi
   log "启动 dockerd（后台，日志 $DOCKERD_LOG）"
-  setsid "$bin" </dev/null >>"$DOCKERD_LOG" 2>&1 &
-  echo $! > "$DOCKERD_PID"
   return 0
+}
+
+# probe_dockerd <slice-ms>: 0 ready, 1 retry, 2 fatal (READY_REASON set).
+probe_dockerd() {
+  local slice_ms="$1" slice_s pid rc
+  DOCKERD_READY=0
+  if ! pid="$(read_dockerd_pid)"; then
+    if [ -n "$DOCKERD_START" ] && [ ! -e "$DOCKERD_PID" ]; then
+      READY_REASON="exited"
+      return 2
+    fi
+    READY_REASON="pending"
+    return 1
+  fi
+  verify_dockerd_identity "$pid" "$DOCKERD_START"
+  rc=$?
+  if [ "$rc" -eq 2 ]; then
+    READY_REASON="exited"
+    return 2
+  fi
+  if [ "$rc" -ne 0 ]; then
+    READY_REASON="identity"
+    return 2
+  fi
+  [ -n "$DOCKERD_START" ] || DOCKERD_START="$DOCKERD_CUR_START"
+  [ -S "$DOCKER_SOCK" ] || { READY_REASON="pending"; return 1; }
+  slice_s="$(ms_to_s "$slice_ms")"
+  if ! env -u DOCKER_HOST -u DOCKER_CONTEXT -u DOCKER_TLS_VERIFY -u DOCKER_CERT_PATH \
+    timeout -s KILL "$slice_s" "$DOCKER_BIN" --host "unix:///var/run/docker.sock" info >/dev/null 2>&1; then
+    READY_REASON="pending"
+    return 1
+  fi
+  verify_dockerd_identity "$pid" "$DOCKERD_START"
+  rc=$?
+  if [ "$rc" -eq 2 ]; then
+    READY_REASON="exited"
+    return 2
+  fi
+  if [ "$rc" -ne 0 ]; then
+    READY_REASON="identity"
+    return 2
+  fi
+  DOCKERD_READY=1
+  return 0
+}
+
+# probe_paseo <slice-ms>: 0 ready, 1 retry, 2 fatal (READY_REASON set).
+probe_paseo() {
+  local slice_ms="$1" slice_s code line pid startedAt juid jboot listen serverId
+  local pid2 started2 juid2 jboot2 rc
+  if ! line="$(read_paseo_lock)"; then
+    if [ -n "$PASEO_LOCK_START" ] && [ ! -e "$PASEO_PID" ]; then
+      READY_REASON="exited"
+      return 2
+    fi
+    READY_REASON="pending"
+    return 1
+  fi
+  IFS=$'\x1f' read -r pid startedAt juid jboot listen serverId <<< "$line"
+  [ -n "$pid" ] || { READY_REASON="pending"; return 1; }
+  paseo_identity_ok "$pid" "$juid" "$jboot" "$PASEO_LOCK_START"
+  rc=$?
+  if [ "$rc" -eq 2 ]; then
+    if [ -n "$PASEO_LOCK_START" ]; then
+      READY_REASON="exited"
+      return 2
+    fi
+    READY_REASON="pending"
+    return 1
+  fi
+  if [ "$rc" -ne 0 ]; then
+    READY_REASON="identity"
+    return 2
+  fi
+  if [ -z "$PASEO_LOCK_START" ]; then
+    PASEO_LOCK_START="$PASEO_CUR_START"
+    PASEO_LOCK_BOOT="$jboot"
+    PASEO_LOCK_STARTED_AT="$startedAt"
+  fi
+  if [ "$jboot" != "$PASEO_LOCK_BOOT" ] || [ "$startedAt" != "$PASEO_LOCK_STARTED_AT" ]; then
+    READY_REASON="identity"
+    return 2
+  fi
+  if [ -z "$listen" ] || [ -z "$serverId" ]; then
+    READY_REASON="pending"
+    return 1
+  fi
+  slice_s="$(ms_to_s "$slice_ms")"
+  code="$(env NO_PROXY='*' no_proxy='*' "$CURL_BIN" -q --noproxy '*' -sS -o /dev/null \
+    -w '%{http_code}' --max-time "$slice_s" "$PASEO_HEALTH_URL" 2>/dev/null)"
+  rc=$?
+  if [ "$rc" -ne 0 ] || [ "$code" != "200" ]; then
+    READY_REASON="pending"
+    return 1
+  fi
+  if ! line="$(read_paseo_lock)"; then
+    READY_REASON="pending"
+    return 1
+  fi
+  IFS=$'\x1f' read -r pid2 started2 juid2 jboot2 _ <<< "$line"
+  if [ "$pid2" != "$pid" ] || [ "$started2" != "$startedAt" ] || [ "$jboot2" != "$jboot" ]; then
+    READY_REASON="identity"
+    return 2
+  fi
+  paseo_identity_ok "$pid2" "$juid2" "$jboot2" "$PASEO_LOCK_START"
+  rc=$?
+  if [ "$rc" -eq 2 ]; then
+    READY_REASON="exited"
+    return 2
+  fi
+  if [ "$rc" -ne 0 ]; then
+    READY_REASON="identity"
+    return 2
+  fi
+  return 0
+}
+
+start_paseo() {
+  local line pid startedAt juid jboot listen serverId fd rc
+  if [ ! -x "$PASEO_BOOT_BIN" ]; then
+    READY_REASON="missing-binary"
+    return 2
+  fi
+  if line="$(read_paseo_lock)"; then
+    IFS=$'\x1f' read -r pid startedAt juid jboot listen serverId <<< "$line"
+    if paseo_identity_ok "$pid" "$juid" "$jboot" ""; then
+      PASEO_LOCK_START="$PASEO_CUR_START"
+      PASEO_LOCK_BOOT="$jboot"
+      PASEO_LOCK_STARTED_AT="$startedAt"
+      log "paseo 服务已在运行（pid=$pid），只探测不重启"
+      return 0
+    fi
+  fi
+  rotate_log "$PASEO_LOG" "$PASEO_LOG_MAX"
+  if ! { exec {fd}>>"$PASEO_LOG"; } 2>/dev/null; then
+    READY_REASON="log-open"
+    return 2
+  fi
+  "$SETSID_BIN" --fork "$PASEO_BOOT_BIN" </dev/null >&"$fd" 2>&1
+  rc=$?
+  exec {fd}>&-
+  if [ "$rc" -ne 0 ]; then
+    READY_REASON="launch"
+    return 2
+  fi
+  log "启动 paseo 服务（后台，日志 $PASEO_LOG）"
+  return 0
+}
+
+write_service_failure_motd() {
+  local service="$1" reason="$2" logpath="$3"
+  {
+    printf '%s\n' '*** agent-devbox is in MAINTENANCE MODE / 维护模式 ***'
+    printf '数据盘已挂载；%s 未就绪。 Data disk mounted; %s not ready.\n' "$service" "$service"
+    printf '原因 / reason: %s\n' "$reason"
+    printf '日志 / log: %s\n' "$logpath"
+  } > "$MOTD_FILE" 2>/dev/null || true
+}
+
+# readiness_fail(): never a data-disk banner — the disk IS mounted. The matching
+# service log gets the machine-readable line; if that log cannot be opened the
+# boot log carries it instead. No password, no remount hint, no "complete".
+readiness_fail() {
+  local service="$1" reason="$2" logpath
+  if [ "$service" = "dockerd" ]; then
+    logpath="$DOCKERD_LOG"
+  else
+    logpath="$PASEO_LOG"
+  fi
+  if ! printf '%s\n' "readiness failed: service=$service reason=$reason" >> "$logpath" 2>/dev/null; then
+    log "readiness failed: service=$service reason=$reason（无法写入 $logpath）"
+  fi
+  write_service_failure_motd "$service" "$reason" "$logpath"
+  log "boot failed: service=$service reason=$reason log=$logpath"
+}
+
+# ensure_services_ready(): one 30s deadline for every required service. Overlay
+# marker => dockerd AND paseo; absent => paseo only (never infer from PATH).
+ensure_services_ready() {
+  local docker_required=0 deadline rem_ms slice_ms sleep_s rc dsv_rc psv_rc
+  PASEO_LOCK_START=""
+  PASEO_LOCK_BOOT=""
+  PASEO_LOCK_STARTED_AT=""
+  DOCKERD_START=""
+  DOCKERD_READY=0
+  if [ -f "$OVERLAY_MARKER" ]; then
+    docker_required=1
+  fi
+  deadline=$(( $(now_ms) + READY_TIMEOUT * 1000 ))
+  if [ "$docker_required" -eq 1 ]; then
+    start_dockerd
+    rc=$?
+    if [ "$rc" -eq 2 ]; then
+      readiness_fail dockerd "$READY_REASON"
+      return 1
+    fi
+  fi
+  start_paseo
+  rc=$?
+  if [ "$rc" -eq 2 ]; then
+    readiness_fail paseo "$READY_REASON"
+    return 1
+  fi
+  while :; do
+    rem_ms=$(( deadline - $(now_ms) ))
+    if [ "$rem_ms" -le 0 ]; then
+      if [ "$docker_required" -eq 1 ] && [ "$DOCKERD_READY" -ne 1 ]; then
+        readiness_fail dockerd timeout
+      else
+        readiness_fail paseo timeout
+      fi
+      return 1
+    fi
+    slice_ms="$READY_POLL_MS"
+    if [ "$slice_ms" -gt "$rem_ms" ]; then
+      slice_ms="$rem_ms"
+    fi
+    dsv_rc=0
+    if [ "$docker_required" -eq 1 ]; then
+      probe_dockerd "$slice_ms"
+      dsv_rc=$?
+      if [ "$dsv_rc" -eq 2 ]; then
+        readiness_fail dockerd "$READY_REASON"
+        return 1
+      fi
+    fi
+    probe_paseo "$slice_ms"
+    psv_rc=$?
+    if [ "$psv_rc" -eq 2 ]; then
+      readiness_fail paseo "$READY_REASON"
+      return 1
+    fi
+    if [ "$dsv_rc" -eq 0 ] && [ "$psv_rc" -eq 0 ]; then
+      clear_motd
+      log "boot complete"
+      return 0
+    fi
+    rem_ms=$(( deadline - $(now_ms) ))
+    if [ "$rem_ms" -le 0 ]; then
+      continue
+    fi
+    slice_ms="$READY_POLL_MS"
+    if [ "$slice_ms" -gt "$rem_ms" ]; then
+      slice_ms="$rem_ms"
+    fi
+    sleep_s="$(ms_to_s "$slice_ms")"
+    sleep "$sleep_s"
+  done
 }
 
 # verify_data_uuid(): compare the mounted UUID(s) with DATA_UUID. `sort -u`
@@ -608,7 +1076,6 @@ main() {
     exit 0
   fi
   log "数据盘挂载成功"
-  clear_motd
 
   # --- verify identity; fail closed on UUID mismatch -------------------------
   if [ -n "${DATA_UUID:-}" ]; then
@@ -647,20 +1114,10 @@ main() {
   # live on the data disk, so an image-side link alone cannot repair an upgrade) -
   ensure_opencode_shim /root /home/*
 
-  # --- Docker Engine (rootfs overlay only; fire-and-forget, never blocks) ----
-  start_dockerd
-
-  # --- start the daemon as paseo (single owner) ------------------------------
-  if [ -f /run/agent-devbox-paseo.pid ] && kill -0 "$(cat /run/agent-devbox-paseo.pid)" 2>/dev/null; then
-    log "paseo 服务已在运行"
-  else
-    log "启动 paseo 服务 …"
-    rotate_log "$PASEO_LOG" "$PASEO_LOG_MAX"
-    setsid /usr/local/bin/paseo-boot.sh >>"$PASEO_LOG" 2>&1 &
-    echo $! > /run/agent-devbox-paseo.pid
-  fi
-
-  log "boot complete"
+  # --- required services: the overlay variant needs dockerd AND paseo -------
+  # The MOTD is cleared only after every required probe passed in the same
+  # round; `boot complete` is emitted exactly once, here, on success.
+  ensure_services_ready || exit 0
 }
 
 # --- entry point (guarded so the file can be sourced without side effects) ----

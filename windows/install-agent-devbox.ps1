@@ -107,7 +107,9 @@ function Test-DistroExists {
   return ((Get-WslDistros) -contains $Distro)
 }
 
-# 解析版本选择：beta -> 最近的 beta-* 预发布；裸 YYYYMMDD.HHMM -> build-*；其余原样。
+# 解析版本选择：beta -> 最近的 beta-* 预发布；latest -> 正式 Release；
+# 裸 YYYYMMDD.HHMM -> 旧 build-YYYYMMDD.HHMM；显式 build-/beta-（含新
+# -<run>.<attempt> 后缀）原样精确查询，绝不截断后缀。
 function Resolve-ReleaseTag {
   param([string] $Sel)
   $sel = Normalize-ReleaseTag $Sel
@@ -983,9 +985,10 @@ if ($script:NativeExit -eq 0) {
 Step '[完成] 重启发行版…'
 # 重启前的 boot 日志行数：重启后只认「新增」的行，避免把上一次的 boot complete 当成本次成功。
 $bootLogPath = '/var/log/agent-devbox-boot.log'
-$bootLinesBefore = 0
 $lineOut = Invoke-WslBashScript -Distro $Distro -Script "wc -l < $bootLogPath 2>/dev/null || echo 0"
-if ("$lineOut".Trim() -match '^\d+$') { $bootLinesBefore = [int]("$lineOut".Trim()) }
+$lineText = "$lineOut".Trim()
+if ($lineText -notmatch '^\d+$') { throw "无法读取启动日志基线（$bootLogPath）：$lineOut" }
+$bootLinesBefore = [int]$lineText
 Invoke-Native 'wsl.exe' @('--terminate', $Distro) | Out-Null
 Assert-DistroReady -Distro $Distro -InstallDir $InstallDir | Out-Null
 

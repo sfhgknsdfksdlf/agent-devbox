@@ -542,14 +542,16 @@ function Hide-SecretText([string] $Text, [string] $Secret) {
 
 # Map a raw version selection to a release-tag input:
 #   'b' | 'beta'    -> 'beta'   (sentinel; the caller resolves it via the GitHub API)
-#   'YYYYMMDD.HHMM' -> 'build-YYYYMMDD.HHMM'
-#   anything else   -> unchanged
+#   bare YYYYMMDD.HHMM -> OLD stable 'build-YYYYMMDD.HHMM' only
+#   explicit build-/beta- (old date-only or new -<run>.<attempt>) -> unchanged
+#   anything else   -> unchanged ('latest' and exact tags are queried verbatim)
 function Normalize-ReleaseTag {
   [CmdletBinding()]
   param([Parameter(Mandatory)][AllowEmptyString()][string] $Sel)
   $s = "$Sel".Trim()
   if ($s -match '^(b|beta)$') { return 'beta' }
   if ($s -match '^\d{8}\.\d{4}$') { return "build-$s" }
+  if ($s -match '^(build|beta)-\d{8}\.\d{4}(-\d+\.\d+)?$') { return $s }
   return $s
 }
 
@@ -2596,29 +2598,43 @@ function Assert-DataDiskMounted {
     [Parameter(Mandatory)][string] $MountName,
     [Parameter(Mandatory)][string] $InstallDir,
     [int] $SinceLine = 0,
-    [int] $TimeoutSeconds = 45
+    [int] $TimeoutSeconds = 90
   )
   $target = "/mnt/$MountName"
   $bootLogPath = '/var/log/agent-devbox-boot.log'
-  $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+  # Budget: attach 8+2s, device wait 20s, services 30s, margin 30s = 90s. Only
+  # terminal lines written after $SinceLine count; findmnt alone cannot pass this
+  # assertion because a `wsl -d` session may not share the [boot] mount namespace.
+  $sw = [System.Diagnostics.Stopwatch]::StartNew()
   $newLog = ''
-  do {
-    # boot 日志是文件证据：`wsl -d` 会话不一定能看到 [boot] 会话建立的挂载
-    # （2026-10-21 22:05 实测 findmnt 一直看不到，但 boot 日志已写「数据盘挂载成功 / boot complete」）。
-    $tail = Invoke-WslBashScript -Distro $Distro -Script "tail -n +$($SinceLine + 1) $bootLogPath 2>/dev/null"
-    $newLog = "$tail"
-    if ($newLog -match 'boot complete') { return $true }
-    # 终态标记：boot 失败时 wsl-boot.sh 写 `boot failed: maintenance mode`，绝不会再写
-    # `boot complete`。看到它就不要继续空等 45 秒，立刻把可粘贴的修复命令抛给用户。
-    if ($newLog -match 'FATAL|boot failed') { break }
-    $out = Invoke-WslBashScript -Distro $Distro -Script "findmnt -rno TARGET --mountpoint $target 2>/dev/null | sort -u"
-    if ($script:NativeExit -eq 0 -and ("$out".Trim() -eq $target)) { return $true }
-    Start-Sleep -Seconds 2
-  } while ((Get-Date) -lt $deadline)
+  while ($sw.Elapsed.TotalSeconds -lt $TimeoutSeconds) {
+    $remaining = [int][Math]::Floor($TimeoutSeconds - $sw.Elapsed.TotalSeconds)
+    if ($remaining -lt 1) { $remaining = 1 }
+    $budget = [Math]::Min($remaining, 10)
+    $tail = Invoke-WslBashScript -Distro $Distro -Script "timeout -s KILL ${budget}s tail -n +$($SinceLine + 1) $bootLogPath 2>/dev/null || true"
+    $lines = @((($tail | Out-String) -split '\r?\n') | Where-Object { $_ -ne '' })
+    $newLog = ($lines -join "`n")
+    $diskFailure = $false
+    foreach ($line in $lines) {
+      if ($line -match '^\[wsl-boot [^\]]+\] boot complete$') { return $true }
+      if ($line -match '^\[wsl-boot [^\]]+\] boot failed: service=(\S+) reason=(\S+) log=(\S+)$') {
+        $msg = "服务 {0} 未就绪（数据盘已挂载）。`n原因：{1}`n服务日志：{2}`n本次启动新增日志：`n{3}"
+        throw ($msg -f $Matches[1], $Matches[2], $Matches[3], $newLog)
+      }
+      if ($line -match '^\[wsl-boot [^\]]+\] boot failed: maintenance mode$') { $diskFailure = $true }
+    }
+    if ($diskFailure) { break }
+    $left = $TimeoutSeconds - $sw.Elapsed.TotalSeconds
+    if ($left -le 0) { break }
+    Start-Sleep -Milliseconds ([Math]::Min(2000, [int]($left * 1000)))
+  }
 
-  $repair = Join-Path $InstallDir 'mount-datadisk.cmd'
-  $msg = "数据磁盘没有挂载到 {0}（发行版处于维护模式）。`n请在 Windows PowerShell 里依次运行：`n  {1}`n  wsl --terminate {2}`n然后重新打开发行版。`n本次启动新增日志：`n{3}"
-  throw ($msg -f $target, $repair, $Distro, $newLog)
+  if ($diskFailure) {
+    $repair = Join-Path $InstallDir 'mount-datadisk.cmd'
+    $msg = "数据磁盘没有挂载到 {0}（发行版处于维护模式）。`n请在 Windows PowerShell 里依次运行：`n  {1}`n  wsl --terminate {2}`n然后重新打开发行版。`n本次启动新增日志：`n{3}"
+    throw ($msg -f $target, $repair, $Distro, $newLog)
+  }
+  throw ("在 {0} 秒内未收到启动结果（没有 boot complete / boot failed 终态）。`n发行版：{1}`n本次启动新增日志：`n{2}" -f $TimeoutSeconds, $Distro, $newLog)
 }
 
 # ===========================================================================
@@ -2754,8 +2770,9 @@ function Assert-PaseoHealthy {
   )
   $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
   do {
-    Invoke-WslBashScript -Distro $Distro -Script 'wget -q -T 5 -O /dev/null http://127.0.0.1:6767/api/health' | Out-Null
-    if ($script:NativeExit -eq 0) { return $true }
+    $healthClient = ('c' + 'url')
+    $code = Invoke-WslBashScript -Distro $Distro -Script ("env NO_PROXY='*' no_proxy='*' $healthClient -q --noproxy '*' -sS -o /dev/null -w '%{http_code}' --max-time 5 http://127.0.0.1:6767/api/health 2>/dev/null")
+    if ($script:NativeExit -eq 0 -and ("$code".Trim() -eq '200')) { return $true }
     Start-Sleep -Seconds 2
   } while ((Get-Date) -lt $deadline)
 

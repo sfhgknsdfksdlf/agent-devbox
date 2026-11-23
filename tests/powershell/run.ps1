@@ -28,9 +28,14 @@ function Assert-Equal {
 Assert-Equal 'beta' (Normalize-ReleaseTag 'b') 'Normalize: b -> beta'
 Assert-Equal 'beta' (Normalize-ReleaseTag 'beta') 'Normalize: beta -> beta'
 Assert-Equal 'beta' (Normalize-ReleaseTag '  beta ') 'Normalize: trim'
-Assert-Equal 'build-20261018.0731' (Normalize-ReleaseTag '20261018.0731') 'Normalize: bare date -> build-'
-Assert-Equal 'beta-20261018.0731' (Normalize-ReleaseTag 'beta-20261018.0731') 'Normalize: explicit beta tag passthrough'
+Assert-Equal 'build-20261018.0731' (Normalize-ReleaseTag '20261018.0731') 'Normalize: bare date -> old build-'
+Assert-Equal 'build-20261018.0731' (Normalize-ReleaseTag 'build-20261018.0731') 'Normalize: explicit old build- tag passthrough'
+Assert-Equal 'beta-20261018.0731' (Normalize-ReleaseTag 'beta-20261018.0731') 'Normalize: explicit old beta- tag passthrough'
+Assert-Equal 'build-20261018.0731-123.2' (Normalize-ReleaseTag 'build-20261018.0731-123.2') 'Normalize: new stable tag keeps the run suffix'
+Assert-Equal 'beta-20261018.0731-123.2' (Normalize-ReleaseTag 'beta-20261018.0731-123.2') 'Normalize: new beta tag keeps the run suffix'
+Assert-Equal '20261018.0731-123.2' (Normalize-ReleaseTag '20261018.0731-123.2') 'Normalize: only a BARE date is normalized (suffixed date stays verbatim)'
 Assert-Equal 'latest' (Normalize-ReleaseTag 'latest') 'Normalize: latest passthrough'
+Assert-Equal '' (Normalize-ReleaseTag '') 'Normalize: empty stays empty'
 
 # --- Resolve-YesNoDefault (issue #1) --------------------------------------
 Assert-True (Resolve-YesNoDefault -Answer '' -DefaultYes $true) 'YesNo: Enter defaults to yes'
@@ -235,6 +240,20 @@ $ensureText = Get-Content -Raw (Join-Path $winDir 'wsl-ensure.ps1')
 $webText    = Get-Content -Raw (Join-Path $winDir 'install.ps1')
 $mainText   = Get-Content -Raw (Join-Path $winDir 'install-agent-devbox.ps1')
 
+# --- Resolve-ReleaseTag: explicit tags are queried verbatim -----------------
+# Compatibility contract (P0-2): bare dates normalize to the OLD `build-<date>`;
+# explicit old/new `build-`/`beta-` tags (including the run suffix) and `latest`
+# pass through untouched; only `b|beta` resolves through the Release API. The
+# suffix must never be truncated.
+$resolveBlock = [regex]::Match($mainText, '(?ms)^function Resolve-ReleaseTag \{.*?^\}').Value
+Assert-True ($resolveBlock -ne '') 'tag: Resolve-ReleaseTag is defined'
+Assert-True ($resolveBlock -match 'Normalize-ReleaseTag \$Sel') 'tag: Resolve-ReleaseTag normalizes first'
+Assert-True ($resolveBlock -match 'return \$sel') 'tag: explicit/normalized selections are returned verbatim'
+Assert-True ($resolveBlock -notmatch '\.Substring|\.Replace\(|TrimEnd') 'tag: Resolve-ReleaseTag never truncates the run suffix'
+$normalizeBlock = [regex]::Match($ensureText, '(?ms)^function Normalize-ReleaseTag \{.*?^\}').Value
+Assert-True ($normalizeBlock -match '\\d\{8\}\\\.\\d\{4\}') 'tag: Normalize only recognizes a bare date'
+Assert-True ($normalizeBlock -match 'build-\$s') 'tag: bare date maps to old build- only'
+
 # C1: no inline C# / P/Invoke in the shared helper.
 Assert-True ($ensureText -notmatch 'TypeDefinition') 'av: wsl-ensure has no Add-Type -TypeDefinition'
 Assert-True ($ensureText -notmatch 'DllImport') 'av: wsl-ensure has no DllImport'
@@ -258,6 +277,222 @@ Assert-True ($ciText -notmatch '(?m)^\s*windows/install\.cmd\s*$') 'converge: bu
 Assert-True ($ciText -notmatch 'windows/import-distro\.ps1') 'converge: build.yml has no import-distro'
 Assert-True ($ciText -match 'rootfs-\*-\*\.tar\.zst\.part-\*') 'converge: build.yml keeps the rootfs parts'
 Assert-True ($ciText -match 'agent-devbox-1panel-localapp\.zip') 'converge: build.yml keeps the 1panel zip'
+
+# --- P0-6a: least-privilege permission matrix + checkout credentials -------
+# Parse the REAL workflow structure (jobs -> permissions / steps) instead of
+# substring matching: a missing job, an added scope, a changed scope, or a
+# missing/extra `persist-credentials` must all fail. No external YAML module is
+# used (the ps-lint runner has no PowerShell-Yaml), so this is a deliberately
+# small indentation parser for the mapping/sequence/scalar subset build.yml uses;
+# block scalars (`run: |`, `files: |`) are skipped as opaque text.
+function Remove-WorkflowYamlComment {
+  param([string] $Text)
+  $inSingle = $false; $inDouble = $false
+  for ($i = 0; $i -lt $Text.Length; $i++) {
+    $c = $Text[$i]
+    if ($c -eq "'" -and -not $inDouble) { $inSingle = -not $inSingle; continue }
+    if ($c -eq '"' -and -not $inSingle) { $inDouble = -not $inDouble; continue }
+    if ($c -eq '#' -and -not $inSingle -and -not $inDouble) {
+      if ($i -eq 0 -or $Text[$i - 1] -eq ' ' -or $Text[$i - 1] -eq "`t") {
+        return $Text.Substring(0, $i)
+      }
+    }
+  }
+  return $Text
+}
+
+function Get-WorkflowYamlTokens {
+  param([string[]] $Lines)
+  $tokens = [System.Collections.Generic.List[object]]::new()
+  $blockIndent = -1
+  for ($n = 0; $n -lt $Lines.Count; $n++) {
+    $raw = $Lines[$n]
+    $indent = 0
+    while ($indent -lt $raw.Length -and $raw[$indent] -eq ' ') { $indent++ }
+    $body = $raw.Substring($indent)
+    if ($body -eq '' -or $body.StartsWith('#')) { continue }
+    if ($blockIndent -ge 0) {
+      if ($indent -gt $blockIndent) { continue }
+      $blockIndent = -1
+    }
+    $content = (Remove-WorkflowYamlComment $body).TrimEnd()
+    if ($content -eq '') { continue }
+    $tokens.Add([pscustomobject]@{ Indent = $indent; Content = $content; Line = $n + 1 })
+    if ($content -match '(?:^|:\s)[|>][-+]?\s*$') { $blockIndent = $indent }
+  }
+  return ,$tokens
+}
+
+function Convert-WorkflowYamlScalar {
+  param([string] $Text)
+  $t = $Text.Trim()
+  if ($t -eq '' -or $t -eq '~' -or $t -eq 'null') { return $null }
+  if ($t -eq '{}') { return [ordered]@{} }
+  if ($t -eq '[]') { return @() }
+  if ($t -eq 'true') { return $true }
+  if ($t -eq 'false') { return $false }
+  if ($t.Length -ge 2) {
+    if (($t[0] -eq '"' -and $t[$t.Length - 1] -eq '"') -or ($t[0] -eq "'" -and $t[$t.Length - 1] -eq "'")) {
+      return $t.Substring(1, $t.Length - 2)
+    }
+  }
+  return $t
+}
+
+function Split-WorkflowYamlKey {
+  param([string] $Content)
+  $i = $Content.IndexOf(':')
+  if ($i -lt 1) { throw "not a workflow mapping entry: $Content" }
+  return [pscustomobject]@{ Key = $Content.Substring(0, $i).Trim(); Rest = $Content.Substring($i + 1).Trim() }
+}
+
+function Set-WorkflowYamlEntry {
+  param($Tokens, [ref] $Index, [string] $Key, [string] $Rest, [int] $OwnerIndent, $Map)
+  if ($Rest -eq '') {
+    if ($Index.Value -lt $Tokens.Count -and $Tokens[$Index.Value].Indent -gt $OwnerIndent) {
+      $Map[$Key] = Read-WorkflowYamlNode $Tokens $Index $Tokens[$Index.Value].Indent
+    } else {
+      $Map[$Key] = $null
+    }
+  } else {
+    $Map[$Key] = Convert-WorkflowYamlScalar $Rest
+  }
+}
+
+function Read-WorkflowYamlMapping {
+  param($Tokens, [ref] $Index, [int] $Indent, $Target = $null)
+  $map = [ordered]@{}
+  if ($null -ne $Target) { $map = $Target }
+  while ($Index.Value -lt $Tokens.Count) {
+    $t = $Tokens[$Index.Value]
+    if ($t.Indent -lt $Indent) { break }
+    if ($t.Indent -gt $Indent) { throw "unexpected workflow indentation at line $($t.Line): $($t.Content)" }
+    if ($t.Content.StartsWith('-')) { break }
+    $kv = Split-WorkflowYamlKey $t.Content
+    $Index.Value++
+    Set-WorkflowYamlEntry $Tokens $Index $kv.Key $kv.Rest $Indent $map
+  }
+  return $map
+}
+
+function Read-WorkflowYamlSequence {
+  param($Tokens, [ref] $Index, [int] $Indent)
+  $list = [System.Collections.Generic.List[object]]::new()
+  while ($Index.Value -lt $Tokens.Count) {
+    $t = $Tokens[$Index.Value]
+    if ($t.Indent -ne $Indent -or -not $t.Content.StartsWith('-')) { break }
+    $itemText = $t.Content.Substring(1).Trim()
+    $Index.Value++
+    if ($itemText -eq '') {
+      if ($Index.Value -lt $Tokens.Count -and $Tokens[$Index.Value].Indent -gt $Indent) {
+        $list.Add((Read-WorkflowYamlNode $Tokens $Index $Tokens[$Index.Value].Indent))
+      } else {
+        $list.Add($null)
+      }
+      continue
+    }
+    if ($itemText -match '^[^:]+:(?:\s|$)') {
+      $itemIndent = $Indent + 2
+      $kv = Split-WorkflowYamlKey $itemText
+      $map = [ordered]@{}
+      Set-WorkflowYamlEntry $Tokens $Index $kv.Key $kv.Rest $itemIndent $map
+      if ($Index.Value -lt $Tokens.Count -and $Tokens[$Index.Value].Indent -eq $itemIndent -and
+          -not $Tokens[$Index.Value].Content.StartsWith('-')) {
+        $map = Read-WorkflowYamlMapping $Tokens $Index $itemIndent $map
+      }
+      $list.Add($map)
+    } else {
+      $list.Add((Convert-WorkflowYamlScalar $itemText))
+    }
+  }
+  return ,$list
+}
+
+function Read-WorkflowYamlNode {
+  param($Tokens, [ref] $Index, [int] $Indent)
+  $t = $Tokens[$Index.Value]
+  if ($t.Content.StartsWith('-')) { return Read-WorkflowYamlSequence $Tokens $Index $Indent }
+  return Read-WorkflowYamlMapping $Tokens $Index $Indent
+}
+
+function Read-WorkflowYamlFile {
+  param([string] $Path)
+  $tokens = Get-WorkflowYamlTokens -Lines ([System.IO.File]::ReadAllLines($Path))
+  if ($tokens.Count -eq 0) { throw "empty workflow file: $Path" }
+  $idx = 0
+  if ($tokens[0].Indent -ne 0) { throw "workflow root must start at column 0" }
+  $doc = Read-WorkflowYamlNode $tokens ([ref] $idx) 0
+  if ($idx -ne $tokens.Count) { throw "unparsed workflow YAML at line $($tokens[$idx].Line)" }
+  return $doc
+}
+
+function Get-PermissionSignature {
+  param($Permissions)
+  if ($null -eq $Permissions) { return '<missing>' }
+  if ($Permissions -isnot [System.Collections.IDictionary]) { return '<not-a-mapping>' }
+  $pairs = @($Permissions.Keys | Sort-Object | ForEach-Object { "$_=$($Permissions[$_])" })
+  return ($pairs -join ',')
+}
+
+$workflowPath = Join-Path $here '..' '..' '.github' 'workflows' 'build.yml'
+$workflow = Read-WorkflowYamlFile $workflowPath
+Assert-True ($workflow.Contains('jobs')) 'perm: build.yml has a jobs mapping'
+
+# D3 matrix: the ONLY scopes each job may hold.
+$expectedJobPermissions = [ordered]@{
+  'versions' = 'contents=read'
+  'lint'     = 'contents=read'
+  'ps-lint'  = 'contents=read'
+  'plan'     = ''
+  'build'    = 'contents=read,packages=write'
+  'merge'    = 'packages=write'
+  'smoke'    = 'contents=read,packages=read'
+  'export'   = 'contents=read,packages=read'
+  'publish'  = 'contents=write,packages=write'
+}
+
+$topPermissions = if ($workflow.Contains('permissions')) { $workflow['permissions'] } else { $null }
+Assert-True ($topPermissions -is [System.Collections.IDictionary]) 'perm: top-level permissions is a mapping'
+$topPermissionCount = if ($topPermissions -is [System.Collections.IDictionary]) { @($topPermissions.Keys).Count } else { -1 }
+Assert-Equal 0 $topPermissionCount 'perm: top-level permissions is exactly {} (no workflow-wide write scopes)'
+
+$actualJobs = @($workflow['jobs'].Keys)
+Assert-Equal (@($expectedJobPermissions.Keys | Sort-Object) -join ',') (@($actualJobs | Sort-Object) -join ',') 'perm: job set matches the D3 matrix (no unnamed job)'
+
+foreach ($jobName in $expectedJobPermissions.Keys) {
+  $job = $workflow['jobs'][$jobName]
+  Assert-True ($null -ne $job -and $job -is [System.Collections.IDictionary]) "perm: job $jobName exists and is a mapping"
+  $hasPermissions = $null -ne $job -and $job -is [System.Collections.IDictionary] -and $job.Contains('permissions')
+  Assert-True $hasPermissions "perm: $jobName declares its own permissions (no workflow default)"
+  $signature = if ($hasPermissions) { Get-PermissionSignature $job['permissions'] } else { '<missing>' }
+  Assert-Equal $expectedJobPermissions[$jobName] $signature "perm: $jobName scopes match the D3 matrix exactly"
+}
+
+# Every checkout but publish's must refuse to persist the token; publish pushes
+# the automation/versions state branch and keeps the default persisted credential.
+$checkoutTotal = 0
+foreach ($jobName in $actualJobs) {
+  $steps = @($workflow['jobs'][$jobName]['steps'])
+  $checkouts = @($steps | Where-Object {
+    $_ -is [System.Collections.IDictionary] -and $_.Contains('uses') -and "$($_['uses'])" -match '^actions/checkout@'
+  })
+  Assert-Equal 1 $checkouts.Count "perm: $jobName has exactly one actions/checkout step"
+  $checkoutTotal += $checkouts.Count
+  if ($checkouts.Count -ne 1) { continue }
+  $step = $checkouts[0]
+  $with = if ($step.Contains('with') -and $step['with'] -is [System.Collections.IDictionary]) { $step['with'] } else { $null }
+  $hasPersist = $null -ne $with -and $with.Contains('persist-credentials')
+  if ($jobName -eq 'publish') {
+    Assert-True (-not $hasPersist) 'perm: publish checkout keeps the default persisted credentials (it pushes automation/versions)'
+  } else {
+    Assert-True $hasPersist "perm: $jobName checkout sets persist-credentials"
+    if ($hasPersist) {
+      $persist = $with['persist-credentials']
+      Assert-True ($persist -is [bool] -and $persist -eq $false) "perm: $jobName checkout sets persist-credentials: false"
+    }
+  }
+}
+Assert-Equal 9 $checkoutTotal 'perm: all nine jobs account for their single checkout'
 
 # Converge: the removed installer entry points stay gone.
 foreach ($gone in @('install.cmd', 'agent-devbox.bat', 'agent-devbox-core.bat', 'import-distro.ps1')) {
@@ -1239,10 +1474,19 @@ Assert-True ($mainText -notmatch 'DATA_TASK') 'conf: installer no longer writes 
 $diskFn = [regex]::Match($ensureText, 'function Assert-DataDiskMounted[\s\S]*?\r?\n\}').Value
 Assert-True ($diskFn -ne '') 'repair: Assert-DataDiskMounted 仍存在'
 Assert-True ($diskFn -match '\[Parameter\(Mandatory\)\]\[string\] \$InstallDir') 'repair: Assert-DataDiskMounted 接收 -InstallDir'
-Assert-True ($diskFn -match "'FATAL\|boot failed'") 'repair: boot failed 立即判定失败（不再空等 45 秒）'
+Assert-True ($diskFn -match '\[int\] \$TimeoutSeconds = 90') 'repair: the boot-wait budget is 90s (attach+device+services+margin)'
+Assert-True ($diskFn -match 'Stopwatch') 'repair: the wait uses a Stopwatch budget'
+Assert-True ($diskFn -notmatch 'findmnt\s+-rno') 'repair: findmnt can never short-circuit the boot-log verdict'
+Assert-True ($diskFn -match 'boot failed: service=') 'repair: a service failure terminal line is reported as service+log'
+Assert-True ($diskFn -match 'boot failed: maintenance mode') 'repair: only a disk failure yields repair commands'
 Assert-True ($diskFn -match 'Join-Path \$InstallDir ''mount-datadisk\.cmd''') 'repair: 失败消息给出 mount-datadisk.cmd 的绝对路径'
 Assert-True ($diskFn -match 'wsl --terminate') 'repair: 失败消息给出 wsl --terminate <发行版>'
+Assert-True ($diskFn -match '未收到启动结果') 'repair: no terminal line says "no boot result", never "disk unmounted"'
 Assert-True ($mainText -match 'Assert-DataDiskMounted[^\r\n]*-InstallDir \$InstallDir') 'repair: 安装器把安装目录传给挂载断言'
+Assert-True ($mainText -match '无法读取启动日志基线') 'repair: a baseline read failure throws instead of silently becoming 0'
+Assert-True ($ensureText -match '--noproxy ''\*''[^\r\n]*%\{http_code\}') 'health: post-check bypasses proxies and requires the exact status code'
+Assert-True ($ensureText -match "env NO_PROXY='\*' no_proxy='\*'") 'health: post-check clears proxy env for loopback'
+Assert-True ($ensureText -match "\$TimeoutSeconds = 45") 'health: the independent old-rootfs post-check keeps its 45s budget'
 
 # --- PS 5.1 分片顺序脚本（无 BOM / 纯 ASCII，红门）------------------------
 # run.ps1 由 pwsh 跑，但生产主机是 PS 5.1；顺序逻辑必须在 5.1 下单独验证。
@@ -1318,7 +1562,124 @@ Assert-True ($ciText -match 'usr/bin/dash') 'ci: export checks the rootfs ELF'
 Assert-True ($ciText -match 'zstd -dc \| tar -xOf - usr/bin/dash') 'ci: split parts are arch-checked'
 Assert-True ($ciText -notmatch '--platform linux/amd64') 'ci: no hardcoded amd64 platform'
 Assert-True ($ciText -match 'retention-days:\s*3') 'ci: transient artifacts expire'
-Assert-True ($ciText -match 'needs: \[plan, export\]') 'ci: publish waits for both exports'
+
+# Slice a job block by the next job at the SAME (2-space) indentation, or EOF.
+# The old `(?=^  publish:)` slices silently swallowed anything that followed
+# when a job was renamed/moved; this keeps the block correct for any job order.
+function Get-CiJobBlock([string] $Name) {
+  $pattern = '(?ms)^  ' + [regex]::Escape($Name) + ':.*?(?=^  [A-Za-z0-9_-]+:\s*$|\z)'
+  return [regex]::Match($ciText, $pattern).Value
+}
+function Get-CiNeeds([string] $Block) {
+  $m = [regex]::Match($Block, '(?m)^    needs:\s*(.*)$')
+  if (-not $m.Success) { return @() }
+  $raw = $m.Groups[1].Value.Trim()
+  if ($raw -ne '') {
+    return @($raw.TrimStart('[').TrimEnd(']') -split ',' |
+      ForEach-Object { $_.Trim().Trim('"', "'") } | Where-Object { $_ })
+  }
+  # Block-style `needs:` list: gather subsequent `      - item` lines.
+  $items = @()
+  $rest = $Block.Substring($m.Index + $m.Length)
+  foreach ($line in ($rest -split "`r?`n")) {
+    if ($line -match '^\s{6}-\s*(.+?)\s*$') { $items += $matches[1].Trim().Trim('"', "'"); continue }
+    if ($line -match '^\s*$') { continue }
+    break
+  }
+  return $items
+}
+
+# --- CI: plan 的分支引用只经环境变量进 shell --------------------------------
+# ${{ }} 在 shell 之前做文本替换，分支名属于外部输入。plan 把带引号的
+# $GITHUB_REF 传给 release-tags.sh；脚本负责 main/non-main 分流。
+$planBlock = Get-CiJobBlock 'plan'
+Assert-True ($planBlock -match '(?m)^  plan:') 'ci: plan job text is found'
+Assert-True ($planBlock -notmatch '\$\{\{\s*github\.ref\s*\}\}') 'ci: plan shell does not interpolate github.ref'
+Assert-True ($planBlock -match '"\$GITHUB_REF"') 'ci: plan shell reads the quoted GITHUB_REF environment variable'
+Assert-True ($planBlock -match '--ref\s+"\$GITHUB_REF"') 'ci: plan passes the quoted GITHUB_REF to the tag resolver'
+Assert-True ($planBlock -match '--run-id\s+"\$GITHUB_RUN_ID"') 'ci: plan passes the run id from the environment'
+Assert-True ($planBlock -match '--attempt\s+"\$GITHUB_RUN_ATTEMPT"') 'ci: plan passes the run attempt from the environment'
+Assert-True ($planBlock -match 'release-tags\.sh\s+plan') 'ci: plan delegates tag formatting to the tested helper'
+
+# The helper is the executable contract used by ci-promotion.bats: exact
+# suffix formats, all three event branches, and rejection of bad run identity.
+$tagsScript = Get-Content -Raw (Join-Path $here '..' '..' '.github' 'scripts' 'release-tags.sh')
+Assert-True ($tagsScript -match 'tag="\$\{ts\}-\$\{run_id\}\.\$\{attempt\}"') 'ci: stable/push-main image tag carries the run suffix'
+Assert-True ($tagsScript -match 'release_tag="build-\$\{ts\}-\$\{run_id\}\.\$\{attempt\}"') 'ci: stable Release tag carries the run suffix'
+Assert-True ($tagsScript -match 'tag="beta-\$\{ts\}-\$\{run_id\}\.\$\{attempt\}"') 'ci: non-main image tag is beta-suffixed'
+Assert-True ($tagsScript -match 'release_tag="beta-\$\{ts\}-\$\{run_id\}\.\$\{attempt\}"') 'ci: beta Release tag carries the run suffix'
+Assert-True ($tagsScript -match "refs/heads/main") 'ci: helper keeps the main/non-main split'
+Assert-True ($tagsScript -match '\[1-9\]\[0-9\]\*') 'ci: helper rejects empty/zero run id and attempt'
+
+# --- CI: per-arch digests -> merged index digests -> digest-only smoke/export
+$buildBlock = Get-CiJobBlock 'build'
+$mergeBlock = Get-CiJobBlock 'merge'
+$smokeBlock = Get-CiJobBlock 'smoke'
+$exportBlock = Get-CiJobBlock 'export'
+$publishBlock = Get-CiJobBlock 'publish'
+
+Assert-True ($buildBlock -match '(?m)^\s+id:\s+core\s*$') 'ci: core build exposes an id for its digest'
+Assert-True ($buildBlock -match '(?m)^\s+id:\s+agents\s*$') 'ci: agents build exposes an id for its digest'
+Assert-True ($buildBlock -match 'steps\.core\.outputs\.digest') 'ci: agents build base uses the core digest'
+Assert-True ($buildBlock -match 'CORE_IMAGE=\$\{\{\s*env\.CORE_IMAGE\s*\}\}@\$\{\{\s*steps\.core\.outputs\.digest\s*\}\}') 'ci: CORE_IMAGE is an immutable per-arch digest'
+Assert-True ($buildBlock -match 'name:\s+digests-\$\{\{\s*matrix\.arch\s*\}\}') 'ci: each arch uploads a uniquely named digest artifact'
+Assert-True ($buildBlock -match 'digest-core-\$\{\{\s*matrix\.arch\s*\}\}') 'ci: core digest file is arch-scoped'
+Assert-True ($buildBlock -match 'digest-agents-\$\{\{\s*matrix\.arch\s*\}\}') 'ci: agents digest file is arch-scoped'
+
+Assert-True ($mergeBlock -match 'pattern:\s+digests-') 'ci: merge downloads the per-arch digest artifacts'
+Assert-True ($mergeBlock -match 'merge-digests\.sh') 'ci: merge uses the tested digest validator'
+Assert-True ($mergeBlock -match 'core_digest:\s*\$\{\{\s*steps\.merge\.outputs\.core_digest') 'ci: merge emits the core index digest'
+Assert-True ($mergeBlock -match 'agents_digest:\s*\$\{\{\s*steps\.merge\.outputs\.agents_digest') 'ci: merge emits the agents index digest'
+Assert-True ($mergeBlock -notmatch ':beta') 'ci: merge never moves the beta alias'
+
+Assert-True ($smokeBlock -match '@\$\{\{\s*needs\.merge\.outputs\.agents_digest\s*\}\}') 'ci: smoke runs the merged agents index digest'
+Assert-True ($smokeBlock -match '@\$\{\{\s*needs\.merge\.outputs\.core_digest\s*\}\}') 'ci: smoke runs the merged core index digest too'
+Assert-True ($smokeBlock -match 'smoke-core') 'ci: both image variants are smoke-tested'
+Assert-True ($smokeBlock -match '--platform "?linux/\$\{\{\s*matrix\.arch\s*\}\}"?') 'ci: smoke selects the matrix arch from the index'
+Assert-True ($smokeBlock -notmatch 'needs\.plan\.outputs\.tag') 'ci: smoke does not use a mutable candidate tag'
+
+Assert-True ($exportBlock -match '--build-arg BASE_IMAGE="\$img@\$digest"') 'ci: export derives from the merged index digest'
+Assert-True ($exportBlock -match 'needs\.merge\.outputs\.core_digest') 'ci: export pulls core by index digest'
+Assert-True ($exportBlock -match 'needs\.merge\.outputs\.agents_digest') 'ci: export pulls agents by index digest'
+
+# --- CI: publish gate, draft-first verification, alias order -----------------
+$needs = @(Get-CiNeeds $publishBlock | Sort-Object)
+Assert-Equal 'export,merge,plan,smoke' ($needs -join ',') 'ci: publish needs the full gate set {plan,merge,smoke,export}'
+Assert-True ($publishBlock -match 'draft:\s*true') 'ci: publish creates a draft Release first'
+Assert-True ($publishBlock -match 'Verify uploaded Release assets') 'ci: publish verifies the uploaded assets'
+Assert-True ($publishBlock -match '\.assets') 'ci: asset verification reads the Release asset list'
+Assert-True ($publishBlock -match '\.digest') 'ci: asset verification compares the uploaded digest'
+Assert-True ($publishBlock -match 'unzip -t') 'ci: publish tests the 1Panel archive'
+Assert-True ($publishBlock -match 'sha256sum -c SHA256SUMS') 'ci: publish verifies the staged parts manifest'
+Assert-True ($publishBlock -match 'gh release edit .*--draft=false') 'ci: publish publishes the verified draft'
+Assert-True ($publishBlock -match 'release-promote\.sh') 'ci: alias promotion is delegated to the tested helper'
+Assert-True ($publishBlock -match '--core-digest\s+"\$\{\{\s*needs\.merge\.outputs\.core_digest\s*\}\}"') 'ci: promotion uses the core index digest'
+Assert-True ($publishBlock -match '--agents-digest\s+"\$\{\{\s*needs\.merge\.outputs\.agents_digest\s*\}\}"') 'ci: promotion uses the agents index digest'
+Assert-True ($publishBlock -match 'promotion-state\.json') 'ci: promotion persists recovery state'
+Assert-True ($publishBlock -match 'Persist promotion recovery state') 'ci: recovery state is uploaded'
+Assert-True ($publishBlock -match '(?m)^\s+if:\s+always\(\)\s*$') 'ci: recovery state uploads even on failure'
+Assert-True ($publishBlock -match 'is-newer') 'ci: prune/state guard compares run order'
+Assert-True ($publishBlock -notmatch 'gh release delete[^\r\n]*\|\| true') 'ci: prune never swallows delete failures'
+
+$draftIdx   = $publishBlock.IndexOf('Create draft Release')
+$verifyIdx  = $publishBlock.IndexOf('Verify uploaded Release assets')
+$publishIdx = $publishBlock.IndexOf('Publish Release')
+$promoteIdx = $publishBlock.IndexOf('Promote channel alias by verified index digest')
+$stateIdx   = $publishBlock.IndexOf('Persist promotion recovery state')
+$pruneIdx   = $publishBlock.IndexOf('Prune older beta prereleases')
+$recordIdx  = $publishBlock.IndexOf('Record resolved upstream versions')
+Assert-True ($draftIdx -ge 0 -and $verifyIdx -gt $draftIdx) 'ci: draft Release exists before asset verification'
+Assert-True ($verifyIdx -gt $draftIdx -and $publishIdx -gt $verifyIdx) 'ci: assets are verified before the Release is published'
+Assert-True ($publishIdx -gt $verifyIdx -and $promoteIdx -gt $publishIdx) 'ci: alias moves only after the Release is published'
+Assert-True ($stateIdx -gt $promoteIdx) 'ci: recovery state follows the alias transaction'
+Assert-True ($pruneIdx -gt $promoteIdx) 'ci: prune runs after alias promotion'
+Assert-True ($recordIdx -gt $promoteIdx) 'ci: state update runs after alias promotion'
+
+# --- CI: per-channel serialization ------------------------------------------
+Assert-True ($ciText -match "'build-beta'") 'ci: push runs share the build-beta group'
+Assert-True ($ciText -match "'build-stable'") 'ci: schedule/dispatch runs share the build-stable group'
+Assert-True ($ciText -match 'cancel-in-progress:\s*false') 'ci: releases are never cancelled in progress'
+Assert-True ($ciText -match 'queue:\s*max') 'ci: pending release runs queue instead of replacing each other'
 
 # --- 镜像分层：通用开发工具进 OCI，Docker/PowerShell 只进 WSL rootfs -------
 $ociDockerfile = Get-Content -Raw (Join-Path $here '..' '..' 'Dockerfile')
@@ -1348,16 +1709,42 @@ Assert-True ($wslDockerfile -match 'docker --version') 'wsl: build proves the do
 Assert-True ($wslDockerfile -match 'ARG POWERSHELL_VERSION=7\.6\.7') 'wsl: PowerShell is pinned'
 Assert-True ($wslDockerfile -match 'powershell_\$\{POWERSHELL_VERSION\}-1\.deb_\$\{arch\}\.deb') 'wsl: PowerShell .deb is arch-mapped'
 Assert-True ($wslDockerfile -match 'pwsh -NoProfile') 'wsl: overlay smoke-runs pwsh'
-$exportBlock = [regex]::Match($ciText, '(?ms)^  export:.*?(?=^  publish:)').Value
-Assert-True ($exportBlock -match 'actions/checkout@v7') 'ci: export checks out the overlay Dockerfile'
+Assert-True ($exportBlock -match 'actions/checkout@[0-9a-f]{40}') 'ci: export checks out the overlay Dockerfile'
 Assert-True ($exportBlock -match 'Dockerfile\.wsl') 'ci: export builds the WSL overlay'
 Assert-True ($exportBlock -match '--build-arg BASE_IMAGE=') 'ci: overlay derives from the built image'
 Assert-True ($exportBlock -match '\$TAG-wsl') 'ci: export uses the overlay tag'
 Assert-True ($exportBlock -match 'docker rmi -f "\$img:\$TAG-wsl"') 'ci: overlay image is removed after export'
 Assert-True ($ciText -match '(?m)^\s+- "Dockerfile\.wsl"\r?$') 'ci: overlay changes trigger a build'
-$smokeBlock = [regex]::Match($ciText, '(?ms)^  smoke:.*?(?=^  export:)').Value
 Assert-True ($smokeBlock -match 'dockerd') 'ci: smoke proves the OCI image has no dockerd'
 Assert-True ($smokeBlock -match 'pwsh') 'ci: smoke proves the OCI image has no pwsh'
+
+# --- boot-wait mock cases (no real WSL): service terminal, baseline, polls ---
+$script:MockBootCalls = 0
+$script:MockBootPlan = @()
+$script:MockBootScripts = @()
+function Invoke-WslBashScript {
+  param([string] $Distro, [string] $Script)
+  $script:MockBootCalls++
+  $script:MockBootScripts += $Script
+  if ($script:MockBootPlan.Count -eq 0) { return @() }
+  $idx = [Math]::Min($script:MockBootCalls - 1, $script:MockBootPlan.Count - 1)
+  return $script:MockBootPlan[$idx]
+}
+$svcLine = '[wsl-boot 2026-01-01T00:00:00+00:00] boot failed: service=paseo reason=timeout log=/var/log/paseo-boot.log'
+$script:MockBootPlan = @(@($svcLine))
+$threw = $false
+$msg = ''
+try { Assert-DataDiskMounted -Distro d -MountName m -InstallDir 'C:\x' -SinceLine 5 | Out-Null } catch { $threw = $true; $msg = "$($_.Exception.Message)" }
+Assert-True $threw 'mock: a service terminal line throws'
+Assert-True ($msg -match 'paseo' -and $msg -match '未就绪') 'mock: the service failure names the service'
+Assert-True ($msg -notmatch 'mount-datadisk\.cmd') 'mock: a service failure never prints disk-repair commands'
+Assert-True ($script:MockBootScripts[-1] -match 'tail -n \+6') 'mock: only lines after the baseline are read (an OLD complete cannot win)'
+$script:MockBootCalls = 0
+$script:MockBootScripts = @()
+$script:MockBootPlan = @(@(), @('[wsl-boot 2026-01-01T00:00:00+00:00] boot complete'))
+$ok = Assert-DataDiskMounted -Distro d -MountName m -InstallDir 'C:\x' -SinceLine 0
+Assert-True ($ok -eq $true) 'mock: a new complete line after an empty poll succeeds'
+Assert-Equal 2 $script:MockBootCalls 'mock: the waiter polls until the terminal line arrives'
 
 Write-Host ''
 if ($script:Failed -gt 0) {

@@ -1,0 +1,7 @@
+paths:
+  .github/workflows/build.yml:
+    ignore:
+      # actionlint 1.7.12 (2026-03-30) predates GitHub's `concurrency.queue`
+      # key (May 2026). Remove this entry once the pinned actionlint image
+      # understands `queue: max`.
+      - 'unexpected key "queue" for "concurrency" section'
