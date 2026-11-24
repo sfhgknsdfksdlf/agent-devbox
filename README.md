@@ -21,11 +21,44 @@
 
 ## 快速开始 —— Docker
 
+`DATA_DIR` 是**必填**的绝对路径，用来指定持久化数据放在哪；没有 `./data` 默认值，也不会自动创建：
+
 ```bash
-cp .env.example .env      # 设置 PASEO_PASSWORD（必填）
+cp .env.example .env
+# 编辑 .env：设置 PASEO_PASSWORD（必填），并把 DATA_DIR 设为绝对路径
+DATA_DIR=/srv/agent-devbox
+export DATA_DIR
+mkdir -p "$DATA_DIR"/{home,root,project}
 docker compose up -d
 # 浏览器打开 http://localhost:6767
 ```
+
+compose 挂四个目录：`${DATA_DIR}/home` → `/home`、`${DATA_DIR}/root` → `/root`、
+`${DATA_DIR}/project` → `/workspace`，以及只读的 `${DATA_DIR}` → `/run/agent-devbox/data`。
+子目录必须事先存在（`create_host_path: false`）；即使挂错，entrypoint 也会在写入或启动任何服务之前用
+`stat %d:%i` 比对只读基准并 fail closed。首次启动补建 `/home/paseo`（1000:1000）、`/root`（0:0、0700）、
+`/workspace`，只补缺失的 skeleton（来自 `/etc/skel` + `/opt/agent-seed`），并重建桌面版 CLI 链接。
+
+## 内置 MCP（11 个）
+
+| MCP | 类型 | 来源 / 启动 | 说明 |
+|---|---|---|---|
+| `memory` | 本地常驻 | `mcp-memory-service`（PyPI） | 每个 UID 一个只监听回环的 HTTP 服务，插件自动捕获记忆 |
+| `websearch` | 本地 stdio | `open-websearch`（npm 全局） | 同一个 key 覆盖 omo 自带的 Exa 搜索 |
+| `tavily` | 远程 | `https://mcp.tavily.com/mcp/` | 免 key（`X-Tavily-Access-Mode: keyless`），只能 search/extract；crawl/map/research 需要 key |
+| `context7` | 内置 | omo 运行时注入 | 文档查询 |
+| `grep_app` | 内置 | omo 运行时注入 | GitHub 代码搜索 |
+| `lsp` | 内置 | omo 运行时注入 | LSP 工具 |
+| `shadcn` | 本地 stdio | `shadcn mcp` | 在当前项目目录工作 |
+| `wails3` | 本地 stdio | `wails3 mcp` | Wails3 工具 |
+| `playwright` | 本地 stdio | `@playwright/mcp` | headless、isolated，使用 `/usr/local/bin/chromium` |
+| `deepwiki` | 远程 | `https://mcp.deepwiki.com/mcp` | 免 key，仅公开仓库 |
+| `delve` | 本地 stdio | `mcp-dap-server` | Delve 调试适配器，默认启用 |
+
+全局定义分两处：`/etc/opencode/opencode.json` 是 OpenCode V1 的 managed 全局配置（最后应用），只写
+**8 个非 omo** 条目（`memory`、`websearch`、`tavily`、`shadcn`、`wails3`、`playwright`、`deepwiki`、`delve`）；
+`context7`、`grep_app`、`lsp` 由 omo 在运行时注入，不能写进该文件。该文件**没有 `plugin` 键**（否则会替换
+omo 自己的插件数组）；记忆插件从 `~/.config/opencode/plugins/memory-plugin.js` 自动发现。
 
 ## 快速开始 —— WSL
 

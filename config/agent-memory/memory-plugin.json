@@ -1,0 +1,8 @@
+{
+  "autoCapture": {
+    "enabled": true
+  },
+  "memoryService": {
+    "includeProjectTag": true
+  }
+}

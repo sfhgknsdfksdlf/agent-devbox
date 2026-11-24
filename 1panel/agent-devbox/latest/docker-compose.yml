@@ -15,7 +15,9 @@ services:
       PASEO_PASSWORD: ${PASEO_PASSWORD}
       TZ: ${TZ}
     volumes:
-      - ./data/home:/home/paseo
+      - ./data:/run/agent-devbox/data:ro
+      - ./data/home:/home
+      - ./data/root:/root
       - ./data/project:/workspace
     labels:
       createdBy: "Apps"

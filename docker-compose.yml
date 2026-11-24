@@ -25,10 +25,34 @@ services:
       # To allow extra DNS hostnames (reverse proxy), also add a line like:
       #   PASEO_HOSTNAMES: "paseo.example.com,.lan"
     volumes:
-      # ${DATA_DIR}/home    -> paseo state + agent config/credentials
-      # ${DATA_DIR}/project -> your code
-      - "${DATA_DIR:-./data}/home:/home/paseo"
-      - "${DATA_DIR:-./data}/project:/workspace"
+      # The WHOLE home tree lives on the host: /home, /root and /workspace are
+      # bind-mounted from DATA_DIR, so agent config/credentials, caches and
+      # plugin state persist across image upgrades. DATA_DIR is explicit (no
+      # default) and each subdirectory must already exist (create_host_path is
+      # off). The whole DATA_DIR is also mounted READ-ONLY at
+      # /run/agent-devbox/data; the entrypoint compares stat %d:%i there against
+      # each target and fails closed before any write if a bind is wrong.
+      - type: bind
+        source: "${DATA_DIR:?set DATA_DIR}"
+        target: /run/agent-devbox/data
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: "${DATA_DIR:?set DATA_DIR}/home"
+        target: /home
+        bind:
+          create_host_path: false
+      - type: bind
+        source: "${DATA_DIR:?set DATA_DIR}/root"
+        target: /root
+        bind:
+          create_host_path: false
+      - type: bind
+        source: "${DATA_DIR:?set DATA_DIR}/project"
+        target: /workspace
+        bind:
+          create_host_path: false
 
   # Health self-healing: restarts the container if its healthcheck fails.
   autoheal:

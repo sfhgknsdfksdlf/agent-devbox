@@ -38,9 +38,14 @@
 
 ## 4. 数据在哪
 
-数据都写在应用实例目录下的 `data/`：
+数据都写在应用实例目录下的 `data/`，容器里对应四个挂载：
 
-- `data/home/` → 容器里的 `/home/paseo`
+- `data/` → `/run/agent-devbox/data`（只读，身份基准）
+- `data/home/` → 容器里的 `/home`
+- `data/root/` → 容器里的 `/root`
 - `data/project/` → 容器里的 `/workspace`
 
-升级或重装应用不会动这两个目录；删应用前先备份 `data/`。
+1Panel 的 compose 用的是短语法，启动时 Docker 会自动补建缺失的 `data/...` 目录。真正的保护是容器的
+preflight：它在任何写入或启动服务之前，用 `stat -c '%d:%i'` 比对 `/run/agent-devbox/data/{home,root,project}`
+与三个目标；不一致就 fail closed。首启还会把 `/home/paseo` 设为 1000:1000、`/root` 设为 0:0（0700），
+只补缺失的 skeleton。升级或重装应用不会动这些目录；删应用前先备份 `data/`。

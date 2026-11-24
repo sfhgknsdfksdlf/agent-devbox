@@ -1299,6 +1299,20 @@ main() {
   # live on the data disk, so an image-side link alone cannot repair an upgrade) -
   ensure_opencode_shim /root /home/*
 
+  # --- agent memory for root: start it in the boot namespace, bounded so the
+  #     installer's 90s assertion and the 30s service deadline still hold -----
+  MEMORY_SUPERVISOR="${AGENT_DEVBOX_MEMORY_SUPERVISOR:-/usr/local/bin/memory-supervisor.sh}"
+  if [ -x "$MEMORY_SUPERVISOR" ]; then
+    if AGENT_DEVBOX_MEMORY_HEALTH_TIMEOUT="${AGENT_DEVBOX_WSL_MEMORY_HEALTH_TIMEOUT:-20}" \
+      "$MEMORY_SUPERVISOR" ensure 0 /root; then
+      log "agent memory（root）已就绪"
+    else
+      log "警告：agent memory（root）首次初始化未在预算内就绪（后续启动会自动复用）；见 /run/agent-memory/0/service.log"
+    fi
+  else
+    log "警告：未找到 memory-supervisor.sh，跳过 root 记忆服务"
+  fi
+
   # --- required services: the overlay variant needs dockerd AND paseo -------
   # The MOTD is cleared only after every required probe passed in the same
   # round; `boot complete` is emitted exactly once, here, on success.

@@ -295,6 +295,27 @@ fi
 # Seed missing config as paseo.
 "$GOSU_BIN" "$PASEO_USER" "$ENV_BIN" HOME="$PASEO_HOME_DIR" "$SEED_BIN"
 
+# Agent memory for the daemon's user: start/reuse the resident service and
+# install its missing-only OpenCode assets before the daemon inherits the env.
+# Docker has no external boot deadline, so it may wait for the first-run model
+# download; WSL has a 30s service deadline / 90s installer budget, so it only
+# waits briefly and the endpoint is published on the next ensure (next boot).
+MEMORY_SUPERVISOR="${AGENT_DEVBOX_MEMORY_SUPERVISOR:-$(command -v memory-supervisor.sh 2>/dev/null || true)}"
+MEMORY_ENV="${AGENT_DEVBOX_MEMORY_ENV:-$(command -v memory-env.sh 2>/dev/null || true)}"
+if [ "${IS_DOCKER:-false}" = "true" ]; then
+  MEMORY_HEALTH_TIMEOUT="${AGENT_DEVBOX_MEMORY_HEALTH_TIMEOUT:-180}"
+else
+  MEMORY_HEALTH_TIMEOUT="${AGENT_DEVBOX_PASEO_MEMORY_HEALTH_TIMEOUT:-8}"
+fi
+if [ -n "$MEMORY_SUPERVISOR" ] && [ -x "$MEMORY_SUPERVISOR" ]; then
+  if ! AGENT_DEVBOX_MEMORY_HEALTH_TIMEOUT="$MEMORY_HEALTH_TIMEOUT" \
+    "$MEMORY_SUPERVISOR" ensure "$PASEO_UID" "$PASEO_HOME_DIR"; then
+    echo "WARN: agent memory (uid $PASEO_UID) did not become healthy; continuing without it." >&2
+  fi
+else
+  echo "WARN: memory-supervisor.sh not found; continuing without the memory MCP." >&2
+fi
+
 # Idempotent persisted settings (best-effort: daemon run also gets the env below).
 if ! "$GOSU_BIN" "$PASEO_USER" "$ENV_BIN" HOME="$PASEO_HOME_DIR" PASEO_HOME="$PASEO_HOME" \
   paseo daemon config set daemon.listen "$PASEO_LISTEN" >/dev/null 2>&1; then
@@ -307,6 +328,15 @@ fi
 
 # A dead/reused PID in the persisted pidfile must not block the daemon.
 clear_stale_pidfile
+
+# The daemon's OpenCode children inherit this process env, so publish the memory
+# endpoint/key here (sourced in this shell) right before the final exec.
+if [ -n "$MEMORY_ENV" ] && [ -r "$MEMORY_ENV" ]; then
+  # shellcheck source=/dev/null
+  AGENT_DEVBOX_MEMORY_UID="$PASEO_UID" \
+    AGENT_DEVBOX_MEMORY_HOME="$PASEO_HOME_DIR" \
+    . "$MEMORY_ENV"
+fi
 
 # Foreground daemon as paseo, with the deployment env overrides.
 exec "$GOSU_BIN" "$PASEO_USER" "$ENV_BIN" \

@@ -1745,6 +1745,7 @@ Assert-True ($tagsScript -match "refs/heads/main") 'ci: helper keeps the main/no
 Assert-True ($tagsScript -match '\[1-9\]\[0-9\]\*') 'ci: helper rejects empty/zero run id and attempt'
 
 # --- CI: per-arch digests -> merged index digests -> digest-only smoke/export
+$lintBlock = Get-CiJobBlock 'lint'
 $buildBlock = Get-CiJobBlock 'build'
 $mergeBlock = Get-CiJobBlock 'merge'
 $smokeBlock = Get-CiJobBlock 'smoke'
@@ -1758,6 +1759,7 @@ Assert-True ($buildBlock -match 'CORE_IMAGE=\$\{\{\s*env\.CORE_IMAGE\s*\}\}@\$\{
 Assert-True ($buildBlock -match 'name:\s+digests-\$\{\{\s*matrix\.arch\s*\}\}') 'ci: each arch uploads a uniquely named digest artifact'
 Assert-True ($buildBlock -match 'digest-core-\$\{\{\s*matrix\.arch\s*\}\}') 'ci: core digest file is arch-scoped'
 Assert-True ($buildBlock -match 'digest-agents-\$\{\{\s*matrix\.arch\s*\}\}') 'ci: agents digest file is arch-scoped'
+Assert-True ($lintBlock -match '(?s)name:\s+compose config.*?run:\s+DATA_DIR=') 'ci: compose lint step passes a temporary DATA_DIR'
 
 Assert-True ($mergeBlock -match 'pattern:\s+digests-') 'ci: merge downloads the per-arch digest artifacts'
 Assert-True ($mergeBlock -match 'merge-digests\.sh') 'ci: merge uses the tested digest validator'
@@ -1867,6 +1869,44 @@ Assert-True ($publishBlock -match '--manifest\s+"\$base"') 'ci: merge uses the s
 $seedIdx = $publishBlock.IndexOf('cp versions.json "$RUNNER_TEMP/versions-seed.json"')
 $stateCheckoutIdx = $publishBlock.IndexOf('git checkout -B automation/versions')
 Assert-True ($seedIdx -ge 0 -and $stateCheckoutIdx -gt $seedIdx) 'ci: the v2 seed is captured before the state checkout'
+
+# --- CI/T4: MCP cache-busting, fixed pins, and managed MCP smoke coverage ---
+# A RUN whose only changing input is an unreferenced ARG stays cached, so the
+# @latest adapters would freeze; the run identity must reach the build args.
+Assert-True ($buildBlock -match 'CACHEBUST=\$\{\{\s*github\.run_id\s*\}\}\.\$\{\{\s*github\.run_attempt\s*\}\}') 'ci: core build busts the MCP layer cache per run'
+Assert-True ($buildBlock -match 'Verify pinned MCP versions') 'ci: build has a named per-arch MCP pin check'
+Assert-True ($buildBlock -match 'ARG\s+MMS_VERSION=') 'ci: build reads the MMS_VERSION pin from the Dockerfile'
+Assert-True ($buildBlock -match 'ARG\s+MCP_DAP_VERSION=') 'ci: build reads the MCP_DAP_VERSION pin from the Dockerfile'
+Assert-True ($buildBlock -match '\.tools\["mcp-memory-service"\]') 'ci: build compares the installed memory service version'
+Assert-True ($buildBlock -match '\.tools\["mcp-dap-server"\]') 'ci: build compares the installed DAP server version'
+Assert-True ($buildBlock -match '\[ "\$got_mms" = "\$mms" \]') 'ci: build fails a missing/drifted memory service pin'
+Assert-True ($buildBlock -match '\[ "\$got_dap" = "\$dap" \]') 'ci: build fails a missing/drifted DAP server pin'
+
+Assert-True ($publishBlock -match 'ARG\s+MMS_VERSION=') 'ci: publish reads the MMS_VERSION pin from the Dockerfile'
+Assert-True ($publishBlock -match 'ARG\s+MCP_DAP_VERSION=') 'ci: publish reads the MCP_DAP_VERSION pin from the Dockerfile'
+Assert-True ($publishBlock -match '\.tools\["mcp-memory-service"\]') 'ci: publish compares the memory service version on every arch'
+Assert-True ($publishBlock -match '\.tools\["mcp-dap-server"\]') 'ci: publish compares the DAP server version on every arch'
+Assert-True ($publishBlock -match '\[ "\$got_mms" = "\$mms" \]') 'ci: publish blocks promotion on a memory service pin drift'
+Assert-True ($publishBlock -match '\[ "\$got_dap" = "\$dap" \]') 'ci: publish blocks promotion on a DAP server pin drift'
+Assert-True ($publishBlock -match 'for arch in amd64 arm64') 'ci: publish validates both architectures'
+
+$smokeMmsMatch = [regex]::Match($smokeBlock, '(?s)Managed MCP config and adapters.*?(?=\r?\n      - name:|\z)').Value
+Assert-True ($smokeMmsMatch -match '/etc/opencode/opencode\.json') 'ci: smoke checks the managed OpenCode config'
+Assert-True ($smokeMmsMatch -match '\[ "\$mode" = "644" \]') 'ci: smoke checks the managed config mode (0644)'
+Assert-True ($smokeMmsMatch -match '\.mcp\s*\|\s*length\s*==\s*8') 'ci: smoke requires the eight managed MCP keys'
+Assert-True ($smokeMmsMatch -match 'deepwiki,delve,memory,playwright,shadcn,tavily,wails3,websearch') 'ci: smoke pins the exact eight managed MCP keys'
+Assert-True ($smokeMmsMatch -match '\bcontext7\b') 'ci: smoke forbids context7 in the managed config'
+Assert-True ($smokeMmsMatch -match '\bgrep_app\b') 'ci: smoke forbids grep_app in the managed config'
+Assert-True ($smokeMmsMatch -match '\blsp\b') 'ci: smoke forbids lsp in the managed config'
+Assert-True ($smokeMmsMatch -match 'for bin in open-websearch shadcn playwright-mcp memory mcp-dap-server wails3') 'ci: smoke proves every adapter binary is installed'
+Assert-True ($smokeBlock -notmatch 'length\s*==\s*11') 'ci: smoke never hard-gates on the 11 runtime MCP keys'
+
+Assert-True ($smokeBlock -match 'home:/home') 'ci: smoke binds a temporary DATA_DIR/home'
+Assert-True ($smokeBlock -match 'root:/root') 'ci: smoke binds a temporary DATA_DIR/root'
+Assert-True ($smokeBlock -match 'project:/workspace') 'ci: smoke binds a temporary DATA_DIR/project'
+Assert-True ($smokeBlock -match ':/run/agent-devbox/data:ro') 'ci: smoke exposes the read-only DATA_DIR baseline'
+Assert-True ($smokeBlock -match '-e DATA_DIR=') 'ci: smoke passes DATA_DIR to the entrypoint'
+Assert-True ($smokeBlock -match 'seq 1 (8[0-9]|9[0-9]|[1-9][0-9]{2,})') 'ci: smoke health wait budget is at least 80 attempts (240s)'
 
 # --- CI: per-channel serialization ------------------------------------------
 Assert-True ($ciText -match "'build-beta'") 'ci: push runs share the build-beta group'

@@ -1,0 +1,59 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "memory": {
+      "type": "remote",
+      "url": "{env:OPENCODE_MEMORY_ENDPOINT}/mcp",
+      "headers": {
+        "X-API-Key": "{env:OPENCODE_MEMORY_API_KEY}"
+      },
+      "oauth": false,
+      "enabled": true
+    },
+    "websearch": {
+      "type": "local",
+      "command": ["/usr/local/bin/open-websearch"],
+      "environment": {
+        "MODE": "stdio",
+        "DEFAULT_SEARCH_ENGINE": "bing",
+        "ALLOWED_SEARCH_ENGINES": "bing,baidu",
+        "SEARCH_MODE": "request",
+        "PLAYWRIGHT_NAVIGATION_TIMEOUT_MS": "20000"
+      },
+      "enabled": true
+    },
+    "tavily": {
+      "type": "remote",
+      "url": "https://mcp.tavily.com/mcp/",
+      "headers": {
+        "X-Tavily-Access-Mode": "keyless"
+      },
+      "enabled": true
+    },
+    "shadcn": {
+      "type": "local",
+      "command": ["/usr/local/bin/shadcn", "mcp"],
+      "enabled": true
+    },
+    "wails3": {
+      "type": "local",
+      "command": ["/usr/local/bin/wails3", "mcp"],
+      "enabled": true
+    },
+    "playwright": {
+      "type": "local",
+      "command": ["/usr/local/bin/playwright-mcp-launcher.sh"],
+      "enabled": true
+    },
+    "deepwiki": {
+      "type": "remote",
+      "url": "https://mcp.deepwiki.com/mcp",
+      "enabled": true
+    },
+    "delve": {
+      "type": "local",
+      "command": ["/usr/local/bin/mcp-dap-launcher.sh"],
+      "enabled": true
+    }
+  }
+}

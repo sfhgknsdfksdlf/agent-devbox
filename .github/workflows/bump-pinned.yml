@@ -1,9 +1,10 @@
 # =============================================================================
 # bump-pinned — every 6 months, move the manually-pinned build ARGs
-# (PLAYWRIGHT_VERSION, GO_VERSION) to the latest upstream, then rebuild.
+# (PLAYWRIGHT_VERSION, GO_VERSION, MMS_VERSION, MCP_DAP_VERSION) to the latest
+# upstream, then rebuild.
 #
 # The floating packages (OpenCode, omo, wrangler, ...) refresh on the regular
-# weekly build; these two are pinned on purpose so they only move on this
+# weekly build; these four are pinned on purpose so they only move on this
 # slower cadence. A run with no upstream change does nothing.
 #
 # GO_VERSION moves together with BOTH linux sha256 rows in
@@ -11,6 +12,12 @@
 # verifies the tarball against that manifest before extracting it. Everything
 # else in the manifest (uv, marksman, PowerShell) and the base-image/core-image
 # digests are reviewed by a human and are NEVER touched by this workflow.
+#
+# MMS_VERSION (PyPI mcp-memory-service) and MCP_DAP_VERSION (Go module
+# github.com/go-delve/mcp-dap-server) move together with their versions.json
+# `fixed` entries: both files are staged in temps, verified, then renamed as
+# one change. The DAP version keeps its leading `v` verbatim because it may be
+# a full Go pseudo-version, so it is compared as an exact string.
 #
 # NOTE: a `git push` made with the workflow GITHUB_TOKEN does NOT trigger other
 # workflows, so we explicitly dispatch build.yml (workflow_dispatch is the
@@ -35,12 +42,41 @@ jobs:
         with:
           ref: main
 
+      - name: Read the pinned Go version
+        id: go_version
+        run: |
+          set -euo pipefail
+          go_ver="$(sed -n 's/^ARG GO_VERSION=//p' Dockerfile | head -1)"
+          if [ -z "$go_ver" ]; then
+            echo "ERROR: GO_VERSION not found in Dockerfile" >&2
+            exit 1
+          fi
+          echo "version=$go_ver" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version: ${{ steps.go_version.outputs.version }}
+          cache: false
+
       - name: Bump the pinned ARGs if upstream moved
         id: bump
         run: |
           set -euo pipefail
 
           pw="$(curl -fsSL https://registry.npmjs.org/playwright/latest | jq -r '.version')"
+
+          # A failed/empty/mis-shaped query must abort, never be skipped as
+          # "unchanged". The DAP module version keeps its leading `v`.
+          mms="$(curl -fsSL https://pypi.org/pypi/mcp-memory-service/json | jq -er '.info.version')"
+          dap="$(go list -m -json github.com/go-delve/mcp-dap-server@latest | jq -er '.Version')"
+          if ! printf '%s\n' "$mms" | grep -Eq '^[0-9]+(\.[0-9]+)+([.+_-][0-9A-Za-z.+_-]+)?$'; then
+            echo "ERROR: unexpected PyPI version for mcp-memory-service: '$mms'" >&2
+            exit 1
+          fi
+          if ! printf '%s\n' "$dap" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$'; then
+            echo "ERROR: unexpected Go module version for mcp-dap-server: '$dap'" >&2
+            exit 1
+          fi
 
           # Stable channel only: the first entry is the newest stable release.
           go_json="$(curl -fsSL 'https://go.dev/dl/?mode=json')"
@@ -66,8 +102,12 @@ jobs:
 
           cur_pw="$(sed -n 's/^ARG PLAYWRIGHT_VERSION=//p' Dockerfile | head -1)"
           cur_go="$(sed -n 's/^ARG GO_VERSION=//p' Dockerfile | head -1)"
+          cur_mms="$(sed -n 's/^ARG MMS_VERSION=//p' Dockerfile | head -1)"
+          cur_dap="$(sed -n 's/^ARG MCP_DAP_VERSION=//p' Dockerfile | head -1)"
           echo "playwright: $cur_pw -> $pw"
           echo "go:         $cur_go -> $go"
+          echo "mcp-memory-service: $cur_mms -> $mms"
+          echo "mcp-dap-server:     $cur_dap -> $dap"
 
           scripts/image-assets.sh verify-manifest config/image-assets.sha256
 
@@ -84,6 +124,42 @@ jobs:
             changed=1
           fi
 
+          mms_changed=0
+          if [ "$mms" != "$cur_mms" ]; then mms_changed=1; fi
+          dap_changed=0
+          if [ "$dap" != "$cur_dap" ]; then dap_changed=1; fi
+
+          if [ "$mms_changed" -eq 1 ] || [ "$dap_changed" -eq 1 ]; then
+            # Dockerfile ARGs and versions.json move as one change: stage both
+            # copies, verify them, then rename both. Any failure aborts before
+            # a single file is replaced.
+            tmp_df="$(mktemp "$PWD/.Dockerfile.bump.XXXXXX")"
+            tmp_vj="$(mktemp "$PWD/.versions.json.bump.XXXXXX")"
+            chmod 0644 "$tmp_df" "$tmp_vj"
+            cp Dockerfile "$tmp_df"
+            cp versions.json "$tmp_vj"
+            if [ "$mms_changed" -eq 1 ]; then
+              sed -i "s|^ARG MMS_VERSION=.*|ARG MMS_VERSION=$mms|" "$tmp_df"
+            fi
+            if [ "$dap_changed" -eq 1 ]; then
+              sed -i "s|^ARG MCP_DAP_VERSION=.*|ARG MCP_DAP_VERSION=$dap|" "$tmp_df"
+            fi
+            jq --arg mms "$mms" --arg dap "$dap" \
+              '.fixed["tool:mcp-memory-service"].version = $mms
+               | .fixed["tool:mcp-dap-server"].version = $dap' \
+              "$tmp_vj" > "$tmp_vj.new"
+            mv "$tmp_vj.new" "$tmp_vj"
+            grep -qF "ARG MMS_VERSION=$mms" "$tmp_df"
+            grep -qF "ARG MCP_DAP_VERSION=$dap" "$tmp_df"
+            jq -e --arg mms "$mms" \
+              '.fixed["tool:mcp-memory-service"].version == $mms' "$tmp_vj" >/dev/null
+            jq -e --arg dap "$dap" \
+              '.fixed["tool:mcp-dap-server"].version == $dap' "$tmp_vj" >/dev/null
+            mv "$tmp_df" Dockerfile
+            mv "$tmp_vj" versions.json
+            changed=1
+          fi
+
           if [ "$changed" -eq 0 ]; then
             echo "already up to date"
             exit 0
@@ -93,11 +169,17 @@ jobs:
           grep -qF "ARG GO_VERSION=$go" Dockerfile
           grep -qF "go${go}.linux-amd64.tar.gz" config/image-assets.sha256
           grep -qF "go${go}.linux-arm64.tar.gz" config/image-assets.sha256
+          grep -qF "ARG MMS_VERSION=$mms" Dockerfile
+          grep -qF "ARG MCP_DAP_VERSION=$dap" Dockerfile
+          jq -e --arg mms "$mms" \
+            '.fixed["tool:mcp-memory-service"].version == $mms' versions.json >/dev/null
+          jq -e --arg dap "$dap" \
+            '.fixed["tool:mcp-dap-server"].version == $dap' versions.json >/dev/null
 
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add Dockerfile config/image-assets.sha256
-          git commit -m "chore: bump pinned Playwright/Go"
+          git add Dockerfile versions.json config/image-assets.sha256
+          git commit -m "chore: bump pinned Playwright/Go/mcp-memory-service/mcp-dap-server"
           git push origin main
           echo "changed=true" >> "$GITHUB_OUTPUT"
 

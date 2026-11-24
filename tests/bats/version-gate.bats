@@ -126,9 +126,14 @@ teardown() {
   run "$SCRIPT" --emit manifest --manifest "$REPO_ROOT/versions.json"
   [ "$status" -eq 0 ]
   printf '%s' "$output" | jq -e '.schemaVersion == 2' >/dev/null
-  printf '%s' "$output" | jq -e '(.floating | length) == 16' >/dev/null
+  printf '%s' "$output" | jq -e '(.floating | length) == 19' >/dev/null
   printf '%s' "$output" | jq -e '.floating["npm:@getpaseo/cli"].package == "@getpaseo/cli"' >/dev/null
   printf '%s' "$output" | jq -e '.floating["pypi:aider-chat"].ecosystem == "pypi"' >/dev/null
+  printf '%s' "$output" | jq -e '.floating["npm:open-websearch"].package == "open-websearch"' >/dev/null
+  printf '%s' "$output" | jq -e '.floating["npm:shadcn"].package == "shadcn"' >/dev/null
+  printf '%s' "$output" | jq -e '.floating["npm:@playwright/mcp"].package == "@playwright/mcp"' >/dev/null
+  printf '%s' "$output" | jq -e '.fixed["tool:mcp-memory-service"] == {"kind":"pypi","version":"13.0.0"}' >/dev/null
+  printf '%s' "$output" | jq -e '.fixed["tool:mcp-dap-server"] == {"kind":"go-module","version":"v0.0.0-20261103230859-6011c2cd13e8"}' >/dev/null
   printf '%s' "$output" | jq -e '.fixed["base:node"].digest == "sha256:af02d57b57719b9657a45199a79264a9437940cd55b3c7b3fc99615654f124a0"' >/dev/null
   printf '%s' "$output" | jq -e '.fixed["image:core"].digest == "sha256:6c295e41755ead3667779650473515bf70ddd8096e8ad8a4af4d488026c127b9"' >/dev/null
   printf '%s' "$output" | jq -e '(.tools | length) == 0 and (.packages.dpkg | length) == 0 and .last_built == null' >/dev/null
@@ -288,5 +293,84 @@ JSON
   cd "$TMP"
   run "$SCRIPT" --emit manifest
   [ "$status" -eq 0 ]
-  printf '%s' "$output" | jq -e '.schemaVersion == 2 and (.floating | length) == 16' >/dev/null
+  printf '%s' "$output" | jq -e '.schemaVersion == 2 and (.floating | length) == 19' >/dev/null
+}
+
+@test "structural: scoped npm floating key survives the tab protocol and is compared by package" {
+  MANIFEST="$TMP/scoped.json"
+  UPSTREAM="$TMP/scoped-upstream.json"
+  cat >"$MANIFEST" <<'JSON'
+{
+  "schemaVersion": 2,
+  "floating": {
+    "npm:@playwright/mcp": {"ecosystem": "npm", "package": "@playwright/mcp", "track": true}
+  },
+  "fixed": {},
+  "tools": {
+    "@playwright/mcp": {"amd64": "0.0.86", "arm64": "0.0.86"}
+  },
+  "packages": {"dpkg": {}},
+  "last_built": "2026-11-20T00:00:00Z"
+}
+JSON
+  printf '{"npm:@playwright/mcp":"0.0.86"}\n' >"$UPSTREAM"
+  run "$SCRIPT" --emit changed --manifest "$MANIFEST" --upstream "$UPSTREAM" \
+    --now 2026-11-23T00:00:00Z
+  [ "$status" -eq 0 ]
+  [ "${lines[0]}" = "changed=false" ]
+  [ "${lines[1]}" = "reason=none" ]
+
+  printf '{"npm:@playwright/mcp":"0.0.87"}\n' >"$UPSTREAM"
+  run "$SCRIPT" --emit changed --manifest "$MANIFEST" --upstream "$UPSTREAM" \
+    --now 2026-11-23T00:00:00Z
+  [ "$status" -eq 0 ]
+  [ "${lines[0]}" = "changed=true" ]
+  [ "${lines[1]}" = "reason=upstream-change" ]
+  [ "${lines[2]}" = "changed-key=npm:@playwright/mcp" ]
+  [ "${lines[3]}" = "changed-tool=@playwright/mcp" ]
+}
+
+@test "structural: MCP fixed pins merge through and are never compared" {
+  MANIFEST="$TMP/mcp-fixed.json"
+  UPSTREAM="$TMP/mcp-fixed-upstream.json"
+  MERGED="$TMP/mcp-fixed-merged.json"
+  cat >"$MANIFEST" <<'JSON'
+{
+  "schemaVersion": 2,
+  "floating": {
+    "npm:zeta": {"ecosystem": "npm", "package": "zeta", "track": true}
+  },
+  "fixed": {
+    "tool:mcp-memory-service": {"kind": "pypi", "version": "13.0.0"},
+    "tool:mcp-dap-server": {"kind": "go-module", "version": "v0.0.0-20261103230859-6011c2cd13e8"}
+  },
+  "tools": {
+    "zeta": {"amd64": "1.0.0", "arm64": "1.0.0"}
+  },
+  "packages": {"dpkg": {}},
+  "last_built": "2026-11-20T00:00:00Z"
+}
+JSON
+  printf '{"npm:zeta":"1.0.0"}\n' >"$UPSTREAM"
+
+  run "$SCRIPT" --emit changed --manifest "$MANIFEST" --upstream "$UPSTREAM" \
+    --now 2026-11-23T00:00:00Z
+  [ "$status" -eq 0 ]
+  [ "${lines[0]}" = "changed=false" ]
+  [ "${lines[1]}" = "reason=none" ]
+
+  run "$SCRIPT" --emit manifest --manifest "$MANIFEST"
+  [ "$status" -eq 0 ]
+  printf '%s' "$output" | jq -e '
+    .fixed["tool:mcp-memory-service"] == {"kind": "pypi", "version": "13.0.0"}
+    and .fixed["tool:mcp-dap-server"] == {"kind": "go-module", "version": "v0.0.0-20261103230859-6011c2cd13e8"}
+  ' >/dev/null
+
+  run "$SCRIPT" merge --build-dir "$FIX/sc5" --manifest "$MANIFEST" --out "$MERGED"
+  [ "$status" -eq 0 ]
+  jq -e '
+    .fixed["tool:mcp-memory-service"].version == "13.0.0"
+    and .fixed["tool:mcp-dap-server"].version == "v0.0.0-20261103230859-6011c2cd13e8"
+    and .floating["npm:zeta"].track == true
+  ' "$MERGED"
 }

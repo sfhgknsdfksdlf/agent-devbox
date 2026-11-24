@@ -17,3 +17,6 @@ testResults.xml
 .omo
 PROGRESS.md
 **/*.md
+# Python bytecode from helper scripts must never enter the build context.
+**/__pycache__
+**/*.pyc

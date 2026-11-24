@@ -160,7 +160,7 @@ jobs:
               print("ok:", f)
           PY
       - name: compose config
-        run: PASEO_PASSWORD=x docker compose -f docker-compose.yml config -q
+        run: DATA_DIR="${RUNNER_TEMP}/agent-devbox-compose" PASEO_PASSWORD=x docker compose -f docker-compose.yml config -q
       - name: actionlint
         run: docker run --rm -v "$PWD:/r" -w /r rhysd/actionlint:1.7.12@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667 -color
       - name: hadolint
@@ -366,6 +366,12 @@ jobs:
           platforms: linux/${{ matrix.arch }}
           push: true
           tags: ${{ env.CORE_IMAGE }}:${{ needs.plan.outputs.tag }}-${{ matrix.arch }}
+          # The MCP adapters install `@latest`/`go install @<pin>`/`uv tool install`
+          # layers; without a changing build arg Docker reuses the cached layer on
+          # every push and the image silently keeps an old adapter. The run
+          # identity changes on every run (and every re-run attempt).
+          build-args: |
+            CACHEBUST=${{ github.run_id }}.${{ github.run_attempt }}
           provenance: false
           sbom: false
           no-cache: ${{ github.event_name != 'push' }}
@@ -423,6 +429,27 @@ jobs:
             '.schemaVersion == 1 and .arch == $a and .variant == "agents"' \
             "installed-build-$arch.json" >/dev/null
           jq -r '"tools=\(.tools | length) dpkg=\(.packages.dpkg | length)"' "installed-build-$arch.json"
+
+      # Both MCP packages are pinned as Dockerfile ARGs, so the inventory must
+      # equal the pin byte for byte. A stale cache hit or a wrong pin fails this
+      # arch here instead of silently shipping a mixed version to one arch.
+      - name: Verify pinned MCP versions (${{ matrix.arch }})
+        run: |
+          set -euo pipefail
+          arch="${{ matrix.arch }}"
+          inv="installed-build-$arch.json"
+          mms="$(sed -n 's/^ARG MMS_VERSION=//p' Dockerfile | head -n 1)"
+          dap="$(sed -n 's/^ARG MCP_DAP_VERSION=//p' Dockerfile | head -n 1)"
+          [ -n "$mms" ] || { echo "ERROR: ARG MMS_VERSION missing from Dockerfile"; exit 1; }
+          [ -n "$dap" ] || { echo "ERROR: ARG MCP_DAP_VERSION missing from Dockerfile"; exit 1; }
+          got_mms="$(jq -r '.tools["mcp-memory-service"] // empty' "$inv")"
+          got_dap="$(jq -r '.tools["mcp-dap-server"] // empty' "$inv")"
+          printf 'mcp-memory-service pin=%s installed=%s\n' "$mms" "$got_mms"
+          printf 'mcp-dap-server pin=%s installed=%s\n' "$dap" "$got_dap"
+          [ "$got_mms" = "$mms" ] || {
+            echo "ERROR: $arch mcp-memory-service installed=[$got_mms] pin=[$mms]"; exit 1; }
+          [ "$got_dap" = "$dap" ] || {
+            echo "ERROR: $arch mcp-dap-server installed=[$got_dap] pin=[$dap]"; exit 1; }
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -505,6 +532,17 @@ jobs:
             amd64:x86_64|arm64:aarch64) echo "native runner ok: $(uname -m)";;
             *) echo "ERROR: runner $(uname -m) is not native ${{ matrix.arch }}"; exit 1;;
           esac
+      # The entrypoint proves /home, /root and /workspace are the DATA_DIR binds
+      # before it seeds or starts anything, so even a bare smoke run needs the
+      # full layout. One throwaway tree per container keeps the paseo homes and
+      # locks apart; smoke-pw serves the password-refusal probe.
+      - name: Prepare temporary DATA_DIRs
+        run: |
+          set -euo pipefail
+          for name in smoke smoke-core smoke-pw; do
+            rm -rf "${RUNNER_TEMP:?}/$name"
+            mkdir -p "${RUNNER_TEMP:?}/$name/home" "${RUNNER_TEMP:?}/$name/root" "${RUNNER_TEMP:?}/$name/project"
+          done
       - name: Both image variants match the matrix architecture
         run: |
           set -euo pipefail
@@ -519,11 +557,16 @@ jobs:
       - name: Password is required for both variants
         run: |
           set -euo pipefail
+          data="$RUNNER_TEMP/smoke-pw"
           for pair in "core|${{ env.CORE_IMAGE }}@${{ needs.merge.outputs.core_digest }}" "agents|${{ env.AGENTS_IMAGE }}@${{ needs.merge.outputs.agents_digest }}"; do
             v="${pair%%|*}"
             img="${pair#*|}"
             set +e
-            out=$(docker run --rm --platform "linux/${{ matrix.arch }}" -e IS_DOCKER=true "$img" true 2>&1)
+            out=$(docker run --rm --platform "linux/${{ matrix.arch }}" \
+              -e IS_DOCKER=true -e DATA_DIR="$data" \
+              -v "$data/home:/home" -v "$data/root:/root" \
+              -v "$data/project:/workspace" -v "$data:/run/agent-devbox/data:ro" \
+              "$img" true 2>&1)
             rc=$?
             set -e
             if [ "$rc" -eq 0 ]; then
@@ -541,18 +584,49 @@ jobs:
             rest="${pair#*|}"
             port="${rest%%|*}"
             img="${rest#*|}"
+            data="$RUNNER_TEMP/$name"
             docker rm -f "$name" >/dev/null 2>&1 || true
             docker run -d --name "$name" --platform "linux/${{ matrix.arch }}" \
-              -e IS_DOCKER=true -e PASEO_PASSWORD=smoke-test-pw \
+              -e IS_DOCKER=true -e DATA_DIR="$data" -e PASEO_PASSWORD=smoke-test-pw \
+              -v "$data/home:/home" -v "$data/root:/root" \
+              -v "$data/project:/workspace" -v "$data:/run/agent-devbox/data:ro" \
               -p "$port:6767" "$img"
             code=000
-            for i in $(seq 1 40); do
+            # 80*3s = 240s, comfortably above the 180s Docker memory-supervisor
+            # budget in scripts/paseo-boot.sh, so a cold start cannot fail here.
+            for i in $(seq 1 80); do
               code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$port/api/health" || true)
               [ "$code" = "200" ] && break; sleep 3
             done
             echo "$name health=$code (after up to $i attempts)"
             docker logs "$name" | tail -40
             [ "$code" = "200" ]
+          done
+      # Only the eight MANAGED servers live in /etc/opencode/opencode.json. omo
+      # injects its runtime servers from a plugin hook, so `opencode debug
+      # config` is not a valid gate for them and is deliberately not asserted.
+      - name: Managed MCP config and adapters
+        run: |
+          set -euo pipefail
+          for name in smoke smoke-core; do
+            docker exec "$name" sh -lc '
+              set -eu
+              cfg=/etc/opencode/opencode.json
+              [ -f "$cfg" ] || { echo "missing managed config: $cfg" >&2; exit 1; }
+              mode=$(stat -c %a "$cfg")
+              [ "$mode" = "644" ] || { echo "mode=$mode want=644" >&2; exit 1; }
+              jq -e ".mcp | length == 8" "$cfg" >/dev/null || {
+                echo "managed config must hold exactly 8 MCP servers" >&2; exit 1; }
+              keys=$(jq -r ".mcp | keys | join(\",\")" "$cfg")
+              [ "$keys" = "deepwiki,delve,memory,playwright,shadcn,tavily,wails3,websearch" ] || {
+                echo "unexpected managed MCP keys: $keys" >&2; exit 1; }
+              jq -e "(.mcp | has(\"context7\") or has(\"grep_app\") or has(\"lsp\")) | not" "$cfg" >/dev/null || {
+                echo "omo-injected MCP keys must not be managed" >&2; exit 1; }
+              for bin in open-websearch shadcn playwright-mcp memory mcp-dap-server wails3; do
+                command -v "$bin" >/dev/null || { echo "missing adapter binary: $bin" >&2; exit 1; }
+              done
+              echo "ok: $name managed mcp keys=$keys"
+            '
           done
       - name: paseo daemon identity matches the supervisor lock
         run: |
@@ -608,7 +682,11 @@ jobs:
           done
       - name: Tear down
         if: always()
-        run: docker rm -f smoke smoke-core || true
+        # Containers write as root into the bind-mounted data trees, so the
+        # runner needs sudo to remove them after the containers are gone.
+        run: |
+          docker rm -f smoke smoke-core || true
+          sudo rm -rf "${RUNNER_TEMP:?}/smoke" "${RUNNER_TEMP:?}/smoke-core" "${RUNNER_TEMP:?}/smoke-pw"
 
   # ---------------------------------------------------------------------------
   # Export the WSL rootfs per architecture on its NATIVE runner (no emulation)
@@ -803,6 +881,10 @@ jobs:
           # One JSON per arch per group. The build inventories prove the agents
           # image the build produced; the rootfs inventories are authoritative
           # because they describe the overlay WSL actually imports.
+          mms="$(sed -n 's/^ARG MMS_VERSION=//p' Dockerfile | head -n 1)"
+          dap="$(sed -n 's/^ARG MCP_DAP_VERSION=//p' Dockerfile | head -n 1)"
+          [ -n "$mms" ] || { echo "ERROR: ARG MMS_VERSION missing from Dockerfile"; exit 1; }
+          [ -n "$dap" ] || { echo "ERROR: ARG MCP_DAP_VERSION missing from Dockerfile"; exit 1; }
           for group in build rootfs; do
             dir="version-inventory-$group"
             count="$(find "$dir" -maxdepth 1 -type f -name '*.json' | wc -l)"
@@ -813,6 +895,14 @@ jobs:
               jq -e --arg a "$arch" \
                 '.schemaVersion == 1 and .arch == $a and .variant == "agents"' \
                 "$f" >/dev/null
+              # Both pinned MCP packages must match the Dockerfile ARG exactly
+              # on amd64 AND arm64; a mismatch must abort before any promotion.
+              got_mms="$(jq -r '.tools["mcp-memory-service"] // empty' "$f")"
+              got_dap="$(jq -r '.tools["mcp-dap-server"] // empty' "$f")"
+              [ "$got_mms" = "$mms" ] || {
+                echo "ERROR: $f mcp-memory-service installed=[$got_mms] pin=[$mms]"; exit 1; }
+              [ "$got_dap" = "$dap" ] || {
+                echo "ERROR: $f mcp-dap-server installed=[$got_dap] pin=[$dap]"; exit 1; }
               echo "ok: $f tools=$(jq '.tools | length' "$f") dpkg=$(jq '.packages.dpkg | length' "$f")"
             done
           done

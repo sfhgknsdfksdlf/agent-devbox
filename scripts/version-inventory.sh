@@ -21,6 +21,11 @@
 #                   the exact resolved meta package is left in bun's install
 #                   cache, which is the only offline source for a plugin that
 #                   has no CLI --version
+#   mcp-memory-service  the installed wheel's own dist-info METADATA (uv tool
+#                   directory), the only offline source for a fixed PyPI pin
+#   mcp-dap-server  `go version -m <binary>` mod line, kept verbatim (leading
+#                   `v` and pseudo-version included; compared as an exact
+#                   string, never semver-ordered)
 #   dpkg            `dpkg-query -W -f='${Package}\t${Version}\n'`, verbatim
 #
 # A present command whose output cannot be parsed, a missing cache for a
@@ -186,6 +191,46 @@ if [ "${#omo_unique[@]}" -ne 1 ]; then
   die "ambiguous oh-my-openagent cache versions: ${omo_unique[*]}"
 fi
 printf 'oh-my-openagent\t%s\n' "${omo_unique[0]}" >>"$TOOLS_TSV"
+
+# --- MCP packages (fixed pins recorded verbatim) ------------------------------
+# mcp-memory-service is a `uv tool` install; the wheel's dist-info METADATA is
+# the offline source of truth. Exactly one environment must exist: zero means
+# the pin was not installed, multiple means an ambiguous upgrade, and both would
+# poison the scheduled diff-gate.
+UV_TOOLS_DIR="${AGENT_DEVBOX_UV_TOOLS_DIR:-/opt/uv-tools}"
+[ -d "$UV_TOOLS_DIR" ] || die "uv tools dir not found: $UV_TOOLS_DIR"
+mapfile -t mms_manifests < <(
+  find "$UV_TOOLS_DIR" -type f -path '*/mcp_memory_service-*.dist-info/METADATA' | sort
+)
+if [ "${#mms_manifests[@]}" -ne 1 ]; then
+  die "expected exactly one mcp_memory_service dist-info under $UV_TOOLS_DIR, found ${#mms_manifests[@]}"
+fi
+mms_version="$(sed -n 's/^Version:[[:space:]]*//p' "${mms_manifests[0]}" | tr -d '\r' | head -n 1)"
+[ -n "$mms_version" ] || die "cannot parse Version from ${mms_manifests[0]}"
+printf 'mcp-memory-service\t%s\n' "$mms_version" >>"$TOOLS_TSV"
+
+# mcp-dap-server is built with `go install ...@<pseudo-version>` and has no
+# `--version`; `go version -m` reports the exact module version. Keep the whole
+# string (including the leading `v`) so the fixed pin matches byte for byte.
+MCP_DAP_BIN="${AGENT_DEVBOX_MCP_DAP_BIN:-/usr/local/bin/mcp-dap-server}"
+command -v go >/dev/null 2>&1 || die "mcp-dap-server is tracked but 'go' is not installed"
+if [ ! -x "$MCP_DAP_BIN" ]; then
+  die "mcp-dap-server binary not found: $MCP_DAP_BIN"
+fi
+if ! dap_bin_out="$(go version -m "$MCP_DAP_BIN" 2>"$WORK/dap.err")"; then
+  die "cannot read module info for $MCP_DAP_BIN"
+fi
+mapfile -t dap_versions < <(
+  printf '%s\n' "$dap_bin_out" \
+    | sed -E 's/^[[:space:]]+//' \
+    | awk -F'[[:space:]]+' '$1 == "mod" && $2 == "github.com/go-delve/mcp-dap-server" { print $3 }'
+)
+if [ "${#dap_versions[@]}" -ne 1 ]; then
+  die "expected exactly one mod line for github.com/go-delve/mcp-dap-server, found ${#dap_versions[@]}"
+fi
+dap_version="${dap_versions[0]}"
+[ -n "$dap_version" ] || die "empty module version for github.com/go-delve/mcp-dap-server"
+printf 'mcp-dap-server\t%s\n' "$dap_version" >>"$TOOLS_TSV"
 
 # --- dpkg packages -----------------------------------------------------------
 if ! dpkg-query -W -f='${Package}\t${Version}\n' >"$WORK/dpkg.raw" 2>"$WORK/dpkg.err"; then

@@ -16,6 +16,9 @@
     "npm:@deepseek-ai/dsh": {"ecosystem": "npm", "package": "@deepseek-ai/dsh", "track": true},
     "npm:@xai-official/grok": {"ecosystem": "npm", "package": "@xai-official/grok", "track": true},
     "npm:zcode-app-cli": {"ecosystem": "npm", "package": "zcode-app-cli", "track": true},
+    "npm:open-websearch": {"ecosystem": "npm", "package": "open-websearch", "track": true},
+    "npm:shadcn": {"ecosystem": "npm", "package": "shadcn", "track": true},
+    "npm:@playwright/mcp": {"ecosystem": "npm", "package": "@playwright/mcp", "track": true},
     "pypi:aider-chat": {"ecosystem": "pypi", "package": "aider-chat", "track": true}
   },
   "fixed": {
@@ -25,7 +28,9 @@
     "tool:go": {"kind": "release", "version": "1.27.2"},
     "tool:uv": {"kind": "release", "version": "0.13.9"},
     "tool:marksman": {"kind": "release", "version": "2026-02-08"},
-    "tool:powershell": {"kind": "release", "version": "7.6.7"}
+    "tool:powershell": {"kind": "release", "version": "7.6.7"},
+    "tool:mcp-memory-service": {"kind": "pypi", "version": "13.0.0"},
+    "tool:mcp-dap-server": {"kind": "go-module", "version": "v0.0.0-20261103230859-6011c2cd13e8"}
   },
   "tools": {},
   "packages": {"dpkg": {}},

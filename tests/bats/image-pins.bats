@@ -16,6 +16,7 @@ setup() {
   WSL_DOCKERFILE="$REPO_ROOT/Dockerfile.wsl"
   BUILD_WORKFLOW="$REPO_ROOT/.github/workflows/build.yml"
   BUMP_WORKFLOW="$REPO_ROOT/.github/workflows/bump-pinned.yml"
+  VERSIONS="$REPO_ROOT/versions.json"
 
   TMP="$(mktemp -d)"
   mkdir -p "$TMP/bin" "$TMP/work"
@@ -655,9 +656,9 @@ exec_block() {
   run grep -q 'include=all' "$BUMP_WORKFLOW"
   [ "$status" -ne 0 ]
   grep -qF 'scripts/image-assets.sh update-go config/image-assets.sha256' "$BUMP_WORKFLOW"
-  grep -qF 'git add Dockerfile config/image-assets.sha256' "$BUMP_WORKFLOW"
+  grep -qF 'git add Dockerfile versions.json config/image-assets.sha256' "$BUMP_WORKFLOW"
   grep -qF 'registry.npmjs.org/playwright/latest' "$BUMP_WORKFLOW"
-  grep -qF 'git commit -m "chore: bump pinned Playwright/Go"' "$BUMP_WORKFLOW"
+  grep -qF 'git commit -m "chore: bump pinned Playwright/Go/mcp-memory-service/mcp-dap-server"' "$BUMP_WORKFLOW"
 
   # One commit, one `git add`: the transaction cannot smuggle in other files.
   [ "$(grep -cE '^[[:space:]]*git add ' "$BUMP_WORKFLOW")" -eq 1 ]
@@ -665,6 +666,81 @@ exec_block() {
   # Never auto-update the human-reviewed pins/digests.
   run grep -qE 'UV_VERSION|MARKSMAN|POWERSHELL|af02d57b57719b9657a45199a79264a9437940cd55b3c7b3fc99615654f124a0|6c295e41755ead3667779650473515bf70ddd8096e8ad8a4af4d488026c127b9' "$BUMP_WORKFLOW"
   [ "$status" -ne 0 ]
+}
+
+@test "MCP pins: Dockerfile ARG defaults exactly equal versions.json fixed entries" {
+  local mms dap
+  mms="$(sed -n 's/^ARG MMS_VERSION=//p' "$DOCKERFILE" | head -1)"
+  dap="$(sed -n 's/^ARG MCP_DAP_VERSION=//p' "$DOCKERFILE" | head -1)"
+
+  [ -n "$mms" ]
+  [ -n "$dap" ]
+  [ "$mms" = "$(jq -r '.fixed["tool:mcp-memory-service"].version' "$VERSIONS")" ]
+  [ "$dap" = "$(jq -r '.fixed["tool:mcp-dap-server"].version' "$VERSIONS")" ]
+  [ "$(jq -r '.fixed["tool:mcp-memory-service"].kind' "$VERSIONS")" = "pypi" ]
+  [ "$(jq -r '.fixed["tool:mcp-dap-server"].kind' "$VERSIONS")" = "go-module" ]
+
+  # MMS is a PyPI release string (digits/dots, optional pre/post suffix).
+  printf '%s\n' "$mms" | grep -Eq '^[0-9]+(\.[0-9]+)+([.+_-][0-9A-Za-z.+_-]+)?$'
+
+  # DAP is the FULL Go pseudo-version with the leading `v` preserved.
+  printf '%s\n' "$dap" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?-[0-9]{14}-[0-9a-f]{12}$'
+
+  # The workflow's own validation regexes must accept these seeded pins; pull
+  # them out of the YAML so a regex edit cannot silently reject a real value.
+  local mms_re dap_re
+  mms_re="$(grep -F 'mms" | grep -Eq' "$BUMP_WORKFLOW" | sed -E "s/.*grep -Eq '([^']+)'.*/\1/")"
+  dap_re="$(grep -F 'dap" | grep -Eq' "$BUMP_WORKFLOW" | sed -E "s/.*grep -Eq '([^']+)'.*/\1/")"
+  [ -n "$mms_re" ]
+  [ -n "$dap_re" ]
+  printf '%s\n' "$mms" | grep -Eq "$mms_re"
+  printf '%s\n' "$dap" | grep -Eq "$dap_re"
+}
+
+@test "bump-pinned queries and bumps both MCP pins via setup-go, one atomic write" {
+  # setup-go is SHA-pinned and reads the Dockerfile's GO_VERSION before any
+  # `go list` call.
+  grep -qE 'uses: actions/setup-go@[0-9a-f]{40}( # v[0-9.]+)?$' "$BUMP_WORKFLOW"
+  grep -qE 'go-version: \$\{\{ steps\.[A-Za-z0-9_-]+\.outputs\.version \}\}' "$BUMP_WORKFLOW"
+
+  local setup_line golist_line
+  setup_line="$(grep -n 'uses: actions/setup-go@' "$BUMP_WORKFLOW" | head -1 | cut -d: -f1)"
+  golist_line="$(grep -n 'go list -m -json github.com/go-delve/mcp-dap-server@latest' "$BUMP_WORKFLOW" | head -1 | cut -d: -f1)"
+  [ -n "$setup_line" ]
+  [ -n "$golist_line" ]
+  [ "$setup_line" -lt "$golist_line" ]
+
+  # Both upstream queries exist and fail closed instead of skipping.
+  grep -qF 'curl -fsSL https://pypi.org/pypi/mcp-memory-service/json' "$BUMP_WORKFLOW"
+  grep -qF "jq -er '.info.version'" "$BUMP_WORKFLOW"
+  grep -qF 'go list -m -json github.com/go-delve/mcp-dap-server@latest' "$BUMP_WORKFLOW"
+  grep -qF "jq -er '.Version'" "$BUMP_WORKFLOW"
+  grep -qF 'unexpected PyPI version for mcp-memory-service' "$BUMP_WORKFLOW"
+  grep -qF 'unexpected Go module version for mcp-dap-server' "$BUMP_WORKFLOW"
+
+  # Both ARG sed targets and the jq fixed-entry updates exist.
+  grep -qF 's|^ARG MMS_VERSION=.*|ARG MMS_VERSION=' "$BUMP_WORKFLOW"
+  grep -qF 's|^ARG MCP_DAP_VERSION=.*|ARG MCP_DAP_VERSION=' "$BUMP_WORKFLOW"
+  grep -qF '.fixed["tool:mcp-memory-service"].version = $mms' "$BUMP_WORKFLOW"
+  grep -qF '.fixed["tool:mcp-dap-server"].version = $dap' "$BUMP_WORKFLOW"
+
+  # Dockerfile + versions.json are staged in temp copies and renamed together.
+  grep -qF 'mktemp "$PWD/.Dockerfile.bump.' "$BUMP_WORKFLOW"
+  grep -qF 'mktemp "$PWD/.versions.json.bump.' "$BUMP_WORKFLOW"
+  grep -qF 'mv "$tmp_df" Dockerfile' "$BUMP_WORKFLOW"
+  grep -qF 'mv "$tmp_vj" versions.json' "$BUMP_WORKFLOW"
+
+  # Exact string compare (leading `v` kept), never semver ordering.
+  grep -qF 'if [ "$dap" != "$cur_dap" ]' "$BUMP_WORKFLOW"
+  run grep -qE 'sort -V|sort --version-sort|version_gt|dpkg --compare-versions' "$BUMP_WORKFLOW"
+  [ "$status" -ne 0 ]
+
+  # The existing Playwright/Go queries, manifest update, and build dispatch
+  # are still present.
+  grep -qF 'registry.npmjs.org/playwright/latest' "$BUMP_WORKFLOW"
+  grep -qF 'go.dev/dl/?mode=json' "$BUMP_WORKFLOW"
+  grep -qF 'scripts/image-assets.sh update-go config/image-assets.sha256' "$BUMP_WORKFLOW"
+  grep -qF 'gh workflow run build.yml --ref main' "$BUMP_WORKFLOW"
 }
 
 @test "the real manifest entries use the versions the Dockerfiles download" {

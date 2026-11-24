@@ -38,8 +38,15 @@
 
 容器把数据写在应用目录下的 `./data/`：
 
-- `./data/home` → 容器内 `/home/paseo`（paseo 服务的数据）
+- `./data/home` → 容器内 `/home`（整个 home 目录；paseo 的 `/home/paseo`、agent 配置与凭据都在这里）
+- `./data/root` → 容器内 `/root`
 - `./data/project` → 容器内 `/workspace`（工作目录）
+
+1Panel 使用短语法 bind（缺省目录会自动创建），所以真正的保险是容器启动前的
+**数据盘身份预检**：`./data` 还会只读挂到 `/run/agent-devbox/data`，入口脚本逐个比较
+`stat -c '%d:%i'`（`.../home` vs `/home`、`.../root` vs `/root`、`.../project` vs `/workspace`），
+任一不匹配就以 FATAL 退出，不会先写入任何数据。首次启动会自动创建
+`/home/paseo`（1000:1000）、`/root`（0:0，0700）和 `/workspace`，并只补充缺失的 skeleton。
 
 删除应用前请先备份 `./data/`。
 

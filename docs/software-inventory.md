@@ -34,6 +34,42 @@ ecosystem it belongs to, plus what was **removed** and **added**.
 | zcode (`zcode-app-cli`) | Z.ai ZCode terminal client (community) |
 | Aider (`aider-chat`, via `uv tool`, Python 3.12) | Python agent |
 
+## MCP servers (11)
+
+All 11 are globally available to OpenCode. Eight are managed in
+`/etc/opencode/opencode.json` (applied last as the V1 global config);
+`context7`, `grep_app` and `lsp` are injected by omo at runtime.
+
+| MCP | Type | Source / launch | Notes |
+|---|---|---|---|
+| `memory` | local, resident | `mcp-memory-service` (PyPI) | one loopback HTTP service per UID; OpenCode plugin auto-captures |
+| `websearch` | local stdio | `open-websearch` (npm global) | same key overrides omo's Exa-backed `websearch` |
+| `tavily` | remote | `https://mcp.tavily.com/mcp/` | keyless (`X-Tavily-Access-Mode: keyless`); search/extract only, crawl/map/research need a key |
+| `context7` | built-in | omo runtime | documentation lookup |
+| `grep_app` | built-in | omo runtime | GitHub code search |
+| `lsp` | built-in | omo runtime | LSP tools |
+| `shadcn` | local stdio | `shadcn mcp` | runs in the project cwd |
+| `wails3` | local stdio | `wails3 mcp` | build-time `@latest` |
+| `playwright` | local stdio | `@playwright/mcp` | headless, isolated, `/usr/local/bin/chromium` |
+| `deepwiki` | remote | `https://mcp.deepwiki.com/mcp` | no key; public repos only |
+| `delve` | local stdio | `mcp-dap-server` | Delve DAP adapter, enabled by default |
+
+### Managed config vs runtime injection
+
+- `/etc/opencode/opencode.json` holds exactly the eight non-omo servers:
+  `memory`, `websearch`, `tavily`, `shadcn`, `wails3`, `playwright`, `deepwiki`,
+  `delve`.
+- `context7`, `grep_app` and `lsp` are omo built-ins, injected at runtime, and
+  must not appear in that file.
+- The file has **no `plugin` key**: a managed `plugin` array would replace omo's
+  own plugin array. The memory plugin is auto-discovered from
+  `~/.config/opencode/plugins/memory-plugin.js`.
+
+### Not installed
+
+Sequential Thinking, OpenSpec, markitdown-mcp, OpenViking, Mem0, Serena, Chrome
+DevTools MCP.
+
 ## Language toolchains
 
 | Software | Ecosystem |

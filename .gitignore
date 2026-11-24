@@ -21,3 +21,7 @@ windows/*.exe
 # --- agent / session metadata (not project content) ---
 .omo/
 PROGRESS.md
+
+# --- Python bytecode from helper scripts ---
+__pycache__/
+*.pyc

@@ -6,19 +6,24 @@
 
 | Part | Contents |
 |---|---|
-| `floating` | npm/PyPI packages the scheduled diff-gate tracks: OpenCode V1 (`opencode-ai@^1`; V2 `@opencode/cli` is a separate package and is never installed), omo, paseo, wrangler, create-cloudflare, the extra agent CLIs, and `aider-chat` from PyPI. |
-| `fixed` | Pinned tool/digest metadata: the Node base and core image OCI digests, Playwright, Go, uv, marksman, PowerShell. |
+| `floating` | npm/PyPI packages the scheduled diff-gate tracks: OpenCode V1 (`opencode-ai@^1`; V2 `@opencode/cli` is a separate package and is never installed), omo, paseo, wrangler, create-cloudflare, the extra agent CLIs, `aider-chat` from PyPI, and the three MCP adapters that float weekly (`open-websearch`, `shadcn`, `@playwright/mcp`). |
+| `fixed` | Pinned tool/digest metadata: the Node base and core image OCI digests, Playwright, Go, uv, marksman, PowerShell, `mcp-memory-service` (PyPI) and `mcp-dap-server` (Go module pseudo-version). |
 | `tools` + `packages.dpkg` | The actual installed versions per architecture, written from each build/export artifact. |
 | `last_built` | When the recorded state was last refreshed. |
 
-The scheduled diff-gate compares upstream `floating` versions with the installed
-`tools` recorded in the state. It fails open (rebuilds) on a missing key, a query
-error, or a state older than 28 days; the publish job only merges the per-arch
-rootfs inventories and never queries npm/PyPI.
+Two cadences:
 
-Pins are not just Playwright and Go: `bump-pinned` updates the Playwright and Go
-build ARGs, while uv, marksman, PowerShell and the Node/core OCI digests are
-review-pinned. Not every tool floats.
+- **Weekly, Sunday 03:23 UTC:** the floating diff-gate compares upstream with the
+  installed `tools`. A change rebuilds; a missing key, query error, or state older
+  than 28 days also fails open and rebuilds. No tracked change skips the build.
+- **Every 6 months, Jan/Jul 1st 05:00 UTC:** `bump-pinned` moves
+  `PLAYWRIGHT_VERSION`, `GO_VERSION`, `MMS_VERSION` and `MCP_DAP_VERSION`.
+  `mcp-memory-service` and `mcp-dap-server` are fixed pins, not weekly floating;
+  uv, marksman, PowerShell and the Node/core OCI digests stay review-pinned.
+- `wails3` stays a build-time `@latest` install.
+
+The publish job only merges the per-arch rootfs inventories and never queries
+npm/PyPI.
 
 A rebuild picks up new floating versions. The state lives on `automation/versions`;
 main's `versions.json` is only the bootstrap seed. A scheduled build is skipped
@@ -96,6 +101,37 @@ own bundled OCI implementation — **no Docker required**. You can point it at
   mirrored networking.
 - **OpenCode server**: `opencode serve` defaults to `127.0.0.1:4096`. See
   `opencode-expose.md`.
+
+## MCP runtime: memory
+
+- One resident loopback HTTP service per UID (`127.0.0.1` only), started by
+  `memory-supervisor.sh`; boot hooks never launch `mcp-memory-service --http`
+  directly.
+- A route allowlist (`memory_guard.py`) removes the dashboard, static,
+  credential and OAuth routes; those paths return 404. The dashboard credential
+  API is therefore unavailable.
+- The database lives under `$HOME/.local/share/mcp-memory`; plugin status and
+  inbox live under `$HOME/.local/state/opencode`.
+- The first run may download the ONNX model into `$HOME/.cache`. Runtime
+  downloads are allowed, so a cold start can be slower on both Docker and WSL.
+
+## MCP runtime: Delve
+
+- `compose` already grants `cap_add: [SYS_PTRACE]`; the default seccomp profile is
+  kept (no `seccomp:unconfined`, no `privileged`, no host PID).
+- The root-path launcher (`mcp-dap-launcher.sh`) drops to `paseo` first, so the
+  MCP never runs as root.
+- Debugging is scoped to uid-1000 processes and `/workspace`. The adapter uses
+  stdio and publishes no DAP port.
+
+## Managed MCP config: no plugin array
+
+- `/etc/opencode/opencode.json` is the V1 managed global config and is applied
+  last. It contains exactly the 8 non-omo MCP entries.
+- `context7`, `grep_app` and `lsp` are omo built-ins and stay runtime-injected.
+- The file must not contain a `plugin` key: a managed `plugin` array would
+  replace omo's own plugin array. The memory plugin is auto-discovered from
+  `~/.config/opencode/plugins/memory-plugin.js`.
 
 ## User model
 

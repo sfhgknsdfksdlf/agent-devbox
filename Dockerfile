@@ -268,6 +268,47 @@ RUN set -eux; \
     test -x /root/.opencode/bin/opencode
 
 # -----------------------------------------------------------------------------
+# L11a) MCP adapter packages for the managed OpenCode global config (L11b).
+#       CACHEBUST forces a rebuild of the floating @latest installs; the
+#       managed config always references these ABSOLUTE paths, never npx/uvx.
+#       open-websearch intentionally replaces omo's Exa-backed `websearch`.
+# -----------------------------------------------------------------------------
+ARG CACHEBUST=0
+ARG MMS_VERSION=13.0.0
+ARG MCP_DAP_VERSION=v0.0.0-20261103230859-6011c2cd13e8
+RUN set -eux; \
+    echo "mcp adapter cachebust=${CACHEBUST}"; \
+    npm install -g open-websearch@latest shadcn@latest @playwright/mcp@latest; \
+    npm cache clean --force; \
+    command -v open-websearch; command -v shadcn; command -v playwright-mcp
+RUN set -eux; \
+    UV_TOOL_DIR=/opt/uv-tools UV_TOOL_BIN_DIR=/usr/local/bin \
+      uv tool install "mcp-memory-service[sqlite]==${MMS_VERSION}"
+RUN set -eux; \
+    GOBIN=/usr/local/bin go install "github.com/go-delve/mcp-dap-server@${MCP_DAP_VERSION}"; \
+    test -x /usr/local/bin/mcp-dap-server
+
+# -----------------------------------------------------------------------------
+# L11b) managed OpenCode V1 global config + memory runtime assets.
+#       /etc/opencode/opencode.json is applied last as the global config, so it
+#       stays strict JSON with ONLY $schema + mcp. There is deliberately NO
+#       `plugin` key: omo owns the plugin array, and a managed array would
+#       replace oh-my-openagent at runtime.
+#       config/agent-memory/ is copied as a directory so a missing source fails
+#       the build (no `|| true`); T1b vendors the OpenCode memory plugin there
+#       and verifies it against config/agent-memory/SHA256SUMS before shipping.
+# -----------------------------------------------------------------------------
+COPY config/opencode/global-mcp.json /etc/opencode/opencode.json
+COPY config/agent-memory/ /opt/agent-memory/
+RUN set -eux; \
+    chmod 0644 /etc/opencode/opencode.json; \
+    jq -e '.mcp | length == 8' /etc/opencode/opencode.json >/dev/null; \
+    jq -e '(.mcp | has("context7") or has("grep_app") or has("lsp")) | not' /etc/opencode/opencode.json >/dev/null; \
+    jq -e 'has("plugin") | not' /etc/opencode/opencode.json >/dev/null; \
+    chmod -R a+rX /opt/agent-memory; \
+    sh -c 'cd /opt/agent-memory && sha256sum -c SHA256SUMS'
+
+# -----------------------------------------------------------------------------
 # L12) Seed omo/OpenCode config OUTSIDE the mounted /home (bun required: npx is
 #      known-broken for this installer in Docker builds). No blanket `|| true`.
 # -----------------------------------------------------------------------------
