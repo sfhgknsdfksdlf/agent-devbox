@@ -115,6 +115,14 @@ docs/                            # user-facing guides
 - `npm ls -g --json` 可能 exit 1 但 JSON 仍有效（extraneous 条目），只能以解析失败判错。
 - publish 合并前 `.github/scripts/version-state.sh` 只存在于构建提交，切到 `automation/versions` 后会消失 → 先 `cp` 到 `$RUNNER_TEMP` 再 checkout。
 
+**OpenCode Desktop `sh -lc` 与 bash-only `agent-env.sh`（2026-11-25）**
+- Desktop 的 CLI 探针固定是 `wsl.exe -d <发行版> -- sh -lc '...$HOME/.opencode/bin/opencode...'`（不查 PATH）；`config/profile.d/agent-devbox.sh` 只能对 **Bash** 登录 source `agent-env.sh`。dash 解析 bash 数组会在 `:26` rc=2，探针不执行、stdout 为空 → 桌面版把已安装 CLI 判为“未安装”。
+- guard `${BASH_VERSION:-}` 后 dash 跳过 agent-env、bash 行为不变；`tests/bats/agent-env.bats` 用临时 hook + dash/bash 覆盖；smoke step11 验证真实镜像。
+
+**FastAPI 0.165 `_IncludedRouter`（2026-11-25）**
+- `include_router()` 在 `app.router.routes` 里不是扁平 `APIRoute`，而是无 `path`/`methods` 的 `_IncludedRouter`；`memory_guard.py` 若按 route 形状删路由，会删掉 `/api/health`、`/mcp`、`/api/memories` 全部 API，memory 服务 404、smoke 240s 超时。
+- 修复：只保留最外层 allowlist middleware（不删路由），`uvicorn.run(..., ws="none")` 防 WebSocket 绕过；`scripts/memory_guard_selftest.py` 在 core 镜像构建期用真实 FastAPI `include_router()` + 非上下文 TestClient 回归。
+
 ## ANTI-PATTERNS
 - NEVER set `HOME` globally in the image (root shell needs `HOME=/root`; the daemon's HOME is set in `paseo-boot` only).
 - NEVER install `@opencode/cli`; NEVER `docker build` locally — CI is the only builder and it runs for every branch.

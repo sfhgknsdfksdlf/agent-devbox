@@ -67,3 +67,19 @@ setup() {
   [ "$(printf '%s' "${lines[1]}" | tr ':' '\n' | grep -c '^/usr/local/go/bin$')" -eq 1 ]
   [ "$(printf '%s' "${lines[1]}" | tr ':' '\n' | grep -c '^/home/carol/go/bin$')" -eq 1 ]
 }
+
+@test "profile hook sources agent-env only for Bash login shells" {
+  hook="$BATS_TEST_TMPDIR/agent-devbox.sh"
+  marker="$BATS_TEST_TMPDIR/agent-env-marker.sh"
+  printf 'AGENT_ENV_MARKER=loaded\nexport AGENT_ENV_MARKER\n' > "$marker"
+  sed "s#/usr/local/bin/agent-env.sh#$marker#" \
+    "$BATS_TEST_DIRNAME/../../config/profile.d/agent-devbox.sh" > "$hook"
+
+  run env -u BASH_VERSION dash -c '. "$1"; printf "marker=%s\n" "${AGENT_ENV_MARKER:-}"' sh "$hook"
+  [ "$status" -eq 0 ]
+  [ "$output" = "marker=" ]
+
+  run env -u BASH_VERSION bash -c '. "$1"; printf "marker=%s\n" "${AGENT_ENV_MARKER:-}"' sh "$hook"
+  [ "$status" -eq 0 ]
+  [ "$output" = "marker=loaded" ]
+}

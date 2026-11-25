@@ -2,11 +2,16 @@
 """Loopback-only allowlisting front end for mcp-memory-service.
 
 The dashboard, static assets, configuration/credential API and OAuth surface of
-mcp-memory-service are not needed by an OpenCode agent. This process imports the
-installed FastAPI application, DELETES every route outside a small allowlist,
-and installs an outermost middleware that answers 404 for anything else before
-the upstream handler can run. It then serves the resulting app with uvicorn on
-127.0.0.1 only -- never 0.0.0.0.
+mcp-memory-service are not needed by an OpenCode agent. This process serves the
+installed FastAPI application behind an outermost allowlist middleware that
+answers 404 for anything outside a small allowlist before the upstream handler
+can run. It binds uvicorn on 127.0.0.1 only -- never 0.0.0.0 -- with WebSocket
+support disabled, because the HTTP middleware cannot guard WebSocket upgrades.
+
+Route stripping is deliberately NOT used: FastAPI 0.165 represents included
+routers as ``_IncludedRouter`` objects with no ``path``/``methods``, so
+shape-based stripping deletes the whole API (health, mcp, memories). The
+middleware is the security boundary; the upstream route table stays intact.
 
 The allowlist (see ``is_allowed``) covers exactly:
 
@@ -48,9 +53,9 @@ _ALLOWED_STATIC = frozenset(
     }
 )
 
-# DELETE /api/memories/<hash>. The alternation also matches the FastAPI route
-# template (``/api/memories/{content_hash}``) so route filtering keeps it.
-_MEMORY_DELETE = re.compile(r"^/api/memories/(?:\{[^/{}]+\}|[A-Za-z0-9_.-]{1,128})$")
+# DELETE /api/memories/<hash>. The guard checks request paths, not route
+# templates, so only the real hash charset is accepted (no ``{...}`` form).
+_MEMORY_DELETE = re.compile(r"^/api/memories/[A-Za-z0-9_.-]{1,128}$")
 
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
 
@@ -85,25 +90,6 @@ def is_allowed(method: str, path: str) -> bool:
     return False
 
 
-def strip_routes(app) -> int:
-    """Drop every route that is not allowlisted; return how many were removed."""
-    kept = []
-    removed = 0
-    for route in list(app.router.routes):
-        route_path = getattr(route, "path", None)
-        methods = getattr(route, "methods", None)
-        if not route_path or not methods:
-            # Mount(/static), WebSocket and other method-less scopes.
-            removed += 1
-            continue
-        if any(is_allowed(method, route_path) for method in methods):
-            kept.append(route)
-        else:
-            removed += 1
-    app.router.routes = kept
-    return removed
-
-
 def install_middleware(app) -> None:
     """404 disallowed requests before routing (outermost HTTP middleware)."""
     from starlette.responses import JSONResponse
@@ -115,16 +101,20 @@ def install_middleware(app) -> None:
         return await call_next(request)
 
 
-def build_app():
-    """Import the installed app, strip its route table, and add the guard."""
-    # Imported lazily: importing this module must not require the package.
-    from mcp_memory_service.web.app import app as upstream_app
+def build_app(upstream_app=None):
+    """Import the installed app, install the allowlist, and return it.
 
-    removed = strip_routes(upstream_app)
+    ``upstream_app`` is a test seam: production imports the installed
+    mcp-memory-service app, while the build-time selftest passes a real FastAPI
+    app with ``include_router()`` so the FastAPI 0.165 ``_IncludedRouter``
+    representation is covered.
+    """
+    if upstream_app is None:
+        # Imported lazily: importing this module must not require the package.
+        from mcp_memory_service.web.app import app as upstream_app
+
     install_middleware(upstream_app)
-    sys.stderr.write(
-        f"memory_guard: allowlist active ({removed} non-allowlisted routes removed)\n"
-    )
+    sys.stderr.write("memory_guard: allowlist active\n")
     sys.stderr.flush()
     return upstream_app
 
@@ -160,7 +150,14 @@ def main(argv: list[str] | None = None) -> int:
 
     import uvicorn
 
-    uvicorn.run(app, host="127.0.0.1", port=args.port, log_level="info", access_log=False)
+    uvicorn.run(
+        app,
+        host="127.0.0.1",
+        port=args.port,
+        log_level="info",
+        access_log=False,
+        ws="none",
+    )
     return 0
 
 

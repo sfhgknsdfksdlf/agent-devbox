@@ -161,55 +161,18 @@ guard_allows() {
   done
 }
 
-@test "guard: strip_routes keeps only allowlisted routes (mounts dropped)" {
-  run env PYTHONPATH="$REPO_ROOT/scripts" python3 - <<'PY'
-import memory_guard as g
-
-class R:
-    def __init__(self, path, methods):
-        self.path = path
-        self.methods = methods
-
-class Router:
-    routes = [
-        R("/", {"GET"}),
-        R("/static", None),
-        R("/api/config/credentials", {"POST"}),
-        R("/api/health", {"GET", "HEAD"}),
-        R("/api/health/detailed", {"GET", "HEAD"}),
-        R("/api/memories", {"POST"}),
-        R("/api/memories", {"GET"}),
-        R("/api/memories/{content_hash}", {"DELETE"}),
-        R("/api/memories/{content_hash}", {"PUT"}),
-        R("/mcp", {"POST"}),
-        R("/mcp/", {"POST"}),
-    ]
-
-class App:
-    def __init__(self):
-        self.router = Router()
-
-app = App()
-removed = g.strip_routes(app)
-kept = sorted((r.path, sorted(r.methods)) for r in app.router.routes)
-assert removed == 5, removed
-assert ("/", ["GET"]) not in kept
-assert ("/static", []) not in kept
-assert ("/api/config/credentials", ["POST"]) not in kept
-assert ("/api/memories", ["GET"]) not in kept
-assert ("/api/memories/{content_hash}", ["PUT"]) not in kept
-assert ("/api/health", ["GET", "HEAD"]) in kept
-assert ("/api/health/detailed", ["GET", "HEAD"]) in kept
-assert ("/api/memories", ["POST"]) in kept
-assert ("/api/memories/{content_hash}", ["DELETE"]) in kept
-print("ok")
-PY
-  [ "$status" -eq 0 ]
-  [[ "$output" == *ok* ]]
+@test "guard: allowlist middleware is the only boundary (no route stripping)" {
+  # FastAPI 0.165 represents include_router() as _IncludedRouter objects with
+  # no path/methods; shape-based stripping would delete every API route.
+  ! grep -Fq 'strip_routes' "$GUARD"
+  grep -Fq 'install_middleware(upstream_app)' "$GUARD"
+  grep -Fq 'build_app(upstream_app=None)' "$GUARD"
+  grep -Fq 'memory_guard_selftest.py' "$REPO_ROOT/Dockerfile"
 }
 
 @test "guard: binds only 127.0.0.1 and forces anonymous/OAuth off" {
-  grep -Fq 'uvicorn.run(app, host="127.0.0.1"' "$GUARD"
+  grep -Fq 'host="127.0.0.1",' "$GUARD"
+  grep -Fq 'ws="none"' "$GUARD"
   ! grep -Fq 'host="0.0.0.0"' "$GUARD"
   grep -Fq 'MCP_ALLOW_ANONYMOUS_ACCESS' "$GUARD"
   grep -Fq 'MCP_OAUTH_ENABLED' "$GUARD"

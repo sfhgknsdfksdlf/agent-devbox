@@ -127,8 +127,9 @@ wsl -d agent-devbox-core -u root -e desktop-cli-check.sh --home /root --also-hom
 ## 装错位置的清单
 
 Paseo 守护进程的 PATH 被 `scripts/paseo-boot.sh` 钉死为
-`/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin...`；登录 shell 则通过
-`/etc/profile.d/agent-devbox.sh` 引入 `agent-env.sh`，把 `/usr/local/bin` 前置。四个常见的
+`/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin...`；**Bash** 登录 shell 则通过
+`/etc/profile.d/agent-devbox.sh` 引入 `agent-env.sh`，把 `/usr/local/bin` 前置（POSIX `sh`/dash
+会跳过；桌面版的 `sh -lc` 探针只检查 `$HOME/.opencode/bin/opencode` 绝对路径，不依赖它）。四个常见的
 per-user 目录不在这两条路径里：
 
 | 目录 | 谁看得见 | 为什么不行 |

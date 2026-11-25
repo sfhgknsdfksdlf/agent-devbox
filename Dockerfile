@@ -344,6 +344,10 @@ COPY config/profile.d/ /etc/profile.d/
 COPY scripts/ /usr/local/bin/
 RUN set -eux; chmod +x /usr/local/bin/*.sh; \
     mkdir -p /opt/agent-devbox/windows
+# Build-time guard regression: FastAPI 0.165 represents include_router() as a
+# method-less _IncludedRouter; prove the allowlist keeps the API reachable and
+# still 404s dashboard/static/credential/OAuth/docs. Runs in the tool venv.
+RUN /opt/uv-tools/mcp-memory-service/bin/python /usr/local/bin/memory_guard_selftest.py
 COPY windows/ /opt/agent-devbox/windows/
 RUN chmod -R a+rX /opt/agent-devbox
 
